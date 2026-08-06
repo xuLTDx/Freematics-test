@@ -71,6 +71,10 @@
 #define ENABLE_OBD 1
 #endif
 
+// Zapnutie podpory UDS (Mode 22)
+#define ENABLE_UDS 1
+#define OBD_TIMEOUT_UDS 300 /* ms */
+
 // maximum consecutive OBD access errors before entering standby
 // Set to a high value so that a temporarily unreachable ECU does not
 // permanently disconnect OBD-II.  The process() loop already retries
@@ -84,12 +88,25 @@
 #ifndef ENABLE_WIFI
 #define ENABLE_WIFI 1
 #endif
-// WiFi compile-time defaults (SSID/password are overridden at runtime via NVS)
+// WiFi compile-time defaults. SSIDs are network names (not sensitive) and
+// are fine to keep here; passwords are left EMPTY on purpose so they never
+// end up committed to the (potentially public) repo - set them at runtime
+// via NVS keys WIFI_PWD / WIFI_PWD2 instead (e.g. via the HA integration's
+// provisioning, or the local HTTP config endpoint). Two networks are
+// configured: the device tries WIFI_SSID first, and falls back to
+// WIFI_SSID2 when the first one isn't reachable (see wifiConnect() in
+// telelogger.ino).
 #ifndef WIFI_SSID
-#define WIFI_SSID ""
+#define WIFI_SSID "NTLIRIS"
 #endif
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
+#endif
+#ifndef WIFI_SSID2
+#define WIFI_SSID2 "uLTD_ext"
+#endif
+#ifndef WIFI_PASSWORD2
+#define WIFI_PASSWORD2 ""
 #endif
 
 // cellular network settings
@@ -207,8 +224,13 @@
 // Firmware version string – bumped manually on significant releases.
 // Printed at boot alongside the __DATE__/__TIME__ build timestamp so users
 // can confirm they are running the expected build.
+//   5.1     - baseline (VAG UDS odometer attempt, atoi()-based parsing)
+//   5.2-odo - fixed UDS hex parsing, removed duplicate PID_ODOMETER tier
+//             poll, added extended (29-bit) CAN addressing to module 0x17
+//             (Instruments/J285) for the odometer UDS reads, added GPS
+//             distance fallback, added ODO diagnostic line to Serial/SD log
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "5.1"
+#define FIRMWARE_VERSION "5.2-odo"
 #endif
 
 // enable(1)/disable(0) BLE SPP server (for Freematics Controller App).
