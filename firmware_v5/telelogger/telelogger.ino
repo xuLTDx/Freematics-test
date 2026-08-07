@@ -119,6 +119,16 @@ uint8_t accCount = 0;
 #endif
 int deviceTemp = 0;
 
+// Declared here (before wifiConnect()/wifiReconnectCurrent() below, which
+// reference it) rather than further down with the rest of the network setup -
+// C++ requires the declaration to precede first use, and Arduino's automatic
+// function-prototyping only forward-declares functions, not global objects.
+#if SERVER_PROTOCOL == PROTOCOL_UDP
+TeleClientUDP teleClient;
+#else
+TeleClientHTTP teleClient;
+#endif
+
 // config data
 char apn[32];
 char simPin[16] = SIM_CARD_PIN;
@@ -430,12 +440,6 @@ MEMS_I2C* mems = 0;
 SPIFFSLogger logger;
 #elif STORAGE == STORAGE_SD
 SDLogger logger;
-#endif
-
-#if SERVER_PROTOCOL == PROTOCOL_UDP
-TeleClientUDP teleClient;
-#else
-TeleClientHTTP teleClient;
 #endif
 
 #if ENABLE_OLED
@@ -2365,6 +2369,13 @@ void showSysInfo()
     Serial.print("NVS:");
     Serial.println(nvsVersion);
   }
+#if ENABLE_WIFI
+  // Factory-burned MAC, readable even before WiFi.mode()/begin() - useful for
+  // finding the device in the router's DHCP client list or for MAC-based
+  // access-list entries, independent of whether it has joined a network yet.
+  Serial.print("WIFI MAC:");
+  Serial.println(WiFi.macAddress());
+#endif
 }
 
 void loadConfig()
@@ -2986,6 +2997,12 @@ static String _maskOtaHost(const char* host) {
 // Returns false in all other cases, including the SD-staging success case
 // (caller must NOT block waiting for a reboot when false is returned).
 // ---------------------------------------------------------------------------
+// Pull-OTA needs an HTTP(S)-capable teleClient.wifi (WifiHTTP: .open/.send/
+// .receiveHeaders/.rawClient/.code). With SERVER_PROTOCOL=PROTOCOL_UDP,
+// teleClient.wifi is WifiUDP instead, which has none of those methods, so the
+// real implementation below is only compiled for HTTP-capable protocols; the
+// UDP build gets a no-op stub instead.
+#if SERVER_PROTOCOL != PROTOCOL_UDP
 bool performPullOtaCheck()
 {
   if (!otaToken[0] || !otaHost[0]) return false;
@@ -3701,6 +3718,12 @@ bool performPullOtaCheck()
 #endif  // ENABLE_WIFI
   return false;
 }
+#else   // SERVER_PROTOCOL == PROTOCOL_UDP
+bool performPullOtaCheck()
+{
+  return false;  // Pull-OTA requires an HTTP-capable SERVER_PROTOCOL.
+}
+#endif  // SERVER_PROTOCOL != PROTOCOL_UDP
 
 void processBLE(int timeout)
 {
