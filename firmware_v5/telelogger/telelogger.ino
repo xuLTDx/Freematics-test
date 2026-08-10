@@ -314,7 +314,7 @@ uint16_t nvsStandbyTimeS = 0;
 // frame's bytes as a two-hex-chars-per-byte entry in s_canFrameList.
 // The list is exposed via /api/control?cmd=CAN_DATA and cleared when read.
 // ---------------------------------------------------------------------------
-#define CAN_DATA_LIST_MAX 32    // maximum number of stored CAN frame snapshots
+#define CAN_DATA_LIST_MAX 256   // maximum number of stored CAN frame snapshots
 // Ring buffer storing hex-encoded CAN frame payloads, newest last.
 // Each entry is at most 2*8=16 chars (8 data bytes × 2 hex digits).
 // The buffer is guarded by s_canBufMux for cross-task access from dataserver.
@@ -325,6 +325,40 @@ portMUX_TYPE s_canBufMux = portMUX_INITIALIZER_UNLOCKED;
 // Tracks whether sniffing is currently active so we can call sniff(true/false)
 // only on transitions rather than every process() call.
 static bool s_canSniffActive = false;
+
+// Full CAN sniff capture to SD, independent of the small RAM ring buffer
+// above (which a busy bus can wrap through in well under a second between
+// two WiFi polls). Opened fresh on each sniff-on transition, closed on
+// sniff-off. Flushed periodically rather than every line to avoid stalling
+// the receive loop on SD write latency while still bounding data loss on
+// an unexpected reset.
+//
+// The last CAN_SNIFF_LOG_KEEP sessions are kept as /can_sniff1.log (newest)
+// .. /can_sniffN.log (oldest); each sniff-on transition rotates them up by
+// one slot (logrotate-style) and starts a fresh /can_sniff1.log, instead of
+// overwriting a single file.
+#if STORAGE == STORAGE_SD
+#define CAN_SNIFF_LOG_KEEP 5
+#define CAN_SNIFF_LOG_PATH "/can_sniff1.log"
+File s_canSniffLogFile;
+static uint16_t s_canSniffLogFlushCounter = 0;
+
+// Rotates /can_sniff1.log .. /can_sniffN.log up by one slot (oldest first,
+// logrotate-style) so a fresh sniff session always starts at slot 1 without
+// losing the previous CAN_SNIFF_LOG_KEEP-1 sessions. Called once per
+// sniff-on transition, before opening the new log file.
+static void rotateCanSniffLogs()
+{
+  char oldPath[24], newPath[24];
+  snprintf(oldPath, sizeof(oldPath), "/can_sniff%d.log", CAN_SNIFF_LOG_KEEP);
+  SD.remove(oldPath);  // drop the oldest slot to make room for the shift below
+  for (int i = CAN_SNIFF_LOG_KEEP - 1; i >= 1; i--) {
+    snprintf(oldPath, sizeof(oldPath), "/can_sniff%d.log", i);
+    snprintf(newPath, sizeof(newPath), "/can_sniff%d.log", i + 1);
+    SD.rename(oldPath, newPath);  // no-op if oldPath doesn't exist yet
+  }
+}
+#endif
 
 // Set to true by handlerOTA while an OTA flash is in progress.
 // The telemetry task checks this flag and yields the WiFi to the OTA upload.
@@ -624,9 +658,9 @@ void processOBD(CBuffer* buffer)
     char responseBuf[64];
 
     // Ak je komunikácia s linkou aktívna (obd.link je platný ukazovateľ)
-    char rawBuf[2][20] = { "-", "-" }; // truncated raw hex responses, for the diag line
-    int ret1 = 0, ret2 = 0;
-    long parsed1 = -1, parsed2 = -1;
+    char rawBuf[3][20] = { "-", "-", "-" }; // truncated raw hex responses, for the diag line
+    int ret1 = 0, ret2 = 0, ret3 = 0;
+    long parsed1 = -1, parsed2 = -1, parsed3 = -1;
     const char* src = "NONE";
 
     if (obd.link) {
@@ -667,6 +701,26 @@ void processOBD(CBuffer* buffer)
         }
       }
 
+      // 3. Ak ani jeden VAG UDS DID cez rozšírené (29-bit) adresovanie
+      // nezabral, skúsime alternatívny, štandardný 11-bit fyzický
+      // adresovací pár 0x714 (požiadavka) / 0x77E (odpoveď) pre KOMBI -
+      // iný bežne zdokumentovaný vzor MQB gateway routingu než 18DAxxF1
+      // vyššie (podobný principiálne motoru na 0x7E0/0x7E8).
+      if (odometerKm == 0) {
+        obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // vynúť CAN 11-bit/500k
+        obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> 0x714
+        obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len odpoveď 0x77E
+        obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
+
+        responseBuf[0] = 0;
+        ret3 = obd.link->sendCommand("220505\r", responseBuf, sizeof(responseBuf), 100);
+        strncpy(rawBuf[2], responseBuf, sizeof(rawBuf[2]) - 1);
+        if (ret3 > 0) {
+          parsed3 = parseUdsHexValue(responseBuf, 0x0505);
+          if (parsed3 > 0) { odometerKm = (uint32_t)parsed3; src = "UDS714"; }
+        }
+      }
+
       // --- Vrátiť späť predvolené (11-bit) adresovanie na motor, aby
       // pokračovalo bežné čítanie Mode 1 PID-ov (RPM, rýchlosť, ...) v
       // hlavnej tier-poll slučke bez zmeny.
@@ -675,13 +729,13 @@ void processOBD(CBuffer* buffer)
       obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);   // späť na auto-detekciu protokolu
     }
 
-    // 3. Skúsime štandardný 8-bitový OBD2 PID 0xA6 (ak ho auto podporuje)
+    // 4. Skúsime štandardný 8-bitový OBD2 PID 0xA6 (ak ho auto podporuje)
     if (odometerKm == 0 && obd.readPID(0xA6, odoVal) && odoVal > 0) {
       odometerKm = (uint32_t)odoVal;
       src = "PID_A6";
     }
 
-    // 4. Ak OBD/UDS vyčítanie zlyhá (napr. Peugeot Traveller, alebo VAG s
+    // 5. Ak OBD/UDS vyčítanie zlyhá (napr. Peugeot Traveller, alebo VAG s
     // uzamknutým gateway), použije sa vzdialenosť napočítaná z GPS súradníc
     // (pozri gpsOdometerKm() / processGPS). Ide o vzdialenosť najazdenú od
     // posledného reštartu zariadenia, nie o skutočný stav tachometra vozidla.
@@ -695,12 +749,13 @@ void processOBD(CBuffer* buffer)
     // event logu (logger.logEvent), takže je čitateľný aj bez pripojenia
     // k počítaču - stačí vytiahnuť SD kartu a pozrieť si log súbor.
     // Formát: ODO FW=<firmware verzia> SRC=<zdroj> KM=<hodnota>
-    //         R1=<ret 0x0505> R2=<ret 0x2BDC>
-    //         RAW1=<surová hex odpoveď 0x0505> RAW2=<surová hex odpoveď 0x2BDC>
+    //         R1=<ret 0x0505 ext.> R2=<ret 0x2BDC ext.> R3=<ret 0x0505 @714/77E>
+    //         RAW1=<surová odp. 0x0505 ext.> RAW2=<surová odp. 0x2BDC ext.>
+    //         RAW3=<surová odp. 0x0505 @714/77E>
     {
-      char diag[176];
-      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu R1=%d R2=%d RAW1=%s RAW2=%s",
-          FIRMWARE_VERSION, src, (unsigned long)odometerKm, ret1, ret2, rawBuf[0], rawBuf[1]);
+      char diag[220];
+      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu R1=%d R2=%d R3=%d RAW1=%s RAW2=%s RAW3=%s",
+          FIRMWARE_VERSION, src, (unsigned long)odometerKm, ret1, ret2, ret3, rawBuf[0], rawBuf[1], rawBuf[2]);
       Serial.print("[ODO] "); Serial.println(diag);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) {
@@ -1083,6 +1138,24 @@ void initialize()
     obd.sniff(enableCan);
     s_canSniffActive = enableCan;
     Serial.println(enableCan ? "CAN:sniff on" : "CAN:sniff off");
+#if STORAGE == STORAGE_SD
+    if (enableCan) {
+      // Fresh log per sniff session, keeping the last CAN_SNIFF_LOG_KEEP
+      // sessions on SD (rotated, not overwritten) - see rotateCanSniffLogs().
+      if (state.check(STATE_STORAGE_READY)) {
+        rotateCanSniffLogs();
+        s_canSniffLogFile = SD.open(CAN_SNIFF_LOG_PATH, FILE_WRITE);
+        if (s_canSniffLogFile) {
+          Serial.println("CAN:sniff log open " CAN_SNIFF_LOG_PATH);
+        } else {
+          Serial.println("CAN:sniff log open FAILED");
+        }
+      }
+      s_canSniffLogFlushCounter = 0;
+    } else if (s_canSniffLogFile) {
+      s_canSniffLogFile.close();
+    }
+#endif
     if (enableCan) {
       // Send initial CAN wake-up frame on the OBD2 functional broadcast address
       // (0x7DF) to activate the diagnostic bus before passive sniffing begins.
@@ -1111,7 +1184,8 @@ void initialize()
       // that would otherwise only appear on the serial console.
       char diag[128];
       logger.timestamp(millis());
-      snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s", FIRMWARE_VERSION, devid);
+      snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s BUILD=%s", FIRMWARE_VERSION, devid,
+          BUILD_CAN_SNIFF ? "CAN_SNIFF" : "ODO_READ");
       logger.logEvent(diag);
       snprintf(diag, sizeof(diag), "STATE OBD=%c GPS=%c MEMS=%c",
           state.check(STATE_OBD_READY)  ? '1' : '0',
@@ -1365,6 +1439,20 @@ void process()
         hexLen += snprintf(hexEntry + hexLen, sizeof(hexEntry) - hexLen, "%02X", rxbuf[i]);
       }
       hexEntry[hexLen] = 0;
+#if STORAGE == STORAGE_SD
+      // Full capture to SD - not subject to the RAM ring buffer's small
+      // capacity, so a busy bus can't push VCDS's request/response out
+      // before we get a chance to read it back.
+      if (s_canSniffLogFile) {
+        s_canSniffLogFile.print(millis());
+        s_canSniffLogFile.print(',');
+        s_canSniffLogFile.println(hexEntry);
+        if (++s_canSniffLogFlushCounter >= 8) {
+          s_canSniffLogFlushCounter = 0;
+          s_canSniffLogFile.flush();
+        }
+      }
+#endif
       portENTER_CRITICAL(&s_canBufMux);
       if (s_canFrameCount < CAN_DATA_LIST_MAX) {
         // Append entry to the list.
@@ -2376,6 +2464,11 @@ void showSysInfo()
   Serial.print("WIFI MAC:");
   Serial.println(WiFi.macAddress());
 #endif
+  // What this specific build is for (chosen at build time by
+  // wifi_secrets.py) - printed here so it's unambiguous which build is
+  // running just from the boot log, without needing to check build flags.
+  Serial.print("BUILD:");
+  Serial.println(BUILD_CAN_SNIFF ? "CAN_SNIFF" : "ODO_READ");
 }
 
 void loadConfig()
@@ -2507,6 +2600,17 @@ void loadConfig()
   if (nvs_get_u8(nvs, "CAN_EN", &nvsCanEn) == ESP_OK) {
     enableCan = nvsCanEn != 0;
   }
+
+#if BUILD_CAN_SNIFF
+  // This build was chosen at compile time (wifi_secrets.py prompt) to be a
+  // CAN-sniff bench-test build. Force this regardless of NVS/HTTP toggles:
+  // the odometer block's own AT-command traffic on the shared ELM327 link
+  // would interrupt an active ATM1 monitor stream, so OBD polling (and the
+  // odometer block inside it) must stay off for the whole session, and
+  // sniffing starts automatically without needing a separate CAN=1 command.
+  enableObd = false;
+  enableCan = true;
+#endif
 
   // Deep-standby mode (NVS key DEEP_STANDBY, u8, 0=off 1=on).
   // When enabled the device uses ESP32 deep sleep during standby.

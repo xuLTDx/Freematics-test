@@ -229,8 +229,30 @@
 //             poll, added extended (29-bit) CAN addressing to module 0x17
 //             (Instruments/J285) for the odometer UDS reads, added GPS
 //             distance fallback, added ODO diagnostic line to Serial/SD log
+//   5.3-odo - fixed teleClient used-before-declared build error in
+//             wifiConnect()/wifiReconnectCurrent(), guarded performPullOtaCheck()
+//             so its HTTP-only teleClient.wifi calls only compile for
+//             HTTP-capable SERVER_PROTOCOL builds (not PROTOCOL_UDP), added
+//             WIFI MAC to boot log, enabled ENABLE_WIFI, added 3rd odometer
+//             attempt via standard 11-bit addressing (0x714 request /
+//             0x77E response) alongside the existing extended-addressing
+//             attempts, with R3/RAW3 added to the ODO diagnostic log line
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "5.2-odo"
+#define FIRMWARE_VERSION "5.3-odo"
+#endif
+
+// Build purpose, chosen interactively at build time by wifi_secrets.py
+// (or via the BUILD_PURPOSE env var for non-interactive builds).
+// 0 = ODO_READ (normal driving/logging build; OBD polling incl. the
+//     odometer block runs as usual, CAN sniff stays off unless toggled).
+// 1 = CAN_SNIFF (bench-test build for capturing raw CAN traffic alongside
+//     VCDS; OBD polling is forced OFF and sniffing forced ON at boot,
+//     since the odometer block's own AT commands on the shared ELM327
+//     link would otherwise interrupt the ATM1 monitor stream).
+// The two purposes are mutually exclusive within a single build - see the
+// override in loadConfig() in telelogger.ino.
+#ifndef BUILD_CAN_SNIFF
+#define BUILD_CAN_SNIFF 0
 #endif
 
 // enable(1)/disable(0) BLE SPP server (for Freematics Controller App).
