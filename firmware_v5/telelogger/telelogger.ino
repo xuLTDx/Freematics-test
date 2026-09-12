@@ -607,6 +607,24 @@ static long parseUdsByteRange(const char* resp, uint16_t did, int byteOffset, in
 // reads fail (see the ODOMETER PROCESSING block below).
 uint32_t gpsOdometerKm();
 
+// Diagnostic PIDs for the ODO/FUEL UDS blocks below, sent as regular
+// telemetry fields alongside GPS/OBD data over the SAME cellular/WiFi
+// channel already used for everything else. Traccar's FreematicsProtocolDecoder
+// has no case for these keys, so they fall through to its default branch and
+// get stored as generic "io<key>" position attributes - readable any time the
+// car has signal (not just on WiFi/USB), without any decoder change needed.
+// Range 0x300+ chosen to avoid colliding with standard OBD PIDs (max 0xFF,
+// sent |0x100 => up to 0x1FF) or the existing custom ones (0x81/0x82/0x11f/0x12f/0x1a6).
+// diagCode: 0 = obd.link not up, 1 = no/timeout response, 2 = response
+// received but byte-range parse failed, 3 = success (matches the value
+// actually used for KM/DL that run).
+#define PID_ODO_DIAG  0x300
+#define PID_ODO_RET   0x301
+#define PID_ODO_LEN   0x302
+#define PID_FUEL_DIAG 0x310
+#define PID_FUEL_RET  0x311
+#define PID_FUEL_LEN  0x312
+
 void processOBD(CBuffer* buffer)
 {
   static int idx[2] = {0, 0};
@@ -677,6 +695,8 @@ void processOBD(CBuffer* buffer)
     int ret1 = 0;
     long parsed1 = -1;
     const char* src = "NONE";
+    char sessResp1[24] = "-"; // response to 1003 (extended session request)
+    int sessRet1 = 0;
 
     if (obd.link) {
       // Odometer confirmed 2026-09-12 via a HexSniff bench capture against
@@ -692,7 +712,30 @@ void processOBD(CBuffer* buffer)
       obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
       obd.link->sendCommand("ATSH710\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Gateway (0x19)
       obd.link->sendCommand("ATCRA77A\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
-      obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
+      // ELM327 auto-guesses the flow-control CAN ID it replies with as
+      // "request header + 8" (the standard 11-bit convention, e.g.
+      // 7E0->7E8). VAG's gateway-routed addressing here does NOT follow
+      // that offset (0x710 -> 0x77A), so without telling the chip
+      // explicitly, its auto flow-control frame goes out on the wrong ID,
+      // the module never sees a valid "continue to send" and the multi-frame
+      // UDS response never completes - ELM327 then reports "NO DATA" even
+      // though the module did answer. Every read today failed exactly this
+      // way (see SESS=/R1=/RAW1= diagnostics). Set it explicitly instead:
+      // per ISO-TP, flow control is sent BY the tester (the receiver of the
+      // multi-frame response) using the tester's OWN request ID (0x710),
+      // not the module's response ID - FCSD = "30 00 00" (continue to send,
+      // no block-size limit, no separation delay), FCSM 1 = use both.
+      obd.link->sendCommand("ATFCSH710\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATFCSD300000\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATFCSM1\r", ignore, sizeof(ignore), 100);
+      // Capture (instead of discarding) the response to the session-switch
+      // request - every UDS read today came back "NO DATA" with no
+      // exceptions, which points at 1003 itself being rejected (e.g. a
+      // negative response "7F 10 xx") rather than at a timing/vehicle-speed
+      // issue, since we were previously blind to what this call actually
+      // returned.
+      sessResp1[0] = 0;
+      sessRet1 = obd.link->sendCommand("1003\r", sessResp1, sizeof(sessResp1), 200);
 
       responseBuf[0] = 0;
       ret1 = obd.link->sendCommand("2202BD\r", responseBuf, sizeof(responseBuf), 100);
@@ -709,6 +752,7 @@ void processOBD(CBuffer* buffer)
       // --- Vrátiť späť predvolené (11-bit) adresovanie na motor, aby
       // pokračovalo bežné čítanie Mode 1 PID-ov (RPM, rýchlosť, ...) v
       // hlavnej tier-poll slučke bez zmeny.
+      obd.link->sendCommand("ATFCSM0\r", ignore, sizeof(ignore), 100); // späť na auto flow-control
       obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);   // zruš response filter
       obd.link->sendCommand("ATSH7E0\r", ignore, sizeof(ignore), 100); // späť na motor
       obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);   // späť na auto-detekciu protokolu
@@ -734,17 +778,29 @@ void processOBD(CBuffer* buffer)
     // event logu (logger.logEvent), takže je čitateľný aj bez pripojenia
     // k počítaču - stačí vytiahnuť SD kartu a pozrieť si log súbor.
     // Formát: ODO FW=<firmware verzia> SRC=<zdroj> KM=<hodnota>
-    //         R1=<ret 0x02BD @710/77A> RAW1=<surová odp. 0x02BD @710/77A>
+    //         SESS=<ret 1003>:<odp. 1003> R1=<ret 0x02BD @710/77A> RAW1=<surová odp. 0x02BD @710/77A>
     {
-      char diag[160];
-      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu R1=%d RAW1=%s",
-          FIRMWARE_VERSION, src, (unsigned long)odometerKm, ret1, rawBuf);
+      char diag[192];
+      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu SESS=%d:%s R1=%d RAW1=%s",
+          FIRMWARE_VERSION, src, (unsigned long)odometerKm, sessRet1, sessResp1, ret1, rawBuf);
       Serial.print("[ODO] "); Serial.println(diag);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) {
         logger.logEvent(diag);
       }
 #endif
+    }
+
+    // Send the same diagnosis as regular telemetry fields (see PID_ODO_DIAG
+    // comment above) so it's readable from the server even when this run
+    // happens on a real drive with no WiFi/USB nearby.
+    {
+      int32_t diagCode = !obd.link ? 0 : (ret1 <= 0 ? 1 : (parsed1 <= 0 ? 2 : 3));
+      int32_t diagRet = ret1;
+      int32_t diagLen = (int32_t)strlen(rawBuf);
+      buffer->add(PID_ODO_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
+      buffer->add(PID_ODO_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
+      buffer->add(PID_ODO_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
     }
 
     if (odometerKm > 0) {
@@ -768,6 +824,8 @@ void processOBD(CBuffer* buffer)
     int fuelDeciLiters = 0; // liters * 10, e.g. 475 = 47.5 l
     char fuelRawBuf[24] = "-";
     int fuelRet = 0;
+    char fuelSessResp[24] = "-"; // response to 1003 (extended session request)
+    int fuelSessRet = 0;
 
     if (obd.link) {
       // Confirmed 2026-09-12 via a HexSniff bench capture against a real
@@ -782,7 +840,16 @@ void processOBD(CBuffer* buffer)
       obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
       obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Prístroje (0x17)
       obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
-      obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
+      // See the ODO block's comment above (same fix, same reason) - flow
+      // control uses the tester's own request ID (0x714), not the module's
+      // response ID (0x77E). The 54-byte fuel response is 8 Consecutive
+      // Frames, far more likely to stall on a wrong auto-guessed FC ID than
+      // the odometer's single-CF response.
+      obd.link->sendCommand("ATFCSH714\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATFCSD300000\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATFCSM1\r", ignore, sizeof(ignore), 100);
+      fuelSessResp[0] = 0;
+      fuelSessRet = obd.link->sendCommand("1003\r", fuelSessResp, sizeof(fuelSessResp), 200);
 
       char fuelResponseBuf[200]; // response is 56 bytes total, needs room for hex+spacing
       fuelResponseBuf[0] = 0;
@@ -798,23 +865,34 @@ void processOBD(CBuffer* buffer)
       }
 
       // --- Vrátiť späť predvolené (11-bit) adresovanie na motor
+      obd.link->sendCommand("ATFCSM0\r", ignore, sizeof(ignore), 100);
       obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);
       obd.link->sendCommand("ATSH7E0\r", ignore, sizeof(ignore), 100);
       obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);
     }
 
-    // Formát: FUEL FW=<firmware verzia> DL=<decilitre, t.j. l*10> R1=<ret>
-    //         RAW1=<surová odpoveď 0x22B0 @714/77E>
+    // Formát: FUEL FW=<firmware verzia> DL=<decilitre, t.j. l*10>
+    //         SESS=<ret 1003>:<odp. 1003> R1=<ret> RAW1=<surová odpoveď 0x22B0 @714/77E>
     {
-      char diag[160];
-      snprintf(diag, sizeof(diag), "FUEL FW=%s DL=%d R1=%d RAW1=%s",
-          FIRMWARE_VERSION, fuelDeciLiters, fuelRet, fuelRawBuf);
+      char diag[192];
+      snprintf(diag, sizeof(diag), "FUEL FW=%s DL=%d SESS=%d:%s R1=%d RAW1=%s",
+          FIRMWARE_VERSION, fuelDeciLiters, fuelSessRet, fuelSessResp, fuelRet, fuelRawBuf);
       Serial.print("[FUEL] "); Serial.println(diag);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) {
         logger.logEvent(diag);
       }
 #endif
+    }
+
+    // See PID_ODO_DIAG comment above - same idea, fuel block.
+    {
+      int32_t diagCode = !obd.link ? 0 : (fuelRet <= 0 ? 1 : (fuelParsed < 0 ? 2 : 3));
+      int32_t diagRet = fuelRet;
+      int32_t diagLen = (int32_t)strlen(fuelRawBuf);
+      buffer->add(PID_FUEL_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
+      buffer->add(PID_FUEL_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
+      buffer->add(PID_FUEL_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
     }
 
     if (fuelDeciLiters > 0) {
