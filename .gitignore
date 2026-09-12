@@ -28,4 +28,4 @@ __pycache__/
 .pytest_cache/
 
 # Claude Code local settings (personal, machine-specific - not for the team/public fork)
-.claude/settings.local.json
+.claude/
