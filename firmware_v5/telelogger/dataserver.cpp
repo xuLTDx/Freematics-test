@@ -19,6 +19,7 @@
 * /api/control - issue a control command
 * /api/list - list of log files
 * /api/log/<file #> - raw CSV format log file
+* /api/events/<file #> - just the "FE," diagnostic/event lines from a log file
 * /api/delete/<file #> - delete file
 * /api/data/<file #>?pid=<PID in hex> - JSON array of PID data
 * /api/ota - OTA firmware update (raw binary POST, Content-Type: application/octet-stream)
@@ -293,7 +294,19 @@ int handlerLogList(UrlHandlerParam* param)
 #endif
     int n = snprintf(buf, bufsize, "[");
     if (root) {
-        while(file = root.openNextFile()) {
+        // Leave enough headroom for the longest possible single entry
+        // ({"id":4294967295,"size":4294967295,"active":true},) plus the
+        // closing "]" and NUL, so the loop can always stop cleanly instead
+        // of running snprintf(buf + n, bufsize - n, ...) with a negative
+        // "bufsize - n" once n has already passed bufsize - that gets
+        // reinterpreted as a huge unsigned size, writing far past the
+        // buffer and corrupting memory instead of just truncating.
+        // Confirmed the hard way on 2026-09-12 with 484 accumulated log
+        // files: printed the full list to Serial fine (that part has no
+        // buffer limit), then "Failed to send header" because the actual
+        // HTTP response buffer had already been overrun.
+        const int reserve = 64;
+        while (n < bufsize - reserve && (file = root.openNextFile())) {
             const char *fn = file.name();
             // Handle both full-path ("/DATA/83.CSV") and basename-only ("83.CSV")
             // returned by different versions of the Arduino ESP32 SD library.
@@ -319,6 +332,69 @@ int handlerLogList(UrlHandlerParam* param)
     n += snprintf(buf + n, bufsize - n, "]");
     param->contentType=HTTPFILETYPE_JSON;
     param->contentLength = n;
+    return FLAG_DATA_RAW;
+}
+
+// Extracts only the human-readable diagnostic/event lines (logger.logEvent(),
+// stored on-disk as "FE,<text>" - see FileLogger::logEvent()) from one log
+// file, instead of serving the whole file. Two reasons this exists rather
+// than just using /api/log/<id>:
+//   1. FLAG_DATA_STREAM responses in the shared httpd library hard-code
+//      Content-Length: 0 (see _mwCheckUrlHandlers()) and FLAG_CHUNK is never
+//      set anywhere, so streamed downloads (any file, not just large ones)
+//      come back as a technically-200-OK response with an empty body - the
+//      whole-file download path is broken independent of the earlier
+//      handlerLogList() overflow bug. Confirmed 2026-09-12 via curl -v
+//      showing "Content-Length: 0" from the server itself.
+//   2. Even if that were fixed, a full log file (dozens/hundreds of KB of
+//      per-sample telemetry rows) is far more than needed just to see why an
+//      ODO/FUEL UDS read failed - the "FE," event lines are the only rows
+//      that matter for that and are a tiny fraction of the file.
+// Single-shot (no FLAG_DATA_STREAM/ctx) since the extracted event text for
+// one drive's worth of log is small enough to fit the response buffer.
+int handlerLogEvents(UrlHandlerParam* param)
+{
+    int id = 0;
+    if (param->pucRequest[0] == '/') {
+        id = atoi(param->pucRequest + 1);
+    }
+    char path[24];
+    sprintf(path, "/DATA/%u.CSV", id == 0 ? fileid : id);
+#if STORAGE == STORAGE_SPIFFS
+    File file = SPIFFS.open(path, FILE_READ);
+#else
+    File file = SD.open(path, FILE_READ);
+#endif
+    if (!file) {
+        param->contentLength = snprintf(param->pucBuffer, param->bufSize, "%s not found", path);
+        param->contentType = HTTPFILETYPE_TEXT;
+        return FLAG_DATA_RAW;
+    }
+
+    int n = 0;
+    char line[160];
+    int len = 0;
+    const int reserve = 8;
+    for (;;) {
+        int c = file.read();
+        bool eof = c == -1;
+        if (eof || c == '\n') {
+            line[len] = 0;
+            if (len >= 3 && line[0] == 'F' && line[1] == 'E' && line[2] == ',') {
+                if (n < param->bufSize - reserve) {
+                    n += snprintf(param->pucBuffer + n, param->bufSize - n, "%s\n", line + 3);
+                }
+            }
+            len = 0;
+            if (eof || n >= param->bufSize - reserve) break;
+        } else if (len < (int)sizeof(line) - 1) {
+            line[len++] = (char)c;
+        }
+    }
+    file.close();
+
+    param->contentLength = n;
+    param->contentType = HTTPFILETYPE_TEXT;
     return FLAG_DATA_RAW;
 }
 
@@ -759,6 +835,7 @@ UrlHandler urlHandlerList[]={
     {"api/list", handlerLogList},
     {"api/data", handlerLogData},
     {"api/log", handlerLogFile},
+    {"api/events", handlerLogEvents},
     {"api/delete", handlerLogDelete},
 #endif
     {0}
