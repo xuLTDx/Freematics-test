@@ -78,7 +78,16 @@ PID_POLLING_INFO obdData[]= {
   {PID_SHORT_TERM_FUEL_TRIM_2, 3},
   {PID_LONG_TERM_FUEL_TRIM_2, 3},
   {PID_RUNTIME, 3},
-  {PID_FUEL_LEVEL, 3},
+  // NOTE: PID_FUEL_LEVEL intentionally NOT polled here via standard
+  // obd.readPID() - same reason as PID_ODOMETER above. Confirmed via a
+  // HexSniff capture (2026-09-12) that the standard fuel-level DID this
+  // PID maps to gets zero responses on this vehicle (Gateway-routed
+  // diagnostics again), so leaving it in this tier-3 list would time out
+  // on every pass and `break` the loop, starving PID_BAROMETRIC and
+  // everything listed after it. Read instead via the dedicated UDS block
+  // in processOBD() below (DID 0x22B0 on the Instrument Cluster module,
+  // 0x714/0x77E - not the Gateway that odometer uses), which handles
+  // failure without blocking other PIDs.
   {PID_BAROMETRIC, 3},
   {PID_CONTROL_MODULE_VOLTAGE, 3},
   {PID_ABSOLUTE_ENGINE_LOAD, 3},
@@ -587,6 +596,12 @@ int handlerLiveData(UrlHandlerParam* param)
 // block below).
 static long parseUdsHexValue(const char* resp, uint16_t did);
 
+// Forward declaration: defined right after parseUdsHexValue(); extracts a
+// specific byte range from a UDS ReadDataByIdentifier response instead of
+// treating all trailing data as one value (see the ODOMETER PROCESSING
+// block below).
+static long parseUdsByteRange(const char* resp, uint16_t did, int byteOffset, int byteLen);
+
 // Forward declaration: defined later alongside processGPS(); accumulates
 // GPS-based distance since boot, used as a fallback when OBD/UDS odometer
 // reads fail (see the ODOMETER PROCESSING block below).
@@ -646,7 +661,7 @@ void processOBD(CBuffer* buffer)
   // =========================================================================
   // ODOMETER PROCESSING (Passat B8 UDS / Standard OBD2 / Fallback to GPS)
   // Runs once per minute - the odometer value changes slowly, and each run
-  // costs several extra CAN protocol AT commands (ATSP7/ATSH/1003 + restore),
+  // costs several extra CAN protocol AT commands (ATSP6/ATSH/1003 + restore),
   // so there's no benefit to checking as often as the 5s tier-poll cycle.
   // Independent of GPS position transmission, which is unaffected by this.
   // =========================================================================
@@ -658,67 +673,37 @@ void processOBD(CBuffer* buffer)
     char responseBuf[64];
 
     // Ak je komunikácia s linkou aktívna (obd.link je platný ukazovateľ)
-    char rawBuf[3][20] = { "-", "-", "-" }; // truncated raw hex responses, for the diag line
-    int ret1 = 0, ret2 = 0, ret3 = 0;
-    long parsed1 = -1, parsed2 = -1, parsed3 = -1;
+    char rawBuf[20] = "-"; // truncated raw hex response, for the diag line
+    int ret1 = 0;
+    long parsed1 = -1;
     const char* src = "NONE";
 
     if (obd.link) {
-      // --- Prepnutie na rozšírené (29-bit) CAN adresovanie, aby sme sa
-      // dostali na modul Instruments (VCDS adresa 0x17 / J285) cez gateway.
-      // Adresa modulu potvrdená VCDS skenom: "Address 17: Instruments (J285)".
-      // MQB UDS-on-CAN konvencia rozšíreného adresovania: 0x18DA<target><tester>
-      //   request:  0x18DA17F1  (tester 0xF1 -> modul 0x17)
-      //   response: 0x18DAF117  (modul 0x17 -> tester 0xF1)
-      // Bežné 11-bit adresovanie (0x7E0/0x7E8), ktoré funguje pre motor
-      // (wake-up sekvencia vyššie), sa na tento modul nedostane - preto sme
-      // doteraz dostávali "NO DATA".
+      // Odometer confirmed 2026-09-12 via a HexSniff bench capture against
+      // a real VCDS session (module "19 - Gateway", its "odo read" menu
+      // entry) - full raw capture + byte breakdown in the HexSniff repo at
+      // vehicles/VAG/VW/PassatB8/decoded.md. The two hypotheses previously
+      // tried here - extended 29-bit addressing straight to the instrument
+      // cluster (0x18DA17F1/0x18DAF117) and standard 11-bit 0x714/0x77E -
+      // are both confirmed dead ends: on this MQB platform the odometer is
+      // only reachable through the CAN Gateway module (0x19) itself, not
+      // through the cluster, and DID 0x0505 isn't it anyway.
       char ignore[32];
-      obd.link->sendCommand("ATSP7\r", ignore, sizeof(ignore), 200);       // vynúť CAN 29-bit/500k
-      obd.link->sendCommand("ATSH18DA17F1\r", ignore, sizeof(ignore), 100); // hlavička požiadavky -> modul 0x17
-      obd.link->sendCommand("ATCRA18DAF117\r", ignore, sizeof(ignore), 100); // filtruj len jeho odpoveď
-      // Kombiprístroj často odmieta vozidlo-špecifické DID mimo rozšírenej
-      // (extended) diagnostickej session - najprv ju otvoríme (UDS SID 0x10).
-      obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);
+      obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
+      obd.link->sendCommand("ATSH710\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Gateway (0x19)
+      obd.link->sendCommand("ATCRA77A\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
+      obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
 
-      // 1. Skúsime VAG UDS DID 0x0505 (Passat B8 Dashboard) cez obd.link->
       responseBuf[0] = 0;
-      ret1 = obd.link->sendCommand("220505\r", responseBuf, sizeof(responseBuf), 100);
-      strncpy(rawBuf[0], responseBuf, sizeof(rawBuf[0]) - 1);
+      ret1 = obd.link->sendCommand("2202BD\r", responseBuf, sizeof(responseBuf), 100);
+      strncpy(rawBuf, responseBuf, sizeof(rawBuf) - 1);
       if (ret1 > 0) {
-        parsed1 = parseUdsHexValue(responseBuf, 0x0505);
-        if (parsed1 > 0) { odometerKm = (uint32_t)parsed1; src = "UDS0505"; }
-      }
-
-      // 2. Skúsime VAG UDS DID 0x2BDC (Záložný pre staršie VAG firmware)
-      if (odometerKm == 0) {
-        responseBuf[0] = 0;
-        ret2 = obd.link->sendCommand("222BDC\r", responseBuf, sizeof(responseBuf), 100);
-        strncpy(rawBuf[1], responseBuf, sizeof(rawBuf[1]) - 1);
-        if (ret2 > 0) {
-          parsed2 = parseUdsHexValue(responseBuf, 0x2BDC);
-          if (parsed2 > 0) { odometerKm = (uint32_t)(parsed2 / 10); src = "UDS2BDC"; }
-        }
-      }
-
-      // 3. Ak ani jeden VAG UDS DID cez rozšírené (29-bit) adresovanie
-      // nezabral, skúsime alternatívny, štandardný 11-bit fyzický
-      // adresovací pár 0x714 (požiadavka) / 0x77E (odpoveď) pre KOMBI -
-      // iný bežne zdokumentovaný vzor MQB gateway routingu než 18DAxxF1
-      // vyššie (podobný principiálne motoru na 0x7E0/0x7E8).
-      if (odometerKm == 0) {
-        obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // vynúť CAN 11-bit/500k
-        obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> 0x714
-        obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len odpoveď 0x77E
-        obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
-
-        responseBuf[0] = 0;
-        ret3 = obd.link->sendCommand("220505\r", responseBuf, sizeof(responseBuf), 100);
-        strncpy(rawBuf[2], responseBuf, sizeof(rawBuf[2]) - 1);
-        if (ret3 > 0) {
-          parsed3 = parseUdsHexValue(responseBuf, 0x0505);
-          if (parsed3 > 0) { odometerKm = (uint32_t)parsed3; src = "UDS714"; }
-        }
+        // Dátový blok je CA <km: 3 bajty BE> 00 00 6A 58 D4 <rolling ctr> -
+        // km sú bajty 1..3 (0-indexované) dát, hneď za úvodným stavovým
+        // bajtom. Posledný bajt (rolling counter) sa mení pri každom
+        // pollovaní a nie je súčasťou hodnoty - zámerne sa neparsuje.
+        parsed1 = parseUdsByteRange(responseBuf, 0x02BD, 1, 3);
+        if (parsed1 > 0) { odometerKm = (uint32_t)parsed1; src = "UDS02BD"; }
       }
 
       // --- Vrátiť späť predvolené (11-bit) adresovanie na motor, aby
@@ -749,13 +734,11 @@ void processOBD(CBuffer* buffer)
     // event logu (logger.logEvent), takže je čitateľný aj bez pripojenia
     // k počítaču - stačí vytiahnuť SD kartu a pozrieť si log súbor.
     // Formát: ODO FW=<firmware verzia> SRC=<zdroj> KM=<hodnota>
-    //         R1=<ret 0x0505 ext.> R2=<ret 0x2BDC ext.> R3=<ret 0x0505 @714/77E>
-    //         RAW1=<surová odp. 0x0505 ext.> RAW2=<surová odp. 0x2BDC ext.>
-    //         RAW3=<surová odp. 0x0505 @714/77E>
+    //         R1=<ret 0x02BD @710/77A> RAW1=<surová odp. 0x02BD @710/77A>
     {
-      char diag[220];
-      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu R1=%d R2=%d R3=%d RAW1=%s RAW2=%s RAW3=%s",
-          FIRMWARE_VERSION, src, (unsigned long)odometerKm, ret1, ret2, ret3, rawBuf[0], rawBuf[1], rawBuf[2]);
+      char diag[160];
+      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu R1=%d RAW1=%s",
+          FIRMWARE_VERSION, src, (unsigned long)odometerKm, ret1, rawBuf);
       Serial.print("[ODO] "); Serial.println(diag);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) {
@@ -766,6 +749,76 @@ void processOBD(CBuffer* buffer)
 
     if (odometerKm > 0) {
       buffer->add(PID_ODOMETER | 0x100, ELEMENT_INT32, &odometerKm, sizeof(odometerKm));
+    }
+  }
+  // =========================================================================
+
+  // =========================================================================
+  // FUEL LEVEL PROCESSING (Passat B8 UDS "Calculated volume", module 17)
+  // Same once-per-minute cadence as the odometer block above, for the same
+  // reason - several extra AT commands per read, value doesn't change fast
+  // enough to justify polling on the 5s tier cycle. Independent of the
+  // odometer block (different module/addressing: 0x714/0x77E here vs.
+  // 0x710/0x77A for odometer's Gateway).
+  // =========================================================================
+  static uint32_t lastFuelCheck = 0;
+  if (millis() - lastFuelCheck >= 60000) {
+    lastFuelCheck = millis();
+    long fuelParsed = -1;
+    int fuelDeciLiters = 0; // liters * 10, e.g. 475 = 47.5 l
+    char fuelRawBuf[24] = "-";
+    int fuelRet = 0;
+
+    if (obd.link) {
+      // Confirmed 2026-09-12 via a HexSniff bench capture against a real
+      // VCDS session (module "17 - Instruments" -> "Advanced Measuring
+      // Values" -> "Calculated volume - Fuel level") - see
+      // vehicles/VAG/VW/PassatB8/decoded.md in the HexSniff repo for the
+      // raw capture. NOT the same DID as the standard Mode 1 fuel-level
+      // PID (see the note next to PID_FUEL_LEVEL above) - that one gets
+      // zero responses on this vehicle; this UDS DID is the one that
+      // actually works.
+      char ignore[32];
+      obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
+      obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Prístroje (0x17)
+      obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
+      obd.link->sendCommand("1003\r", ignore, sizeof(ignore), 200);      // rozšírená diagnostická session
+
+      char fuelResponseBuf[200]; // response is 56 bytes total, needs room for hex+spacing
+      fuelResponseBuf[0] = 0;
+      fuelRet = obd.link->sendCommand("2222B0\r", fuelResponseBuf, sizeof(fuelResponseBuf), 150);
+      strncpy(fuelRawBuf, fuelResponseBuf, sizeof(fuelRawBuf) - 1);
+      if (fuelRet > 0) {
+        // Data block is 54 bytes; "Calculated volume - Fuel level" is the
+        // big-endian 2-byte field at offset [33:35] - divide by 10 for
+        // liters. Rest of the block (other tank sensor readings) isn't
+        // decoded/needed here.
+        fuelParsed = parseUdsByteRange(fuelResponseBuf, 0x22B0, 33, 2);
+        if (fuelParsed >= 0) { fuelDeciLiters = (int)fuelParsed; }
+      }
+
+      // --- Vrátiť späť predvolené (11-bit) adresovanie na motor
+      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATSH7E0\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);
+    }
+
+    // Formát: FUEL FW=<firmware verzia> DL=<decilitre, t.j. l*10> R1=<ret>
+    //         RAW1=<surová odpoveď 0x22B0 @714/77E>
+    {
+      char diag[160];
+      snprintf(diag, sizeof(diag), "FUEL FW=%s DL=%d R1=%d RAW1=%s",
+          FIRMWARE_VERSION, fuelDeciLiters, fuelRet, fuelRawBuf);
+      Serial.print("[FUEL] "); Serial.println(diag);
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) {
+        logger.logEvent(diag);
+      }
+#endif
+    }
+
+    if (fuelDeciLiters > 0) {
+      buffer->add(PID_FUEL_LEVEL | 0x100, ELEMENT_INT32, &fuelDeciLiters, sizeof(fuelDeciLiters));
     }
   }
   // =========================================================================
@@ -803,6 +856,47 @@ static long parseUdsHexValue(const char* resp, uint16_t did)
 
   if (n <= 6) return -1; // positive response but no data bytes attached
   return strtol(hex + 6, nullptr, 16);
+}
+
+// Like parseUdsHexValue(), but for DIDs whose value isn't the *entire*
+// trailing data block - e.g. the Passat B8 Gateway (0x19) DID 0x02BD
+// returns 10 data bytes packed together (status byte, the odometer value,
+// then more unidentified bytes ending in a rolling/alive counter that
+// changes on every poll - see vehicles/VAG/VW/PassatB8/decoded.md in the
+// HexSniff repo for the full byte-by-byte breakdown). This extracts
+// `byteLen` bytes starting at `byteOffset` within the data (0 = the first
+// data byte right after the DID) as a single big-endian unsigned value,
+// ignoring everything before/after that slice. Same validation and
+// negative-response handling as parseUdsHexValue().
+static long parseUdsByteRange(const char* resp, uint16_t did, int byteOffset, int byteLen)
+{
+  if (!resp) return -1;
+  // 128 hex chars = up to a 64-byte UDS response (SID+DID+62 data bytes) -
+  // comfortably covers the largest response seen so far (the Passat B8
+  // "Calculated volume" DID 0x22B0, 56 bytes total, needing offsets up to
+  // ~35 = hex index ~76). Bump this if a vehicle ever needs a bigger DID.
+  char hex[128];
+  int n = 0;
+  for (const char* p = resp; *p && n < (int)sizeof(hex) - 1; p++) {
+    if (isxdigit((unsigned char)*p)) hex[n++] = *p;
+  }
+  hex[n] = 0;
+  if (n < 6) return -1;
+
+  char sidStr[3] = { hex[0], hex[1], 0 };
+  if (strtoul(sidStr, nullptr, 16) != 0x62) return -1;
+
+  char didStr[5] = { hex[2], hex[3], hex[4], hex[5], 0 };
+  if (strtoul(didStr, nullptr, 16) != did) return -1;
+
+  int start = 6 + byteOffset * 2;
+  int end = start + byteLen * 2;
+  if (end > n) return -1; // response too short for the requested byte range
+
+  char slice[16];
+  memcpy(slice, hex + start, byteLen * 2);
+  slice[byteLen * 2] = 0;
+  return strtol(slice, nullptr, 16);
 }
 
 bool initGPS()
