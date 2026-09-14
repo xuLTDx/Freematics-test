@@ -620,6 +620,16 @@ int handlerControl(UrlHandlerParam* param)
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
         printOtaStatus();
+    } else if (!strncmp(cmd, "OTA_PORT=", 9)) {
+        // Set the pull-OTA server port (NVS key OTA_PORT, u16; default 443).
+        // Lets the OTA host run on a non-privileged port (e.g. 8443) instead
+        // of 443, which a plain server process can't bind without root.
+        uint16_t port = (uint16_t)atoi(cmd + 9);
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_u16(nvs, "OTA_PORT", port) == ESP_OK
+            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
+        loadConfig();
+        printOtaStatus();
     } else if (!strcmp(cmd, "CAN_DATA?")) {
         // Return accumulated CAN bus raw frame data (hex-encoded) and clear the buffer.
         // Each frame's payload bytes are represented as consecutive two-char hex pairs.
