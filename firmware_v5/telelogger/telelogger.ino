@@ -624,6 +624,49 @@ uint32_t gpsOdometerKm();
 #define PID_FUEL_DIAG 0x310
 #define PID_FUEL_RET  0x311
 #define PID_FUEL_LEN  0x312
+// Session-control (1003) outcome, sent alongside the above so it's readable
+// remotely too - previously this only went into the SD event log's SESS=
+// text, which needs WiFi/USB access to the device to read at all, defeating
+// the point of diagnosing a real-drive failure. sessCode: 0 = no/timeout
+// response, 1 = negative response (session request rejected - sessNrc holds
+// the UDS NRC byte, e.g. 0x22 conditionsNotCorrect, 0x33 securityAccess
+// required), 2 = some other unexpected response (garbage, or "NO DATA" -
+// no hex digits at all), 3 = positive response confirmed (50 03).
+#define PID_ODO_SESS      0x303
+#define PID_ODO_SESS_NRC  0x304
+#define PID_FUEL_SESS     0x313
+#define PID_FUEL_SESS_NRC 0x314
+
+// Classifies a UDS session-control (1003) response so the outcome can be
+// sent as a compact telemetry value instead of the raw text. See the
+// PID_ODO_SESS comment above for the meaning of the returned code.
+static int classifySessionResponse(int ret, const char* resp, int* nrcOut)
+{
+  *nrcOut = 0;
+  if (ret <= 0) return 0;
+  char hex[16];
+  int n = 0;
+  for (const char* p = resp; *p && n < (int)sizeof(hex) - 1; p++) {
+    if (isxdigit((unsigned char)*p)) hex[n++] = *p;
+  }
+  hex[n] = 0;
+  if (n < 2) return 2; // e.g. "NO DATA" - no hex digits at all
+  char sidStr[3] = { hex[0], hex[1], 0 };
+  long sid = strtol(sidStr, nullptr, 16);
+  if (sid == 0x50) {
+    if (n >= 4) {
+      char subStr[3] = { hex[2], hex[3], 0 };
+      if (strtol(subStr, nullptr, 16) == 0x03) return 3;
+    }
+    return 2;
+  }
+  if (sid == 0x7F && n >= 6) {
+    char nrcStr[3] = { hex[4], hex[5], 0 };
+    *nrcOut = (int)strtol(nrcStr, nullptr, 16);
+    return 1;
+  }
+  return 2;
+}
 
 void processOBD(CBuffer* buffer)
 {
@@ -801,6 +844,12 @@ void processOBD(CBuffer* buffer)
       buffer->add(PID_ODO_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
       buffer->add(PID_ODO_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
       buffer->add(PID_ODO_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
+
+      int sessNrc = 0;
+      int32_t sessCode = classifySessionResponse(sessRet1, sessResp1, &sessNrc);
+      int32_t sessNrc32 = sessNrc;
+      buffer->add(PID_ODO_SESS, ELEMENT_INT32, &sessCode, sizeof(sessCode));
+      buffer->add(PID_ODO_SESS_NRC, ELEMENT_INT32, &sessNrc32, sizeof(sessNrc32));
     }
 
     if (odometerKm > 0) {
@@ -893,6 +942,12 @@ void processOBD(CBuffer* buffer)
       buffer->add(PID_FUEL_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
       buffer->add(PID_FUEL_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
       buffer->add(PID_FUEL_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
+
+      int fuelSessNrc = 0;
+      int32_t fuelSessCode = classifySessionResponse(fuelSessRet, fuelSessResp, &fuelSessNrc);
+      int32_t fuelSessNrc32 = fuelSessNrc;
+      buffer->add(PID_FUEL_SESS, ELEMENT_INT32, &fuelSessCode, sizeof(fuelSessCode));
+      buffer->add(PID_FUEL_SESS_NRC, ELEMENT_INT32, &fuelSessNrc32, sizeof(fuelSessNrc32));
     }
 
     if (fuelDeciLiters > 0) {
