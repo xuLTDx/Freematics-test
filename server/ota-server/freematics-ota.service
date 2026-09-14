@@ -1,0 +1,14 @@
+[Unit]
+Description=Freematics telelogger pull-OTA server
+After=network.target
+
+[Service]
+Type=simple
+User=ultd
+WorkingDirectory=/home/ultd/ota-server
+ExecStart=/usr/bin/python3 /home/ultd/ota-server/ota_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -29,3 +29,9 @@ __pycache__/
 
 # Claude Code local settings (personal, machine-specific - not for the team/public fork)
 .claude/
+
+# OTA server: device tokens + TLS key are secrets, never commit them.
+# See server/ota-server/registry.example.json for the expected shape.
+server/ota-server/registry.json
+server/ota-server/*.pem
+server/ota-server/server.log
