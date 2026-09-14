@@ -753,6 +753,30 @@ void processOBD(CBuffer* buffer)
       // through the cluster, and DID 0x0505 isn't it anyway.
       char ignore[32];
       obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
+      // Confirmed 2026-09-14 via server-side telemetry (SESS=9:NO DATA on
+      // EVERY single attempt across 2 real drives, no exceptions) - even
+      // the 1003 session-open request itself never gets a response during
+      // real driving, not just the follow-up DID read. Cross-checked
+      // against the HexSniff capture of a real VCDS session on this same
+      // vehicle: VCDS continuously broadcasts TesterPresent (3E 80) on
+      // FUNCTIONAL address 0x700 throughout the whole session (every
+      // ~200ms, confirmed present right up to and through the successful
+      // odometer read). This firmware never sent that broadcast at all -
+      // the Gateway/Instruments modules apparently won't answer ANY
+      // physically-addressed diagnostic request, including the session
+      // request, without it. Announce tester presence functionally first.
+      obd.link->sendCommand("ATSH700\r", ignore, sizeof(ignore), 100);   // funkčná (broadcast) adresa
+      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);     // bez filtra (nečakáme konkrétnu odpoveď)
+      // VCDS neposiela len jeden paket - v zázname beží nepretržite ~9+
+      // sekúnd (opakovane každých ~200-400ms) predtým, než modul začne
+      // odpovedať na fyzicky adresované požiadavky. Jeden jediný broadcast
+      // tesne pred prepnutím adresy nemusí stačiť, ak Gateway vyžaduje
+      // "udržateľnú" prítomnosť testera. Každé sendCommand tu aj tak čaká
+      // celý timeout (odpoveď na 3E 80 je potlačená), takže 5 opakovaní
+      // samo osebe rozloží vysielanie na ~500ms.
+      for (int i = 0; i < 5; i++) {
+        obd.link->sendCommand("3E80\r", ignore, sizeof(ignore), 100);    // TesterPresent, potlačená odpoveď
+      }
       obd.link->sendCommand("ATSH710\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Gateway (0x19)
       obd.link->sendCommand("ATCRA77A\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
       // ELM327 auto-guesses the flow-control CAN ID it replies with as
@@ -887,6 +911,15 @@ void processOBD(CBuffer* buffer)
       // actually works.
       char ignore[32];
       obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
+      // See the ODO block's comment above (same fix, same reason) - announce
+      // functional TesterPresence (0x700, 3E 80) before switching to a
+      // physical module address, matching what a real VCDS session does
+      // continuously throughout its session on this vehicle.
+      obd.link->sendCommand("ATSH700\r", ignore, sizeof(ignore), 100);
+      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);
+      for (int i = 0; i < 5; i++) {
+        obd.link->sendCommand("3E80\r", ignore, sizeof(ignore), 100);
+      }
       obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Prístroje (0x17)
       obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
       // See the ODO block's comment above (same fix, same reason) - flow
