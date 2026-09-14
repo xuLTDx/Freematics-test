@@ -375,10 +375,36 @@ int handlerLogEvents(UrlHandlerParam* param)
     char line[160];
     int len = 0;
     const int reserve = 8;
+    // Read in blocks rather than file.read() one byte at a time - on a
+    // large file (a full drive can be 100KB+) single-byte SD reads are slow
+    // enough, with enough loop iterations, to starve the watchdog and hang
+    // the httpd task with no response ever sent. Confirmed 2026-09-14: a
+    // request for an ~87KB file never returned (device stayed reachable on
+    // ping but the request itself just hung). Also yield() periodically as
+    // a second safety net regardless of read strategy.
+    char block[256];
+    int blockLen = 0;
+    int blockPos = 0;
+    uint32_t iterations = 0;
     for (;;) {
-        int c = file.read();
-        bool eof = c == -1;
-        if (eof || c == '\n') {
+        if (blockPos >= blockLen) {
+            blockLen = file.readBytes(block, sizeof(block));
+            blockPos = 0;
+            if (blockLen <= 0) {
+                // EOF - flush whatever partial line remains, same as the
+                // original single-byte loop's eof handling.
+                line[len] = 0;
+                if (len >= 3 && line[0] == 'F' && line[1] == 'E' && line[2] == ',') {
+                    if (n < param->bufSize - reserve) {
+                        n += snprintf(param->pucBuffer + n, param->bufSize - n, "%s\n", line + 3);
+                    }
+                }
+                break;
+            }
+        }
+        char c = block[blockPos++];
+        if ((++iterations & 0x3FF) == 0) yield();
+        if (c == '\n') {
             line[len] = 0;
             if (len >= 3 && line[0] == 'F' && line[1] == 'E' && line[2] == ',') {
                 if (n < param->bufSize - reserve) {
@@ -386,9 +412,9 @@ int handlerLogEvents(UrlHandlerParam* param)
                 }
             }
             len = 0;
-            if (eof || n >= param->bufSize - reserve) break;
+            if (n >= param->bufSize - reserve) break;
         } else if (len < (int)sizeof(line) - 1) {
-            line[len++] = (char)c;
+            line[len++] = c;
         }
     }
     file.close();
