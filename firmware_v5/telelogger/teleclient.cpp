@@ -28,6 +28,13 @@ extern char isoTime[];
 // See telelogger.ino's definition (right after "State state;") for why this
 // wrapper exists instead of calling logger.logEvent() directly from here.
 extern void logNetEvent(const char* msg);
+// Lets an inbound EVENT_COMMAND (see TeleClientUDP::inbound() below) make the
+// pull-OTA check run immediately - same trigger /api/control?cmd=OTA_CHECK_NOW
+// uses locally, reused here so a server-initiated push-signal (delivered via
+// Traccar's existing Command.TYPE_CUSTOM, reaching the device through the
+// same NAT mapping its own outbound packets keep open - works over cellular,
+// not just LAN) can request the same check without any new fetch logic.
+extern void httpTriggerOtaCheckNow();
 // Runtime-configurable server settings (set from NVS by loadConfig() in telelogger.ino).
 // The macro names SERVER_HOST / SERVER_PORT defined in config.h are overridden below
 // so that all existing code in this file uses the runtime values transparently.
@@ -417,8 +424,14 @@ bool TeleClientUDP::connect(bool quick)
         continue;
       }
     }
-    // log in or reconnect to Freematics Hub
-    if (!notify(event)) {
+    // log in or reconnect to Freematics Hub.
+    // LOGIN only (not every RECONNECT) carries FW=<FIRMWARE_VERSION> as the
+    // payload - Traccar logs the raw incoming line regardless of whether its
+    // decoder parses this field, so ota_push_watcher.py can read a device's
+    // current build straight from that log without querying the device
+    // directly (which would only work when it's reachable on the LAN).
+    // Minimal added data: one short field, once per session.
+    if (!notify(event, event == EVENT_LOGIN ? ("FW=" FIRMWARE_VERSION) : 0)) {
 #if ENABLE_WIFI
       if (wifi.connected())
       {
@@ -551,6 +564,19 @@ void TeleClientUDP::inbound()
         Serial.print("[UDP] FEED ID:");
         Serial.println(feedid);
         break;
+    case EVENT_COMMAND: {
+        // Server-initiated push signal, e.g. "EV=5,TS=...,ID=...,CMD=OTA_READY*XX"
+        // sent via Traccar's Command.TYPE_CUSTOM. Only OTA_READY is recognised
+        // for now; anything else is ignored (forward-compatible with future
+        // command types without needing a firmware update to tolerate them).
+        char *cmdp = strstr(data, "CMD=");
+        if (cmdp && !strncmp(cmdp + 4, "OTA_READY", 9)) {
+          Serial.println("[UDP] CMD:OTA_READY");
+          logNetEvent("NET CMD_OTA_READY");
+          httpTriggerOtaCheckNow();
+        }
+        break;
+    }
     }
     lastSyncTime = millis();
   } while(0);
