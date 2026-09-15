@@ -1,0 +1,16 @@
+{
+  "ota_host": "ultd@10.74.18.4",
+  "ota_dir": "/home/ultd/ota-server",
+  "profiles": {
+    "esp32dev": {
+      "remote_name": "telelogger-vag.bin",
+      "token": "REPLACE_WITH_THIS_DEVICE_S_REGISTRY_JSON_TOKEN",
+      "device_ip": "OPTIONAL - device's LAN IP, e.g. 192.168.0.39. When set, a build also auto-sets OTA_TOKEN on the device (best-effort, only if it's reachable on this LAN right now) - remove this line if you don't want that."
+    },
+    "esp32dev_zafira": {
+      "remote_name": "telelogger-psa.bin",
+      "token": "REPLACE_WITH_THIS_DEVICE_S_REGISTRY_JSON_TOKEN",
+      "device_ip": "OPTIONAL - same idea, same physical device if you swap it between vehicles"
+    }
+  }
+}

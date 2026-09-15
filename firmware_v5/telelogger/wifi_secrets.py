@@ -78,3 +78,19 @@ def _inject_secret(env_var_name, macro_name, prompt_label):
 
 _inject_secret("WIFI_PWD", "WIFI_PASSWORD", "WiFi password (primary network)")
 _inject_secret("WIFI_PWD2", "WIFI_PASSWORD2", "WiFi password (secondary network)")
+
+# Loud, first-thing-printed reminder of which vehicle this build is for -
+# added so picking the wrong PlatformIO environment (e.g. when switching
+# which car the physical device is currently wired to) is obvious before
+# you've even finished reading the build log, not just discoverable later
+# from the small env name buried in PlatformIO's own header line. The
+# actual cross-vehicle safety net is the variant check in ota_server.py/
+# ota_push_watcher.py (refuses a mismatched push/pull regardless of what
+# gets built) - this is purely about catching the mistake earlier, at your
+# own keyboard, before it ever reaches the network.
+_VEHICLE_LABELS = {
+    "esp32dev": "VW Passat B8 (VAG/MQB UDS build)",
+    "esp32dev_zafira": "Opel Zafira Life (PSA/Stellantis UDS build)",
+}
+_pioenv = env["PIOENV"]  # noqa: F821
+print(f"[wifi_secrets] Building for: {_VEHICLE_LABELS.get(_pioenv, _pioenv)}", flush=True)

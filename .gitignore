@@ -38,3 +38,8 @@ server/ota-server/server.log
 # See server/ota-server/traccar_credentials.example.json for the expected shape.
 server/ota-server/traccar_credentials.json
 server/ota-server/*.log
+
+# firmware_v5/telelogger/publish_ota.py's config: maps PlatformIO env -> the
+# device's registry.json token - a token is a bearer credential, never commit.
+# See publish_ota_config.example.json for the expected shape.
+firmware_v5/telelogger/publish_ota_config.json

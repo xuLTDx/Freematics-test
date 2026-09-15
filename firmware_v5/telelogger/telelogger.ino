@@ -3202,6 +3202,15 @@ bool performPullOtaCheck()
   // offering "available:true" forever and re-flashing the same build every
   // OTA_INTERVAL cycle. Spaces are the only character in that string not
   // safe raw in a query value - percent-encoded here.
+  //
+  // variant=FIRMWARE_VERSION (e.g. "5.3-odo-PSA") is also sent - this is the
+  // device's own periodic pull-check, a completely separate path from the
+  // push-decision service's (ota_push_watcher.py) variant safety check,
+  // which only guards ITS OWN trigger and does nothing to stop this pull
+  // path from fetching whatever a mismatched/stale token happens to point
+  // at. ota_server.py's meta.json handler refuses when this doesn't match
+  // the registry entry's own expected_variant, so a device can never pull
+  // another vehicle's firmware over its own token by itself either.
   char metaPath[448];
   {
     char buildEnc[48];
@@ -3215,7 +3224,8 @@ bool performPullOtaCheck()
     }
     buildEnc[bi] = 0;
     snprintf(metaPath, sizeof(metaPath),
-             "/api/freematics/ota_pull/%s/meta.json?build=%s", otaToken, buildEnc);
+             "/api/freematics/ota_pull/%s/meta.json?build=%s&variant=%s",
+             otaToken, buildEnc, FIRMWARE_VERSION);
   }
 
   Serial.printf("[OTA-PULL] URL: https://%s:%u/api/freematics/ota_pull/%.8s.../meta.json\n",
