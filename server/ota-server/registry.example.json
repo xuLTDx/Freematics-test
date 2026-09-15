@@ -2,6 +2,9 @@
   "REPLACE_WITH_A_RANDOM_64_HEX_CHAR_TOKEN_PER_DEVICE": {
     "device": "human-readable label, e.g. ZKUCA42T (Passat B8, VAG)",
     "firmware": "/absolute/path/to/telelogger-vag.bin",
-    "enabled": false
+    "target_build": "Sep 14 2026 12:04:32",
+    "enabled": false,
+    "device_ip": "192.168.0.39",
+    "device_id": "ZKUCA42T"
   }
 }

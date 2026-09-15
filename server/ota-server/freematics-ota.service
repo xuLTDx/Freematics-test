@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=ultd
-WorkingDirectory=/home/ultd/ota-server
-ExecStart=/usr/bin/python3 /home/ultd/ota-server/ota_server.py
+User=freematics-ota
+WorkingDirectory=/opt/freematics-ota
+ExecStart=/usr/bin/python3 /opt/freematics-ota/ota_server.py
 Restart=on-failure
 RestartSec=5
 
