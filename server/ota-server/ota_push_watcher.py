@@ -24,16 +24,25 @@ How it decides, per registry.json entry with a traccar_device_id set
 (entries without one are skipped - stays optional/backward compatible):
   1. GET {traccar_url}/api/devices/{id} for its positionId, then
      GET {traccar_url}/api/positions?id={positionId} for that position's
-     attributes.versionFw - the device's last self-reported build (sent
+     attributes.versionFw (build timestamp) and attributes.otaVariant (short
+     vehicle-module tag, e.g. "5.3-odo-PSA" vs "5.3-odo-VAG") - both sent
      once per LOGIN in teleclient.cpp's notify() payload, decoded into
-     Position.KEY_VERSION_FW by FreematicsProtocolDecoder.java). This is a
-     database-backed attribute, not a line in a rotatable log file, so it
-     survives however long the device stays offline and however Traccar's
-     own log rotation is configured.
-  2. Compare against this entry's target_build with the exact same
-     is_update_needed() logic ota_server.py's own meta.json handler uses -
-     imported from there, not reimplemented.
-  3. If needed: authenticate to Traccar (POST /api/session) and
+     Position.KEY_VERSION_FW / a custom "otaVariant" attribute by
+     FreematicsProtocolDecoder.java. Database-backed, not a line in a
+     rotatable log file, so it survives however long the device stays
+     offline and however Traccar's own log rotation is configured.
+  2. If this entry has an expected_variant, it must match the device's
+     reported otaVariant or the entry is refused (warning logged, nothing
+     sent). VAG and PSA builds compile from the identical source tree, so
+     neither a timestamp nor a git commit hash would catch a stale/wrong
+     traccar_device_id silently offering one vehicle's firmware to another's
+     hardware - this is what actually catches that, same as the device_id
+     check in the earlier direct-IP design, just checked against what the
+     device itself reports through Traccar instead of a local /api/info call.
+  3. Compare the build timestamp against this entry's target_build with the
+     exact same is_update_needed() logic ota_server.py's own meta.json
+     handler uses - imported from there, not reimplemented.
+  4. If needed: authenticate to Traccar (POST /api/session) and
      POST /api/commands/send with a Command.TYPE_CUSTOM whose data is the
      checksummed "EV=5,TS=...,ID=...,CMD=OTA_READY*XX" string (see
      make_ota_ready_command.py for the same checksum, kept in sync here).
@@ -43,7 +52,7 @@ How it decides, per registry.json entry with a traccar_device_id set
      the moment the device's next packet is decoded - verified by reading
      CommandsManager/ExtendedObjectDecoder directly, not assumed. Nothing
      about that queuing is specific to this protocol or this script.
-  4. The device's own EVENT_COMMAND handler then makes its existing pull-OTA
+  5. The device's own EVENT_COMMAND handler then makes its existing pull-OTA
      check (performPullOtaCheck() - SD-staged download, incremental SHA256
      against meta.json's hash, only written to the trusted marker file on a
      match) run immediately. This script never touches SD/flash/hashes.
@@ -125,17 +134,22 @@ class TraccarSession:
             return r.read()
 
 
-def current_build(session, traccar_device_id):
-    """Latest self-reported fw_build for this device, or None if it has
-    never sent one (e.g. never logged in since the FW= payload was added)."""
+def current_state(session, traccar_device_id):
+    """(fw_build, variant) last self-reported by this device, or (None, None)
+    if it has never sent one (e.g. never logged in since the FW=/VARIANT=
+    payload was added). variant is the short vehicle-module tag (e.g.
+    "5.3-odo-PSA" vs "5.3-odo-VAG") - VAG and PSA builds compile from the
+    identical source tree at different times, so the build timestamp alone
+    can't tell them apart; only this can."""
     device = session.get(f"/api/devices/{traccar_device_id}")
     position_id = device.get("positionId")
     if not position_id:
-        return None
+        return None, None
     position = session.get(f"/api/positions?id={position_id}")
     if isinstance(position, list):
         position = position[0] if position else {}
-    return (position.get("attributes") or {}).get("versionFw")
+    attrs = position.get("attributes") or {}
+    return attrs.get("versionFw"), attrs.get("otaVariant")
 
 
 def push_ota_ready(session, traccar_device_id, device_id_str):
@@ -157,13 +171,24 @@ def run_once(session):
         if not traccar_device_id or not device_id_str:
             continue  # registry entry not opted into push checking
 
-        reported_build = current_build(session, traccar_device_id)
-        target_build = entry.get("target_build")
-        if not is_update_needed(reported_build, target_build):
-            log.info("[%s] up to date (%s)", label, reported_build)
+        reported_build, reported_variant = current_state(session, traccar_device_id)
+
+        expected_variant = entry.get("expected_variant")
+        if expected_variant and reported_variant and reported_variant != expected_variant:
+            log.warning(
+                "[%s] variant mismatch: device reports %r, this registry entry expects %r "
+                "- refusing to push (wrong vehicle firmware would be offered)",
+                label, reported_variant, expected_variant,
+            )
             continue
 
-        log.info("[%s] running %r, target %r - pushing OTA_READY", label, reported_build, target_build)
+        target_build = entry.get("target_build")
+        if not is_update_needed(reported_build, target_build):
+            log.info("[%s] up to date (%s, variant %s)", label, reported_build, reported_variant)
+            continue
+
+        log.info("[%s] running %r (variant %r), target %r - pushing OTA_READY",
+                  label, reported_build, reported_variant, target_build)
         try:
             push_ota_ready(session, traccar_device_id, device_id_str)
             log.info("[%s] command accepted (delivered now, or queued if currently offline)", label)

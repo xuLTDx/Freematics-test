@@ -432,20 +432,37 @@ bool TeleClientUDP::connect(bool quick)
       }
     }
     // log in or reconnect to Freematics Hub.
-    // LOGIN only (not every RECONNECT) carries FW=<FW_BUILD_STR> as the
-    // payload - the exact build timestamp (e.g. "Sep 15 2026 20:53:10"),
-    // NOT FIRMWARE_VERSION (a short tag like "5.3-odo-PSA") - it has to be
-    // the same timestamp format /api/info's fw_build reports and
-    // ota_server.py/ota_push_watcher.py's is_update_needed() compares
-    // against target_build, or every comparison against it is meaningless.
-    // FreematicsProtocolDecoder.java stores this as Position.KEY_VERSION_FW
-    // regardless of whether it parses as a date, so ota_push_watcher.py can
-    // read a device's current build from Traccar's database without
-    // querying the device directly (only works while it's reachable on the
-    // LAN). Minimal added data: one short field, once per session.
-    char fwPayload[40];
+    // LOGIN only (not every RECONNECT) carries two fields, each answering a
+    // different question that a timestamp or a git hash ALONE cannot:
+    //   FW=<FW_BUILD_STR>   - exact build timestamp (e.g. "Sep 15 2026
+    //                         20:53:10"), same format /api/info's fw_build
+    //                         reports - used for ordering/anti-downgrade by
+    //                         ota_server.py/ota_push_watcher.py's
+    //                         is_update_needed(). Says WHEN.
+    //   VARIANT=<FIRMWARE_VERSION> - short vehicle-module tag (e.g.
+    //                         "5.3-odo-PSA" vs "5.3-odo-VAG"). VAG and PSA
+    //                         builds compile from the identical source tree
+    //                         at different times/flags - neither the
+    //                         timestamp nor a git commit hash would tell
+    //                         you WHICH one a device is actually running,
+    //                         only this does. ota_push_watcher.py checks
+    //                         this against each registry.json entry's own
+    //                         expected variant before pushing - the actual
+    //                         guard against silently pushing one vehicle's
+    //                         firmware onto another's hardware (some
+    //                         wrong/stale registry_device_id, a copy-paste
+    //                         mistake) that a plain IP/identity check can't
+    //                         catch once two profiles share one token
+    //                         history, as VAG and PSA now do on this same
+    //                         physical test unit.
+    // FreematicsProtocolDecoder.java stores both as distinct Position
+    // attributes regardless of whether either parses as a date, so
+    // ota_push_watcher.py can read a device's current build+variant from
+    // Traccar's database without querying the device directly (only works
+    // while it's reachable on the LAN).
+    char fwPayload[64];
     if (event == EVENT_LOGIN) {
-      snprintf(fwPayload, sizeof(fwPayload), "FW=%s", FW_BUILD_STR);
+      snprintf(fwPayload, sizeof(fwPayload), "FW=%s,VARIANT=%s", FW_BUILD_STR, FIRMWARE_VERSION);
     }
     if (!notify(event, event == EVENT_LOGIN ? fwPayload : 0)) {
 #if ENABLE_WIFI
