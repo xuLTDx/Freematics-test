@@ -64,7 +64,6 @@ extern nvs_handle_t nvs;
 extern void loadConfig();
 extern bool enableLedRed;  // read here to apply LED state immediately in handlerControl
 extern bool enableObd;         // runtime OBD enable flag (NVS key OBD_EN)
-extern bool enableCan;         // runtime CAN enable flag (NVS key CAN_EN)
 extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDBY)
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
@@ -475,11 +474,6 @@ int handlerControl(UrlHandlerParam* param)
         // Reflects the live enableObd flag (loaded from NVS key OBD_EN at boot
         // and updated by OBD= set commands).
         n = snprintf(buf, bufsize, "%u", (unsigned)enableObd);
-    } else if (!strcmp(cmd, "CAN?")) {
-        // Return current CAN bus sniffing state: "1" = enabled, "0" = disabled.
-        // Reflects the live enableCan flag (loaded from NVS key CAN_EN at boot
-        // and updated by CAN= set commands).
-        n = snprintf(buf, bufsize, "%u", (unsigned)enableCan);
     } else if (!strcmp(cmd, "STANDBY_TIME?")) {
         // Return the current standby-time override in seconds.
         // Returns "0" when no override is set (firmware uses compile-time default).
@@ -593,14 +587,6 @@ int handlerControl(UrlHandlerParam* param)
         uint8_t v = (uint8_t)atoi(cmd + 4);
         n = snprintf(buf, bufsize, "%s",
             nvs_set_u8(nvs, "OBD_EN", v) == ESP_OK
-            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-        loadConfig();
-    } else if (!strncmp(cmd, "CAN=", 4)) {
-        // Enable (1) or disable (0) CAN bus at runtime.
-        // Written to NVS key CAN_EN so the setting survives reboot.
-        uint8_t v = (uint8_t)atoi(cmd + 4);
-        n = snprintf(buf, bufsize, "%s",
-            nvs_set_u8(nvs, "CAN_EN", v) == ESP_OK
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
     } else if (!strncmp(cmd, "STANDBY_TIME=", 13)) {

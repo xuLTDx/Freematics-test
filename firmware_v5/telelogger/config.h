@@ -269,20 +269,6 @@
 #endif
 #endif
 
-// Build purpose, chosen interactively at build time by wifi_secrets.py
-// (or via the BUILD_PURPOSE env var for non-interactive builds).
-// 0 = ODO_READ (normal driving/logging build; OBD polling incl. the
-//     odometer block runs as usual, CAN sniff stays off unless toggled).
-// 1 = CAN_SNIFF (bench-test build for capturing raw CAN traffic alongside
-//     VCDS; OBD polling is forced OFF and sniffing forced ON at boot,
-//     since the odometer block's own AT commands on the shared ELM327
-//     link would otherwise interrupt the ATM1 monitor stream).
-// The two purposes are mutually exclusive within a single build - see the
-// override in loadConfig() in telelogger.ino.
-#ifndef BUILD_CAN_SNIFF
-#define BUILD_CAN_SNIFF 0
-#endif
-
 // enable(1)/disable(0) BLE SPP server (for Freematics Controller App).
 #ifndef ENABLE_BLE
 #define ENABLE_BLE 1

@@ -371,12 +371,10 @@ bool enableLedRed = true;    // red/power LED: lights up in standby / power-on s
 bool enableLedWhite = true;  // white/network LED: lights up during data transmission
 bool enableBeep = true;      // connection beep: short buzz on WiFi/cellular connect
 
-// Runtime OBD / CAN enable flags.  Loaded from NVS by loadConfig().
-// OBD defaults to true so un-provisioned devices keep the existing behaviour.
-// CAN defaults to false (no CAN sniffing by default).
-// Set via NVS keys OBD_EN and CAN_EN (u8, 0=off 1=on).
+// Runtime OBD enable flag.  Loaded from NVS by loadConfig().
+// Defaults to true so un-provisioned devices keep the existing behaviour.
+// Set via NVS key OBD_EN (u8, 0=off 1=on).
 bool enableObd = true;   // OBD-II PID polling (compile-time ENABLE_OBD must also be 1)
-bool enableCan = false;  // CAN bus sniffing (future use; NVS key CAN_EN)
 
 // Deep-standby flag.  When true the device uses ESP32 deep sleep during
 // standby instead of the normal active-wait loop.  Loaded from NVS key
@@ -407,44 +405,6 @@ int vehicleObdDataCount = 0;
 // debugging-only use (extended bench/parked testing) - must not be left set
 // permanently, since it also keeps WiFi/OBD polling running non-stop.
 uint16_t nvsStandbyTimeS = 0;
-
-// Tracks whether sniffing is currently active so we can call sniff(true/false)
-// only on transitions rather than every process() call.
-static bool s_canSniffActive = false;
-
-// Full CAN sniff capture to SD, independent of the small RAM ring buffer
-// above (which a busy bus can wrap through in well under a second between
-// two WiFi polls). Opened fresh on each sniff-on transition, closed on
-// sniff-off. Flushed periodically rather than every line to avoid stalling
-// the receive loop on SD write latency while still bounding data loss on
-// an unexpected reset.
-//
-// The last CAN_SNIFF_LOG_KEEP sessions are kept as /can_sniff1.log (newest)
-// .. /can_sniffN.log (oldest); each sniff-on transition rotates them up by
-// one slot (logrotate-style) and starts a fresh /can_sniff1.log, instead of
-// overwriting a single file.
-#if STORAGE == STORAGE_SD
-#define CAN_SNIFF_LOG_KEEP 5
-#define CAN_SNIFF_LOG_PATH "/can_sniff1.log"
-File s_canSniffLogFile;
-static uint16_t s_canSniffLogFlushCounter = 0;
-
-// Rotates /can_sniff1.log .. /can_sniffN.log up by one slot (oldest first,
-// logrotate-style) so a fresh sniff session always starts at slot 1 without
-// losing the previous CAN_SNIFF_LOG_KEEP-1 sessions. Called once per
-// sniff-on transition, before opening the new log file.
-static void rotateCanSniffLogs()
-{
-  char oldPath[24], newPath[24];
-  snprintf(oldPath, sizeof(oldPath), "/can_sniff%d.log", CAN_SNIFF_LOG_KEEP);
-  SD.remove(oldPath);  // drop the oldest slot to make room for the shift below
-  for (int i = CAN_SNIFF_LOG_KEEP - 1; i >= 1; i--) {
-    snprintf(oldPath, sizeof(oldPath), "/can_sniff%d.log", i);
-    snprintf(newPath, sizeof(newPath), "/can_sniff%d.log", i + 1);
-    SD.rename(oldPath, newPath);  // no-op if oldPath doesn't exist yet
-  }
-}
-#endif
 
 // Set to true by handlerOTA while an OTA flash is in progress.
 // The telemetry task checks this flag and yields the WiFi to the OTA upload.
@@ -477,7 +437,6 @@ static int8_t s_lastLedWhite = -1;
 static int8_t s_lastBeep     = -1;
 static int8_t s_lastConnType = -1;  // PID_CONN_TYPE sentinel: 1=WiFi, 2=Cellular
 static int8_t  s_lastObd         = -1;   // PID_OBD_STATE sentinel
-static int8_t  s_lastCan         = -1;   // PID_CAN_STATE sentinel
 static int16_t s_lastStandbyTime = -1;   // PID_STANDBY_TIME sentinel (seconds)
 static int8_t  s_lastDeepStandby = -1;   // PID_DEEP_STANDBY sentinel
 
@@ -1261,7 +1220,6 @@ void initialize()
   s_lastBeep        = -1;
   s_lastConnType    = -1;
   s_lastObd         = -1;
-  s_lastCan         = -1;
   s_lastStandbyTime = -1;
   // Signal the telemetry task to inject IST-Status PIDs into the very next
   // transmitted packet so they are not lost to the getNewest() race.
@@ -1316,43 +1274,6 @@ void initialize()
       //return;
     }
   }
-  // CAN bus sniffing: enable/disable only on transitions to minimise AT commands.
-  // sniff(true) sends ATM1 to the ELM327 Ã¢â‚¬â€œ puts it in "monitor all" mode so every
-  // CAN frame on the bus is captured and readable via receiveData().
-  // Works independently of STATE_OBD_READY; useful even when OBD-II init fails.
-  if (enableCan != s_canSniffActive) {
-    obd.sniff(enableCan);
-    s_canSniffActive = enableCan;
-    Serial.println(enableCan ? "CAN:sniff on" : "CAN:sniff off");
-#if STORAGE == STORAGE_SD
-    if (enableCan) {
-      // Fresh log per sniff session, keeping the last CAN_SNIFF_LOG_KEEP
-      // sessions on SD (rotated, not overwritten) - see rotateCanSniffLogs().
-      if (state.check(STATE_STORAGE_READY)) {
-        rotateCanSniffLogs();
-        s_canSniffLogFile = SD.open(CAN_SNIFF_LOG_PATH, FILE_WRITE);
-        if (s_canSniffLogFile) {
-          Serial.println("CAN:sniff log open " CAN_SNIFF_LOG_PATH);
-        } else {
-          Serial.println("CAN:sniff log open FAILED");
-        }
-      }
-      s_canSniffLogFlushCounter = 0;
-    } else if (s_canSniffLogFile) {
-      s_canSniffLogFile.close();
-    }
-#endif
-    if (enableCan) {
-      // Send initial CAN wake-up frame on the OBD2 functional broadcast address
-      // (0x7DF) to activate the diagnostic bus before passive sniffing begins.
-      // Payload 02 01 00 = ISO 15765-4 "PIDs supported [01-20]" request.
-      byte wakeFrame[] = {0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-      char rxbuf[32];
-      obd.setCANID(0x7DF);
-      obd.sendCANMessage(wakeFrame, 8, rxbuf, sizeof(rxbuf));
-      Serial.println("CAN:wake-up sent");
-    }
-  }
 #endif
 
 #if STORAGE != STORAGE_NONE
@@ -1370,8 +1291,7 @@ void initialize()
       // that would otherwise only appear on the serial console.
       char diag[128];
       logger.timestamp(millis());
-      snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s BUILD=%s", FIRMWARE_VERSION, devid,
-          BUILD_CAN_SNIFF ? "CAN_SNIFF" : "ODO_READ");
+      snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s", FIRMWARE_VERSION, devid);
       logger.logEvent(diag);
       // See PID_RESET_REASON comment above - answers "why did it reboot"
       // definitively, on SD (readable even with no network at all) and as
@@ -1615,36 +1535,6 @@ void process()
   }
 #endif
 
-#if ENABLE_OBD && BUILD_CAN_SNIFF
-  // CAN bus frame capture (when enableCan=true via NVS key CAN_EN).
-  // BUILD_CAN_SNIFF=1 builds only. Drains all frames currently buffered by
-  // the ELM327 ATM1 monitor-all mode and logs each one (hex-encoded) to SD,
-  // for bench-testing alongside VCDS.
-  if (enableCan) {
-    byte rxbuf[32];  // one CAN frame payload: up to 8 data bytes from receiveData
-    int rxbytes;
-    while ((rxbytes = obd.receiveData(rxbuf, sizeof(rxbuf))) > 0) {
-#if STORAGE == STORAGE_SD
-      if (s_canSniffLogFile) {
-        // Hex-encode the received payload bytes into a local string.
-        char hexEntry[sizeof(rxbuf) * 2 + 1];
-        int hexLen = 0;
-        for (int i = 0; i < rxbytes && hexLen < (int)sizeof(hexEntry) - 2; i++) {
-          hexLen += snprintf(hexEntry + hexLen, sizeof(hexEntry) - hexLen, "%02X", rxbuf[i]);
-        }
-        hexEntry[hexLen] = 0;
-        s_canSniffLogFile.print(millis());
-        s_canSniffLogFile.print(',');
-        s_canSniffLogFile.println(hexEntry);
-        if (++s_canSniffLogFlushCounter >= 8) {
-          s_canSniffLogFlushCounter = 0;
-          s_canSniffLogFile.flush();
-        }
-      }
-#endif
-    }
-  }
-#endif
   if (rssi != rssiLast) {
     int val = (rssiLast = rssi);
     buffer->add(PID_CSQ, ELEMENT_INT32, &val, sizeof(val));
@@ -1742,18 +1632,13 @@ void process()
     }
   }
 
-  // Report OBD / CAN runtime state (PIDs 0x89 / 0x8a) so HA can display
-  // the live IST-Status alongside the configured value from the options flow.
+  // Report OBD runtime state (PID 0x89) so HA can display the live
+  // IST-Status alongside the configured value from the options flow.
   {
     uint8_t ov = enableObd ? 1 : 0;
-    uint8_t cv = enableCan ? 1 : 0;
     if ((int8_t)ov != s_lastObd) {
       s_lastObd = (int8_t)ov;
       buffer->add(PID_OBD_STATE, ELEMENT_UINT8, &ov, sizeof(ov));
-    }
-    if ((int8_t)cv != s_lastCan) {
-      s_lastCan = (int8_t)cv;
-      buffer->add(PID_CAN_STATE, ELEMENT_UINT8, &cv, sizeof(cv));
     }
   }
 
@@ -2100,7 +1985,6 @@ void telemetry(void* inst)
       s_lastBeep        = -1;
       s_lastConnType    = -1;
       s_lastObd         = -1;
-      s_lastCan         = -1;
       s_lastStandbyTime = -1;
       s_send_state_pids = true;
 
@@ -2170,7 +2054,6 @@ void telemetry(void* inst)
             s_lastBeep        = -1;
             s_lastConnType    = -1;
             s_lastObd         = -1;
-            s_lastCan         = -1;
             s_lastStandbyTime = -1;
             s_send_state_pids = true;
             // switch off cellular module when wifi connected
@@ -2218,7 +2101,6 @@ void telemetry(void* inst)
         s_lastBeep        = -1;
         s_lastConnType    = -1;
         s_lastObd         = -1;
-        s_lastCan         = -1;
         s_lastStandbyTime = -1;
         s_send_state_pids = true;
       }
@@ -2372,11 +2254,6 @@ void telemetry(void* inst)
           uint8_t ov = enableObd ? 1 : 0;
           store.log(PID_OBD_STATE, &ov, 1);
           s_lastObd = (int8_t)ov;
-        }
-        {
-          uint8_t cv = enableCan ? 1 : 0;
-          store.log(PID_CAN_STATE, &cv, 1);
-          s_lastCan = (int8_t)cv;
         }
         {
           store.log(PID_STANDBY_TIME, &nvsStandbyTimeS, 1);
@@ -2664,11 +2541,6 @@ void showSysInfo()
   Serial.print("WIFI MAC:");
   Serial.println(WiFi.macAddress());
 #endif
-  // What this specific build is for (chosen at build time by
-  // wifi_secrets.py) - printed here so it's unambiguous which build is
-  // running just from the boot log, without needing to check build flags.
-  Serial.print("BUILD:");
-  Serial.println(BUILD_CAN_SNIFF ? "CAN_SNIFF" : "ODO_READ");
 }
 
 void loadConfig()
@@ -2793,24 +2665,6 @@ void loadConfig()
   if (nvs_get_u8(nvs, "OBD_EN", &nvsObdEn) == ESP_OK) {
     enableObd = nvsObdEn != 0;
   }
-
-  // CAN bus enable/disable (NVS key CAN_EN, u8).
-  // Defaults to 0 (off); reserved for future CAN sniffing support.
-  uint8_t nvsCanEn = 0;
-  if (nvs_get_u8(nvs, "CAN_EN", &nvsCanEn) == ESP_OK) {
-    enableCan = nvsCanEn != 0;
-  }
-
-#if BUILD_CAN_SNIFF
-  // This build was chosen at compile time (wifi_secrets.py prompt) to be a
-  // CAN-sniff bench-test build. Force this regardless of NVS/HTTP toggles:
-  // the odometer block's own AT-command traffic on the shared ELM327 link
-  // would interrupt an active ATM1 monitor stream, so OBD polling (and the
-  // odometer block inside it) must stay off for the whole session, and
-  // sniffing starts automatically without needing a separate CAN=1 command.
-  enableObd = false;
-  enableCan = true;
-#endif
 
   // Deep-standby mode (NVS key DEEP_STANDBY, u8, 0=off 1=on).
   // When enabled the device uses ESP32 deep sleep during standby.

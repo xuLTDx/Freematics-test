@@ -1,5 +1,5 @@
 """PlatformIO pre-build script: prompt for WiFi passwords instead of storing
-them in any tracked file, and ask what this specific build is for.
+them in any tracked file.
 
 Resolution order per secret:
   0. A local secrets file OUTSIDE this repo (see SECRETS_FILE_PATH below) -
@@ -16,15 +16,6 @@ Resolution order per secret:
 Nothing entered here is written to disk by this script; the secrets file is
 edited directly by the user and only lives in the compiled .bin for this one
 local build (same "nothing tracked" guarantee as the old getpass-only flow).
-
-Always builds BUILD_CAN_SNIFF=0 (ODO_READ) - no prompt/choice for this
-anymore. That macro's CAN-sniff bench-test mode (forces OBD polling off,
-ATM1 sniffing on at boot) predates HexSniff; now that HexSniff exists as its
-own dedicated, more capable sniffing tool (own WiFi web UI, SD rotation,
-live filter/send - see HexSniff/firmware/), there's no live use case left
-that needs this repo's own build to do it too, so asking every build wasn't
-worth it. The BUILD_CAN_SNIFF macro/config.h and telelogger.ino's runtime
-handling of it are untouched - only the interactive choice is gone.
 """
 
 Import("env")  # noqa: F821
@@ -85,14 +76,5 @@ def _inject_secret(env_var_name, macro_name, prompt_label):
     env.Append(CPPDEFINES=[(macro_name, env.StringifyMacro(value))])
 
 
-def _inject_build_purpose():
-    # No prompt/choice anymore - see the module docstring for why. Always
-    # ODO_READ; BUILD_CAN_SNIFF stays defined (as 0) since config.h /
-    # telelogger.ino still reference the macro.
-    env.Append(CPPDEFINES=[("BUILD_CAN_SNIFF", 0)])
-    print("[wifi_secrets] Build purpose: ODO_READ", flush=True)
-
-
 _inject_secret("WIFI_PWD", "WIFI_PASSWORD", "WiFi password (primary network)")
 _inject_secret("WIFI_PWD2", "WIFI_PASSWORD2", "WiFi password (secondary network)")
-_inject_build_purpose()
