@@ -51,6 +51,8 @@ unprivileged user. Point the device at it via the OTA_PORT= control command
 import hashlib
 import http.server
 import json
+import logging
+import logging.handlers
 import os
 import re
 import ssl
@@ -59,7 +61,17 @@ from datetime import datetime
 from urllib.parse import urlsplit, parse_qs
 
 REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registry.json")
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ota_server.log")
 LISTEN_PORT = 8443
+
+log = logging.getLogger("ota_server")
+log.setLevel(logging.INFO)
+_console = logging.StreamHandler(sys.stdout)  # -> journalctl under systemd
+_file = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+for _h in (_console, _file):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
 
 # C's __DATE__ " " __TIME__ (e.g. "Sep 14 2026 14:35:40") - single-digit days
 # come through as "Sep  4 2026" (double space), so collapse whitespace first.
@@ -128,11 +140,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Device already reports running this entry's target build,
                 # or (the important case) a build that's the same age or
                 # NEWER than target_build - never offer to move it backwards.
+                log.info("meta.json: %s up to date (reported=%s)", entry.get("device"), reported_build)
                 body = json.dumps({"available": False}).encode()
             else:
                 fw_path = entry["firmware"]
                 if not os.path.isfile(fw_path):
-                    print(f"[WARN] registry entry for {entry.get('device')} points at missing file: {fw_path}", file=sys.stderr)
+                    log.warning("registry entry for %s points at missing file: %s", entry.get("device"), fw_path)
                     body = json.dumps({"available": False}).encode()
                 else:
                     size = os.path.getsize(fw_path)
@@ -140,6 +153,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     with open(fw_path, "rb") as f:
                         for chunk in iter(lambda: f.read(65536), b""):
                             sha.update(chunk)
+                    log.info("meta.json: %s offered update reported=%s target=%s size=%d",
+                              entry.get("device"), reported_build, entry.get("target_build"), size)
                     body = json.dumps({
                         "available": True,
                         "size": size,
@@ -159,6 +174,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._not_found()
                 return
             size = os.path.getsize(fw_path)
+            log.info("firmware.bin: %s downloading %s (%d bytes)", entry.get("device"), fw_path, size)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
@@ -169,12 +185,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+            log.info("firmware.bin: %s download complete", entry.get("device"))
             return
 
         self._not_found()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        log.info("%s - %s", self.address_string(), fmt % args)
 
 
 def main():
@@ -184,7 +201,7 @@ def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert, keyfile=key)
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    print(f"OTA server listening on :{LISTEN_PORT}")
+    log.info("OTA server listening on :%d", LISTEN_PORT)
     server.serve_forever()
 
 

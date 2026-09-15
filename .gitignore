@@ -35,3 +35,6 @@ __pycache__/
 server/ota-server/registry.json
 server/ota-server/*.pem
 server/ota-server/server.log
+# See server/ota-server/traccar_credentials.example.json for the expected shape.
+server/ota-server/traccar_credentials.json
+server/ota-server/*.log

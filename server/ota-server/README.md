@@ -68,28 +68,42 @@ the .deb, then enable the new units - the units now run as the
 By itself, `ota_server.py` is purely passive - a device only finds out about
 an update on its next periodic poll (up to `OTA_INTERVAL` seconds away).
 `ota_push_watcher.py` is a separate, optional process that decides *when* a
-device is actually due and tells it to check immediately:
+device is actually due and tells it to check immediately - over cellular or
+WiFi, wherever the device currently is, not just while it's reachable on
+this LAN (see the module docstring for the full NAT/CGNAT reasoning: a
+device on cellular has no directly-reachable IP at all, so both steps below
+go through Traccar's own REST API and its already-open reverse path to the
+device, never a new connection this script opens itself):
 
-1. For each `registry.json` entry that has a `device_ip` set, it queries that
-   device's own `http://<device_ip>/api/info` - the device's live,
-   authoritative answer for what firmware it's actually running right now.
-2. If the entry also has a `device_id`, it must match `/api/info`'s `"id"`
-   field or the entry is refused with a warning. This matters once you have
-   more than one vehicle profile (e.g. VAG/Passat and PSA/Zafira each have
-   their own token + firmware file, per the rule below) - it's what stops a
-   stale/wrong `device_ip` from silently pushing one vehicle's firmware onto
-   another's hardware.
-3. Compares the reported build against `target_build` with the exact same
-   logic `ota_server.py`'s own `meta.json` handler uses.
-4. If an update is due: `GET http://<device_ip>/api/control?cmd=OTA_CHECK_NOW`.
-   That's the entire "push" - it just makes the device run its existing,
-   already-hash-verified pull-OTA pipeline right away instead of waiting.
+1. `cp traccar_credentials.example.json traccar_credentials.json` and fill
+   in Traccar's URL and a login (a dedicated low-privilege user is fine -
+   it only needs to read devices/positions and send commands).
+   `traccar_credentials.json` is gitignored, same as `registry.json`.
+2. Add `traccar_device_id` (Traccar's own numeric device ID - visible in its
+   UI or via `GET /api/devices`) to a `registry.json` entry to opt it into
+   this; entries without one are left alone (still work via periodic
+   polling only).
+3. For each opted-in entry, the watcher reads that device's last
+   self-reported firmware build from Traccar (`Position.attributes.versionFw`,
+   set once per LOGIN by `teleclient.cpp`'s `notify()` payload and decoded by
+   `FreematicsProtocolDecoder.java` - durable in Traccar's database, not a
+   line in a rotatable log file) and compares it to `target_build` with the
+   same logic `ota_server.py`'s own `meta.json` handler uses.
+4. If due: `POST /api/commands/send` (Traccar's own command-dispatch API, a
+   `type: "custom"` command whose `data` is a checksummed
+   `"EV=5,TS=...,ID=...,CMD=OTA_READY*XX"` string - see
+   `make_ota_ready_command.py` for a standalone way to build the same string
+   for manual testing via Traccar's web UI). Traccar delivers it immediately
+   if the device has a live session, or queues it in its own database
+   (indefinitely, no TTL - verified by reading `CommandsManager` directly)
+   for automatic delivery the moment the device's next packet is decoded,
+   however long that takes. The device's `TeleClientUDP::inbound()`
+   `EVENT_COMMAND` case then triggers the same immediate check that
+   `/api/control?cmd=OTA_CHECK_NOW` does locally - the rest of the pipeline
+   (SD-staged download, SHA256 verify, flash at next standby) is unchanged.
 
-Add `device_ip` (and, once you have more than one vehicle profile,
-`device_id`) to a `registry.json` entry to opt it into this - entries
-without `device_ip` are left alone (still work via periodic polling only).
-A device that's unreachable when checked (not on this LAN right now, no
-WiFi) is just skipped and retried on the next pass - no error.
+Logs to `ota_push_watcher.log` (rotated, 3x2MB) next to the script, and to
+stdout/journalctl under systemd.
 
 Run it the same two ways as `ota_server.py` (Option A's package installs
 both units; for Option B, `python3 ota_push_watcher.py`, or add `--once` to

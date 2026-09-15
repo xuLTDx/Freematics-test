@@ -18,7 +18,9 @@ install -d "$PKGROOT/lib/systemd/system"
 
 install -m 644 ../ota_server.py            "$PKGROOT/opt/freematics-ota/"
 install -m 644 ../ota_push_watcher.py       "$PKGROOT/opt/freematics-ota/"
+install -m 644 ../make_ota_ready_command.py "$PKGROOT/opt/freematics-ota/"
 install -m 644 ../registry.example.json     "$PKGROOT/opt/freematics-ota/"
+install -m 644 ../traccar_credentials.example.json "$PKGROOT/opt/freematics-ota/"
 install -m 644 ../README.md                 "$PKGROOT/opt/freematics-ota/"
 install -m 644 ../freematics-ota.service      "$PKGROOT/lib/systemd/system/"
 install -m 644 ../freematics-ota-push.service "$PKGROOT/lib/systemd/system/"
@@ -38,8 +40,9 @@ Description: Freematics telelogger pull-OTA server + push-decision watcher
  when a device is actually due for an update and tells it to check now
  instead of waiting for its polling interval (ota_push_watcher.py).
  .
- registry.json, cert.pem and key.pem are NOT part of this package - they
- hold per-deployment secrets and are created after install (see README).
+ registry.json, cert.pem, key.pem, and traccar_credentials.json are NOT
+ part of this package - they hold per-deployment secrets and are created
+ after install (see README).
 EOF
 
 # --- maintainer scripts ---------------------------------------------------
@@ -54,8 +57,9 @@ systemctl daemon-reload || true
 echo "freematics-ota installed. Before starting the services:"
 echo "  cd /opt/freematics-ota"
 echo "  cp registry.example.json registry.json  # then fill in your device(s)"
+echo "  cp traccar_credentials.example.json traccar_credentials.json  # then fill in Traccar URL/login"
 echo "  openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj '/CN=freematics-ota'"
-echo "  chown freematics-ota:freematics-ota registry.json cert.pem key.pem"
+echo "  chown freematics-ota:freematics-ota registry.json traccar_credentials.json cert.pem key.pem"
 echo "Then: systemctl enable --now freematics-ota freematics-ota-push"
 exit 0
 EOF

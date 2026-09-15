@@ -4,7 +4,7 @@
     "firmware": "/absolute/path/to/telelogger-vag.bin",
     "target_build": "Sep 14 2026 12:04:32",
     "enabled": false,
-    "device_ip": "192.168.0.39",
+    "traccar_device_id": 1,
     "device_id": "ZKUCA42T"
   }
 }

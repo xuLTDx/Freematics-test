@@ -3,115 +3,184 @@
 
 ota_server.py stays a completely passive responder: it never decides
 anything, it just answers whatever a device asks. This script is the
-opposite side - it decides, on its own schedule, whether a device is
-actually due for an update, and if so tells the device to check *now*
-instead of waiting for its next OTA_INTERVAL-timed poll.
+opposite side - it decides whether a device is due for an update, and if
+so, tells it right now via Traccar's own command-delivery mechanism -
+instead of the device asking "anything new?" on a timer.
 
-How it decides, per registry.json entry (device_ip must be set - entries
-without one are skipped, so this stays fully optional and backward
-compatible with a registry.json written before this script existed):
-  1. GET http://<device_ip>/api/info  - the device's own live, authoritative
-     answer to "what firmware am I actually running right now" (fw_build,
-     plus id - see the device_id check below). This is deliberately NOT
-     inferred from Traccar's log: Traccar only ever sees telemetry packets,
-     never a firmware version, so the device's own /api/info is the one
-     source of truth for this.
-  2. If this entry has a device_id, it MUST match /api/info's "id" field or
-     the entry is refused (loud warning, nothing sent). We now have two
-     genuinely different vehicle-specific firmwares in play (VAG/Passat vs
-     PSA/Zafira, each with its own registry token/firmware path per the
-     "one token maps to exactly one firmware file" rule in README.md) - a
-     stale/wrong device_ip in the registry (device got a new DHCP lease,
-     two entries swapped by a copy-paste mistake, etc.) would otherwise
-     silently push one vehicle's firmware onto the other's hardware. This
-     check is what actually catches that, since device_ip alone can't be
-     trusted to still point at the device the entry thinks it does.
-  3. Compare fw_build against this entry's target_build with the exact same
+Both steps below - reading a device's current firmware and telling it an
+update is ready - go through Traccar's REST API, not a direct connection to
+the device. This is deliberate, not just convenient: a device on cellular
+data has no directly-reachable IP at all (it sits behind carrier-grade NAT
+sharing a public IP with thousands of other SIM cards), so anything that
+tries to open a NEW inbound connection to it - whether to query /api/info
+or to push bytes - simply cannot work over cellular, only on a LAN with no
+NAT in the way. Traccar's UDP session for this device is different: it
+was opened by the DEVICE (outbound), so the NAT/firewall on its side keeps
+that mapping's reverse path open for replies - which is exactly the path
+Command.TYPE_CUSTOM rides down. See teleclient.cpp's TeleClientUDP::inbound()
+EVENT_COMMAND case for the device-side receiver.
+
+How it decides, per registry.json entry with a traccar_device_id set
+(entries without one are skipped - stays optional/backward compatible):
+  1. GET {traccar_url}/api/devices/{id} for its positionId, then
+     GET {traccar_url}/api/positions?id={positionId} for that position's
+     attributes.versionFw - the device's last self-reported build (sent
+     once per LOGIN in teleclient.cpp's notify() payload, decoded into
+     Position.KEY_VERSION_FW by FreematicsProtocolDecoder.java). This is a
+     database-backed attribute, not a line in a rotatable log file, so it
+     survives however long the device stays offline and however Traccar's
+     own log rotation is configured.
+  2. Compare against this entry's target_build with the exact same
      is_update_needed() logic ota_server.py's own meta.json handler uses -
-     imported from there, not reimplemented, so the two can never disagree
-     about what counts as "needs an update".
-  4. If needed and the device answered at all (i.e. it's on the LAN and
-     reachable right now): GET http://<device_ip>/api/control?cmd=OTA_CHECK_NOW.
-     That's the entire "push" - it just makes the device's own existing,
-     already-hash-verified pull-OTA pipeline (stage to SD, verify SHA256,
-     flash at next standby) run immediately rather than up to OTA_INTERVAL
-     seconds from now. This script never touches SD, flash, or hashes
-     itself - all of that stays exactly as already implemented on the
-     device (performPullOtaCheck() / performPullOtaFlash() in telelogger.ino).
-
-A device that's unreachable right now (not on this LAN, powered off,
-mid-drive without WiFi) is simply skipped this pass - no error, no retry
-storm, it's picked up again next pass whenever it's reachable.
+     imported from there, not reimplemented.
+  3. If needed: authenticate to Traccar (POST /api/session) and
+     POST /api/commands/send with a Command.TYPE_CUSTOM whose data is the
+     checksummed "EV=5,TS=...,ID=...,CMD=OTA_READY*XX" string (see
+     make_ota_ready_command.py for the same checksum, kept in sync here).
+     If the device isn't in a live session right now (offline, mid-drive
+     with no signal, parked for months), Traccar queues the command in its
+     own database (tc_commands_queue, no TTL) and delivers it automatically
+     the moment the device's next packet is decoded - verified by reading
+     CommandsManager/ExtendedObjectDecoder directly, not assumed. Nothing
+     about that queuing is specific to this protocol or this script.
+  4. The device's own EVENT_COMMAND handler then makes its existing pull-OTA
+     check (performPullOtaCheck() - SD-staged download, incremental SHA256
+     against meta.json's hash, only written to the trusted marker file on a
+     match) run immediately. This script never touches SD/flash/hashes.
 
 Run directly (loops forever, sleeping PUSH_CHECK_INTERVAL_S between passes)
-or under systemd (see freematics-ota-push.service).
+or under systemd (see freematics-ota-push.service). In practice this should
+be triggered right after publishing a new build (see the "event-driven, not
+blind polling" note below) rather than left on a long timer.
 """
 import json
+import logging
+import logging.handlers
+import os
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from ota_server import load_registry, is_update_needed
 
-HTTP_TIMEOUT_S = 5
-PUSH_CHECK_INTERVAL_S = 300  # 5 minutes between passes
+HTTP_TIMEOUT_S = 8
+PUSH_CHECK_INTERVAL_S = 300  # fallback only - see module docstring
+CREDENTIALS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traccar_credentials.json")
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ota_push_watcher.log")
+
+log = logging.getLogger("ota_push_watcher")
+log.setLevel(logging.INFO)
+_console = logging.StreamHandler(sys.stdout)  # -> journalctl under systemd
+_file = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+for _h in (_console, _file):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
 
 
-def device_info(ip):
-    """GET http://<ip>/api/info, return the parsed JSON dict or None."""
-    try:
-        with urllib.request.urlopen(f"http://{ip}/api/info", timeout=HTTP_TIMEOUT_S) as r:
+def load_credentials():
+    with open(CREDENTIALS_PATH, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def checksummed(message: str) -> str:
+    """Same algorithm on both ends: Traccar's Checksum.sum(String) and the
+    device's TeleClientUDP::verifyChecksum() - verified side by side, not
+    assumed. 8-bit sum of ASCII bytes, 2 uppercase hex digits."""
+    checksum = sum(message.encode("ascii")) & 0xFF
+    return f"{message}*{checksum:02X}"
+
+
+def ota_ready_command(device_id_str: str) -> str:
+    ts = int(time.time() * 1000) % 100000000
+    return checksummed(f"EV=5,TS={ts},ID={device_id_str},CMD=OTA_READY")
+
+
+class TraccarSession:
+    """Cookie-authenticated client for the handful of Traccar REST calls
+    this script needs. Logs in once per run, not per request."""
+
+    def __init__(self, base_url, email, password):
+        self.base_url = base_url.rstrip("/")
+        self.jar = urllib.request.HTTPCookieProcessor()
+        self.opener = urllib.request.build_opener(self.jar)
+        data = urllib.parse.urlencode({"email": email, "password": password}).encode()
+        req = urllib.request.Request(f"{self.base_url}/api/session", data=data, method="POST")
+        self.opener.open(req, timeout=HTTP_TIMEOUT_S).read()
+
+    def get(self, path):
+        req = urllib.request.Request(f"{self.base_url}{path}")
+        with self.opener.open(req, timeout=HTTP_TIMEOUT_S) as r:
             return json.loads(r.read().decode("utf-8"))
-    except Exception:
+
+    def post_json(self, path, obj):
+        data = json.dumps(obj).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}{path}", data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.opener.open(req, timeout=HTTP_TIMEOUT_S) as r:
+            return r.read()
+
+
+def current_build(session, traccar_device_id):
+    """Latest self-reported fw_build for this device, or None if it has
+    never sent one (e.g. never logged in since the FW= payload was added)."""
+    device = session.get(f"/api/devices/{traccar_device_id}")
+    position_id = device.get("positionId")
+    if not position_id:
         return None
+    position = session.get(f"/api/positions?id={position_id}")
+    if isinstance(position, list):
+        position = position[0] if position else {}
+    return (position.get("attributes") or {}).get("versionFw")
 
 
-def trigger_check_now(ip):
-    """GET http://<ip>/api/control?cmd=OTA_CHECK_NOW, return True on 'OK'."""
-    try:
-        with urllib.request.urlopen(
-            f"http://{ip}/api/control?cmd=OTA_CHECK_NOW", timeout=HTTP_TIMEOUT_S
-        ) as r:
-            return r.read().decode("utf-8").strip() == "OK"
-    except Exception:
-        return False
+def push_ota_ready(session, traccar_device_id, device_id_str):
+    session.post_json("/api/commands/send", {
+        "deviceId": traccar_device_id,
+        "type": "custom",
+        "attributes": {"data": ota_ready_command(device_id_str)},
+    })
 
 
-def run_once():
+def run_once(session):
     registry = load_registry()
     for token, entry in registry.items():
         label = entry.get("device", token[:8])
         if not entry.get("enabled"):
             continue
-        ip = entry.get("device_ip")
-        if not ip:
+        traccar_device_id = entry.get("traccar_device_id")
+        device_id_str = entry.get("device_id")
+        if not traccar_device_id or not device_id_str:
             continue  # registry entry not opted into push checking
 
-        info = device_info(ip)
-        if info is None:
-            print(f"[{label}] {ip} unreachable, skipping")
-            continue
-
-        reported_build = info.get("fw_build")
+        reported_build = current_build(session, traccar_device_id)
         target_build = entry.get("target_build")
         if not is_update_needed(reported_build, target_build):
-            print(f"[{label}] {ip} up to date ({reported_build})")
+            log.info("[%s] up to date (%s)", label, reported_build)
             continue
 
-        print(f"[{label}] {ip} running {reported_build!r}, target {target_build!r} - triggering check")
-        if trigger_check_now(ip):
-            print(f"[{label}] OTA_CHECK_NOW accepted")
-        else:
-            print(f"[{label}] OTA_CHECK_NOW failed (device unreachable or rejected it)")
+        log.info("[%s] running %r, target %r - pushing OTA_READY", label, reported_build, target_build)
+        try:
+            push_ota_ready(session, traccar_device_id, device_id_str)
+            log.info("[%s] command accepted (delivered now, or queued if currently offline)", label)
+        except urllib.error.HTTPError as e:
+            log.error("[%s] command send failed: HTTP %s %s", label, e.code, e.reason)
 
 
 def main():
+    creds = load_credentials()
+    session = TraccarSession(creds["url"], creds["email"], creds["password"])
     loop = "--once" not in sys.argv
+    log.info("ota_push_watcher starting (loop=%s)", loop)
     while True:
         try:
-            run_once()
-        except Exception as e:
-            print(f"[ota-push-watcher] pass failed: {e}", file=sys.stderr)
+            run_once(session)
+        except Exception:
+            log.exception("pass failed")
         if not loop:
             break
         time.sleep(PUSH_CHECK_INTERVAL_S)
