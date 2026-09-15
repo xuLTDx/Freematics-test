@@ -2,6 +2,10 @@
 them in any tracked file, and ask what this specific build is for.
 
 Resolution order per secret:
+  0. A local secrets file OUTSIDE this repo (see SECRETS_FILE_PATH below) -
+     lets a non-interactive build (e.g. this Claude Code session, which has
+     no tty and previously could never get past step 2) supply real values
+     without a prompt and without ever putting them in a tracked file.
   1. Environment variable (WIFI_PWD / WIFI_PWD2) - lets CI/non-interactive
      builds set it without a prompt.
   2. Interactive prompt (only when stdin is a real terminal) via getpass,
@@ -9,16 +13,18 @@ Resolution order per secret:
   3. Empty string (e.g. background IntelliSense rebuilds, which run without
      a tty) - the device then relies on runtime NVS provisioning instead.
 
-Nothing entered here is written to disk; it only lives in the compiled
-.bin for this one local build.
+Nothing entered here is written to disk by this script; the secrets file is
+edited directly by the user and only lives in the compiled .bin for this one
+local build (same "nothing tracked" guarantee as the old getpass-only flow).
 
-Also prompts (same tty-only rule) for the build's purpose - ODO_READ
-(normal driving/logging build) or CAN_SNIFF (bench-test build for capturing
-raw CAN traffic alongside VCDS). The two must not run at the same time: the
-odometer block's own AT-command traffic on the shared ELM327 link would
-interrupt an active CAN sniff (ATM1) stream. A CAN_SNIFF build therefore
-forces OBD polling off and sniffing on at boot regardless of NVS/HTTP
-toggles - see BUILD_CAN_SNIFF in config.h / telelogger.ino.
+Always builds BUILD_CAN_SNIFF=0 (ODO_READ) - no prompt/choice for this
+anymore. That macro's CAN-sniff bench-test mode (forces OBD polling off,
+ATM1 sniffing on at boot) predates HexSniff; now that HexSniff exists as its
+own dedicated, more capable sniffing tool (own WiFi web UI, SD rotation,
+live filter/send - see HexSniff/firmware/), there's no live use case left
+that needs this repo's own build to do it too, so asking every build wasn't
+worth it. The BUILD_CAN_SNIFF macro/config.h and telelogger.ino's runtime
+handling of it are untouched - only the interactive choice is gone.
 """
 
 Import("env")  # noqa: F821
@@ -26,6 +32,44 @@ Import("env")  # noqa: F821
 import getpass
 import os
 import sys
+
+# Fixed path outside the repo - never anywhere under Desktop/GitHub/... or
+# any other tracked location. (HexSniff solves the same "no secrets in a
+# tracked file" problem differently - a gitignored wifi_local.ini INSIDE its
+# own repo dir, already fully non-interactive - this file is specific to
+# this repo, not shared with it.)
+SECRETS_FILE_PATH = os.path.join(os.path.expanduser("~"), ".freematics_build_secrets")
+
+
+def _load_secrets_file():
+    """Exports KEY=VALUE lines from SECRETS_FILE_PATH into os.environ, only
+    for keys not already set - a real environment variable (e.g. from CI)
+    always wins over the file. Missing file or unreadable lines are silently
+    skipped: this is a convenience layer on top of the existing env-var/
+    getpass/empty fallback chain, not a required step.
+    """
+    try:
+        with open(SECRETS_FILE_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # No "and value" check here on purpose: a present-but-empty line
+        # (e.g. "WIFI_PWD2=", secondary network intentionally unset) must
+        # still set os.environ to "" so _inject_secret() sees a real (empty)
+        # value and skips its own getpass prompt - not seeing the key at all
+        # is what actually falls through to that interactive prompt.
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_secrets_file()
 
 
 def _inject_secret(env_var_name, macro_name, prompt_label):
@@ -42,30 +86,11 @@ def _inject_secret(env_var_name, macro_name, prompt_label):
 
 
 def _inject_build_purpose():
-    env_value = os.environ.get("BUILD_PURPOSE")
-    is_can_sniff = False
-    if env_value is not None:
-        is_can_sniff = env_value.strip().upper() == "CAN_SNIFF"
-    elif sys.stdin.isatty():
-        try:
-            # Deliberately reusing getpass.getpass() here even though "1"/"2"
-            # isn't a secret: on Windows it writes its prompt straight to the
-            # console via msvcrt, bypassing stdout entirely, which is the only
-            # thing that reliably shows up under some build-task runners (e.g.
-            # PlatformIO run via a VS Code task) - plain print()/input() go
-            # through regular (sometimes fully buffered, even with flush=True
-            # from this side) stdout and can render invisible there. The only
-            # cost is the answer isn't echoed while typing, which is harmless
-            # for a single digit.
-            answer = getpass.getpass(
-                "Build purpose - [1] ODO_READ (normal, default) "
-                "or [2] CAN_SNIFF (bench test): "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        is_can_sniff = answer == "2"
-    env.Append(CPPDEFINES=[("BUILD_CAN_SNIFF", 1 if is_can_sniff else 0)])
-    print(f"[wifi_secrets] Build purpose: {'CAN_SNIFF' if is_can_sniff else 'ODO_READ'}", flush=True)
+    # No prompt/choice anymore - see the module docstring for why. Always
+    # ODO_READ; BUILD_CAN_SNIFF stays defined (as 0) since config.h /
+    # telelogger.ino still reference the macro.
+    env.Append(CPPDEFINES=[("BUILD_CAN_SNIFF", 0)])
+    print("[wifi_secrets] Build purpose: ODO_READ", flush=True)
 
 
 _inject_secret("WIFI_PWD", "WIFI_PASSWORD", "WiFi password (primary network)")

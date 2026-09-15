@@ -67,16 +67,8 @@ extern bool enableObd;         // runtime OBD enable flag (NVS key OBD_EN)
 extern bool enableCan;         // runtime CAN enable flag (NVS key CAN_EN)
 extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDBY)
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
-// CAN bus sniffing ring buffer (populated by process() when enableCan=true).
-// s_canFrameList holds up to CAN_DATA_LIST_MAX hex-encoded CAN frame payloads.
-// s_canFrameCount is the current number of valid entries.
-// s_canFrameTotal is the total frames seen since boot.
-// s_canBufMux guards cross-task access.
-#define CAN_DATA_LIST_MAX 32
-extern char s_canFrameList[CAN_DATA_LIST_MAX][20];
-extern int  s_canFrameCount;
-extern uint32_t s_canFrameTotal;
-extern portMUX_TYPE s_canBufMux;
+extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
+extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
 // Set to true while an OTA flash is in progress so the telemetry task yields
 // the WiFi radio to the upload (defined in telelogger.ino).
 extern volatile bool s_ota_active;
@@ -98,14 +90,22 @@ extern void printOtaStatus();
 // NVS settings version string (NVS_VER key): read at startup, reported via
 // api/control?cmd=NVS_VER? and api/info so HA can show the installed version.
 extern char nvsVersion[64];
+// Requests an immediate pull-OTA check (cmd=OTA_CHECK_NOW), instead of
+// waiting for the periodic otaCheckIntervalS timer - for an external
+// push-decision service that already knows (via Traccar + this device's own
+// /api/info) that an update is due.
+extern void httpTriggerOtaCheckNow();
 
 uint16_t hex2uint16(const char *p);
+
+extern char devid[12];
 
 int handlerInfo(UrlHandlerParam* param)
 {
     char *buf = param->pucBuffer;
     int bufsize = param->bufSize;
-    int bytes = snprintf(buf, bufsize, "{\"httpd\":{\"uptime\":%u,\"clients\":%u,\"requests\":%u,\"traffic\":%u},\n",
+    int bytes = snprintf(buf, bufsize, "{\"id\":\"%s\",\n", devid);
+    bytes += snprintf(buf + bytes, bufsize - bytes, "\"httpd\":{\"uptime\":%u,\"clients\":%u,\"requests\":%u,\"traffic\":%u},\n",
         (unsigned int)millis(), httpParam.stats.clientCount, (unsigned int)httpParam.stats.reqCount, (unsigned int)(httpParam.stats.totalSentBytes >> 10));
 
     time_t now;
@@ -124,8 +124,13 @@ int handlerInfo(UrlHandlerParam* param)
 
     // Firmware version, build date/time, and NVS settings version (NVS_VER key).
     // nvsVersion is empty when NVS settings have never been applied via OTA.
+    // fw_build reads FW_BUILD_STR (telelogger.ino) rather than this file's own
+    // __DATE__/__TIME__ - see that definition's comment: this file doesn't
+    // change on every firmware change, so its own copy goes stale under
+    // PlatformIO's incremental build while telelogger.ino's stays current.
+    extern const char FW_BUILD_STR[];
     bytes += snprintf(buf + bytes, bufsize - bytes, "\"fw\":\"%s\",\n", FIRMWARE_VERSION);
-    bytes += snprintf(buf + bytes, bufsize - bytes, "\"fw_build\":\"%s %s\",\n", __DATE__, __TIME__);
+    bytes += snprintf(buf + bytes, bufsize - bytes, "\"fw_build\":\"%s\",\n", FW_BUILD_STR);
     if (nvsVersion[0]) {
         bytes += snprintf(buf + bytes, bufsize - bytes, "\"nvs_ver\":\"%s\",\n", nvsVersion);
     }
@@ -482,6 +487,30 @@ int handlerControl(UrlHandlerParam* param)
     } else if (!strcmp(cmd, "DEEP_STANDBY?")) {
         // Return current deep-standby mode state: "1" = enabled, "0" = disabled.
         n = snprintf(buf, bufsize, "%u", (unsigned)enableDeepStandby);
+    } else if (!strcmp(cmd, "STATE?")) {
+        // Live diagnostic dump - bit values match the State class in
+        // telelogger.ino (STATE_STORAGE_READY=0x1 ... STATE_STANDBY=0x200).
+        // Added to debug "on WiFi, nothing reaches Traccar" without Serial:
+        // WIFI here is the app-level STATE_WIFI_CONNECTED flag (set only after
+        // a successful teleClient.connect()); RADIO is the raw WiFi.isConnected()
+        // used by the httpd. If RADIO=1 but WIFI stays 0, the telemetry task's
+        // connect attempt is not succeeding (or not being reached) even though
+        // the WiFi link itself is up.
+        uint16_t s = getStateBits();
+        n = snprintf(buf, bufsize,
+            "m_state=0x%04X STORAGE=%d OBD=%d GPS=%d MEMS=%d NET=%d GPSON=%d "
+            "CELL=%d WIFI=%d WORKING=%d STANDBY=%d RADIO=%d LOGIN=%d",
+            (unsigned)s,
+            (s & 0x001) ? 1 : 0, (s & 0x002) ? 1 : 0, (s & 0x004) ? 1 : 0,
+            (s & 0x008) ? 1 : 0, (s & 0x010) ? 1 : 0, (s & 0x020) ? 1 : 0,
+            (s & 0x040) ? 1 : 0, (s & 0x080) ? 1 : 0, (s & 0x100) ? 1 : 0,
+            (s & 0x200) ? 1 : 0,
+#if ENABLE_WIFI
+            WiFi.isConnected() ? 1 : 0,
+#else
+            0,
+#endif
+            teleLoginState() ? 1 : 0);
 #if ENABLE_WIFI
     } else if (!strcmp(cmd, "SSID?")) {
         n = snprintf(buf, bufsize, "%s", wifiSSID[0] ? wifiSSID : "-");
@@ -525,6 +554,13 @@ int handlerControl(UrlHandlerParam* param)
     } else if (!strcmp(cmd, "ON?")) {
         // Query standby state: returns 0 when paused/standby, 1 when active.
         n = snprintf(buf, bufsize, "%u", httpIsStandby() ? 0 : 1);
+    } else if (!strcmp(cmd, "OTA_CHECK_NOW")) {
+        // Makes the periodic pull-OTA check run on its next telemetry-task
+        // pass instead of waiting for OTA_INTERVAL. No-op if OTA isn't
+        // provisioned (OTA_TOKEN empty) or WiFi isn't currently connected -
+        // same preconditions the periodic check already has.
+        httpTriggerOtaCheckNow();
+        n = snprintf(buf, bufsize, "OK");
     } else if (!strncmp(cmd, "LED_RED=", 8)) {
         // Set red/power LED enable (0=off, 1=on).  Written to NVS key LED_RED_EN.
         uint8_t v = (uint8_t)atoi(cmd + 8);
@@ -568,11 +604,20 @@ int handlerControl(UrlHandlerParam* param)
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
     } else if (!strncmp(cmd, "STANDBY_TIME=", 13)) {
-        // Set standby-time override in seconds (5-900; 0 = use firmware default).
+        // Set standby-time override in seconds (5-900; 0 = use firmware
+        // default; 65535 = disable standby entirely - for extended bench/
+        // parked testing where the vehicle deliberately never moves, so
+        // normal standby doesn't suspend WiFi/OBD polling mid-test).
         // Written to NVS key STANDBY_TIME (u16) so the setting survives reboot.
-        uint16_t v = (uint16_t)atoi(cmd + 13);
-        if (v != 0 && v < 5) v = 5;
-        if (v > 900) v = 900;
+        long parsed = atol(cmd + 13);
+        uint16_t v;
+        if (parsed == 65535) {
+            v = 65535;
+        } else {
+            v = (uint16_t)parsed;
+            if (v != 0 && v < 5) v = 5;
+            if (v > 900) v = 900;
+        }
         n = snprintf(buf, bufsize, "%s",
             nvs_set_u16(nvs, "STANDBY_TIME", v) == ESP_OK
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
@@ -630,26 +675,6 @@ int handlerControl(UrlHandlerParam* param)
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
         printOtaStatus();
-    } else if (!strcmp(cmd, "CAN_DATA?")) {
-        // Return accumulated CAN bus raw frame data (hex-encoded) and clear the buffer.
-        // Each frame's payload bytes are represented as consecutive two-char hex pairs.
-        // Multiple frames are comma-separated.  Returns "-" when no frames have been
-        // captured (CAN disabled or no frames received yet).
-        // Also returns the total frame count seen since boot as a suffix "|<count>".
-        portENTER_CRITICAL(&s_canBufMux);
-        if (s_canFrameCount == 0) {
-            n = snprintf(buf, bufsize, "-|%lu", (unsigned long)s_canFrameTotal);
-        } else {
-            n = 0;
-            for (int i = 0; i < s_canFrameCount && n < bufsize - 2; i++) {
-                if (i > 0) n += snprintf(buf + n, bufsize - n, ",");
-                n += snprintf(buf + n, bufsize - n, "%s", s_canFrameList[i]);
-            }
-            n += snprintf(buf + n, bufsize - n, "|%lu", (unsigned long)s_canFrameTotal);
-            // Clear buffer after read.
-            s_canFrameCount = 0;
-        }
-        portEXIT_CRITICAL(&s_canBufMux);
     } else {
         n = snprintf(buf, bufsize, "ERR");
     }

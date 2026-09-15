@@ -21,7 +21,7 @@
 #include <math.h>
 #include <string.h>
 
-// Explicitná deklarácia globálneho objektu Update z ESP32 Updater knižnice
+// ExplicitnÃƒÂ¡ deklarÃƒÂ¡cia globÃƒÂ¡lneho objektu Update z ESP32 Updater kniÃ…Â¾nice
 extern UpdateClass Update;
 #include <FreematicsPlus.h>
 #include <httpd.h>
@@ -29,6 +29,8 @@ extern UpdateClass Update;
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
+#include "vag_odo_fuel.h"
+#include "psa_odo_fuel.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -36,9 +38,29 @@ extern UpdateClass Update;
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #if ENABLE_OLED
 #include "FreematicsOLED.h"
 #endif
+
+// 2026-09-14: __DATE__/__TIME__ are evaluated per translation unit, not once
+// for the whole firmware - dataserver.cpp has its own copy, which only
+// updates when dataserver.cpp itself gets recompiled. Since most recent work
+// only touches this file, PlatformIO's incremental build leaves
+// dataserver.cpp's copy stale (confirmed: dataserver.cpp last changed
+// 13:15:14, so its __DATE__/__TIME__ froze at whatever it compiled to then,
+// even in a firmware.bin built hours later) - /api/info's "fw_build" field
+// (dataserver.cpp) reported an old timestamp while the real running build
+// (this file's own Serial boot banner) was current. Fix: one shared, always-
+// current string, defined here (this file changes on every real firmware
+// change) and consumed via extern from dataserver.cpp instead of it
+// evaluating __DATE__/__TIME__ itself.
+// extern on the definition itself, not just the consuming side's forward
+// declaration - a plain "const char x[] = ..." at file scope in C++ (unlike
+// C) defaults to INTERNAL linkage, which silently produces exactly this
+// "undefined reference to FW_BUILD_STR" at link time from dataserver.cpp's
+// extern declaration, since there'd be no external symbol to find.
+extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
 // states
 #define STATE_STORAGE_READY 0x1
@@ -138,6 +160,14 @@ TeleClientUDP teleClient;
 TeleClientHTTP teleClient;
 #endif
 
+// 2026-09-14: dedicated HTTP client for pull-OTA, independent of teleClient.wifi
+// (which is WifiUDP, not HTTP-capable, on SERVER_PROTOCOL=PROTOCOL_UDP builds -
+// see performPullOtaCheck()'s comment for the full story of why this exists).
+// Declared here for the same C++-declaration-order reason as teleClient above.
+#if ENABLE_WIFI
+WifiHTTP otaWifiClient;
+#endif
+
 // config data
 char apn[32];
 char simPin[16] = SIM_CARD_PIN;
@@ -153,14 +183,71 @@ char wifiPassword2[32] = WIFI_PASSWORD2;
 uint8_t wifiCurrentIdx = 0;
 
 // Tries the two configured WiFi networks in turn: each call to this function
-// (which only happens when the device is NOT currently connected — see the
+// (which only happens when the device is NOT currently connected Ã¢â‚¬â€ see the
 // call sites) alternates which network it attempts, so if the primary
 // (wifiSSID) is out of range, the next retry cycle tries the secondary
 // (wifiSSID2), and so on. Skips a network whose SSID is empty.
 // This replaces the direct teleClient.wifi.begin(wifiSSID, wifiPassword)
 // calls that used to be scattered across the file (single-network only).
+// wifiScanAndLog() (defined later, after `logger`/`state` exist - it needs
+// both) is forward-declared here since Arduino's .ino auto-prototyping
+// doesn't cover functions using types/globals not yet visible at their own
+// definition point. See the definition (near `State state;`) for what it
+// does and why.
+static void wifiScanAndLog();
+static bool wifiScanPending = false;
+static int32_t wifiScanCount = 0;
+static int32_t wifiScanTargetRssi = -999;
+#define PID_WIFI_SCAN_COUNT  0x320
+#define PID_WIFI_TARGET_RSSI 0x321
+
+// 2026-09-14: why the device rebooted, sent once per boot. Added after a
+// ~18-minute total telemetry silence (WiFi AND cellular both quiet) followed
+// two failed direct-OTA push attempts - no way to tell from the outside
+// whether that was a genuine crash (panic/watchdog) caused by the
+// interrupted OTA write, a brownout, or something unrelated. esp_reset_reason()
+// (esp_system.h, standard ESP-IDF) answers this definitively instead of
+// guessing: ESP_RST_POWERON=1 (normal power-on), ESP_RST_WDT=8/ESP_RST_TASK_WDT=
+// 9/ESP_RST_INT_WDT=7 (a stuck task got killed by a watchdog), ESP_RST_PANIC=2
+// (crash/exception), ESP_RST_BROWNOUT=6 (supply voltage sagged), ESP_RST_SW=3
+// (esp_restart() called deliberately, e.g. by the OTA handler after a
+// successful flash). Full enum: esp-idf esp_system.h RESET_REASON.
+static bool resetReasonPending = false;
+static int32_t resetReasonCode = 0;
+#define PID_RESET_REASON 0x360
+
+// ESP32 WiFi disconnect reason codes (wifi_err_reason_t, esp_wifi_types.h) -
+// sent as telemetry (see wifiDisconnectPending below) so repeated WiFi
+// drops during real-world (in-car, engine-running) testing can be diagnosed
+// remotely instead of guessed at. Common values worth knowing on sight:
+//   2   = AUTH_EXPIRE (AP-initiated re-auth failure)
+//   3   = AUTH_LEAVE
+//   6/7 = ASSOC_EXPIRE / NOT_AUTHED
+//   8   = ASSOC_LEAVE (station left - e.g. our own disconnect() call)
+//   15  = 4WAY_HANDSHAKE_TIMEOUT (wrong password OR AP not responding in time)
+//   200 = BEACON_TIMEOUT (lost the AP's signal - range/interference)
+//   201 = NO_AP_FOUND
+//   202 = AUTH_FAIL
+//   203 = ASSOC_FAIL
+//   204 = HANDSHAKE_TIMEOUT
+// Full list: esp-idf esp_wifi_types.h WIFI_REASON_*.
+static bool wifiDisconnectPending = false;
+static int32_t wifiDisconnectReason = 0;
+static int32_t wifiDisconnectCount = 0;
+#define PID_WIFI_DISCONNECT_REASON 0x322
+#define PID_WIFI_DISCONNECT_COUNT  0x323
+
+// Defined later (near wifiScanAndLog(), after `logger`/`state` exist).
+static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+
 void wifiConnect()
 {
+  static bool scanned = false;
+  if (!scanned) {
+    scanned = true;
+    WiFi.onEvent(onWifiEvent);
+    wifiScanAndLog();
+  }
   static uint8_t wifiNetIdx = 0;
   const char* ssid = "";
   const char* pass = "";
@@ -180,7 +267,7 @@ void wifiConnect()
 // Reconnects to whichever network wifiConnect() used most recently, WITHOUT
 // advancing the alternation. Use this only when we know we were already on
 // a working network and just need it back (e.g. the heap-fragmentation
-// WiFi restart mid-OTA below) — not when searching for a reachable network,
+// WiFi restart mid-OTA below) Ã¢â‚¬â€ not when searching for a reachable network,
 // which is what wifiConnect() is for.
 void wifiReconnectCurrent()
 {
@@ -192,7 +279,7 @@ void wifiReconnectCurrent()
   teleClient.wifi.begin(ssid, pass);
 }
 #endif
-// Server settings – loaded from NVS at boot; fall back to compile-time defaults.
+// Server settings Ã¢â‚¬â€œ loaded from NVS at boot; fall back to compile-time defaults.
 // Set via NVS keys SERVER_HOST, SERVER_PORT, WEBHOOK_PATH using the
 // Freematics HA integration provisioning flash (config_nvs.bin).
 char serverHost[128] = SERVER_HOST;
@@ -207,7 +294,7 @@ char webhookPath[256] = "";
 // so that cellular devices reach the cloud webhook endpoint directly rather than
 // the Remote UI proxy (*.ui.nabu.casa) which the SIM7600 TLS stack cannot use.
 // WiFi connections use SERVER_HOST / WEBHOOK_PATH, which the HA integration sets
-// from get_url(prefer_external=True) – typically *.ui.nabu.casa (Nabu Casa Remote
+// from get_url(prefer_external=True) Ã¢â‚¬â€œ typically *.ui.nabu.casa (Nabu Casa Remote
 // UI).  Using the Remote UI for WiFi ensures WiFi telemetry and WiFi OTA (which
 // always uses *.ui.nabu.casa) share the same TLS session, avoiding mbedTLS heap
 // fragmentation from repeated TLS host switching on the ESP32.
@@ -219,7 +306,7 @@ char cellWebhookPath[256] = "";
 // provisioning.  Can be overridden by NVS key ENABLE_HTTPD written by the HA
 // integration config_nvs.bin.  Only takes effect when compiled with ENABLE_HTTPD=1.
 uint8_t enableHttpd = ENABLE_HTTPD;
-// Runtime BLE enable – set to 0 via NVS key ENABLE_BLE to disable the BLE
+// Runtime BLE enable Ã¢â‚¬â€œ set to 0 via NVS key ENABLE_BLE to disable the BLE
 // SPP server and free ~100 KB heap for the TLS webhook client.  Defaults to
 // 1 (on) so devices that were never provisioned keep the previous behaviour.
 // Only takes effect when the firmware is compiled with ENABLE_BLE=1.
@@ -314,23 +401,13 @@ int vehicleObdDataCount = 0;
 // 0 means "use the compile-time STATIONARY_TIME_TABLE default" (currently 180 s).
 // When set to a value between 5 and 900 it replaces the last (maximum) entry
 // of the stationary-time table so the device enters standby sooner.
+// 65535 (0xFFFF) is a sentinel meaning "disable standby entirely" - see the
+// nvsStandbyTimeS == 0xFFFF handling in process() where the stationary-time
+// table's last tier is set to 0 ("never reaches this tier"). Temporary,
+// debugging-only use (extended bench/parked testing) - must not be left set
+// permanently, since it also keeps WiFi/OBD polling running non-stop.
 uint16_t nvsStandbyTimeS = 0;
 
-// ---------------------------------------------------------------------------
-// CAN bus sniffing buffer
-// When enableCan is true, process() calls obd.receiveData() to drain incoming
-// CAN frames from the ELM327's monitor-all (ATM1) queue and appends each
-// frame's bytes as a two-hex-chars-per-byte entry in s_canFrameList.
-// The list is exposed via /api/control?cmd=CAN_DATA and cleared when read.
-// ---------------------------------------------------------------------------
-#define CAN_DATA_LIST_MAX 256   // maximum number of stored CAN frame snapshots
-// Ring buffer storing hex-encoded CAN frame payloads, newest last.
-// Each entry is at most 2*8=16 chars (8 data bytes × 2 hex digits).
-// The buffer is guarded by s_canBufMux for cross-task access from dataserver.
-char   s_canFrameList[CAN_DATA_LIST_MAX][20];
-int    s_canFrameCount = 0;   // number of valid entries (0 … CAN_DATA_LIST_MAX)
-uint32_t s_canFrameTotal = 0; // total CAN frames seen since boot (for display)
-portMUX_TYPE s_canBufMux = portMUX_INITIALIZER_UNLOCKED;
 // Tracks whether sniffing is currently active so we can call sniff(true/false)
 // only on transitions rather than every process() call.
 static bool s_canSniffActive = false;
@@ -392,7 +469,7 @@ static volatile bool s_ota_pending = false;
 // Initialised to -1 so the first call to process()
 // always adds the PIDs to the buffer.  Reset back to -1 by initialize() and
 // whenever a new WiFi or cellular connection is established (in telemetry()), so
-// the current state is always re-sent after a reconnect — preventing a permanent
+// the current state is always re-sent after a reconnect Ã¢â‚¬â€ preventing a permanent
 // "Unbekannt" IST-Status in Home Assistant when HA is reloaded while the device
 // is connected (HA loses diag state but device won't resend unchanged values
 // unless the sentinels are reset).
@@ -412,10 +489,10 @@ static int8_t  s_lastDeepStandby = -1;   // PID_DEEP_STANDBY sentinel
 // picks up.  Without this, a race between process() (updating sentinels and
 // filling buffers) and the telemetry loop (slow OTA check over cellular delays
 // getNewest()) causes the sentinel-triggered buffer to be overwritten before it
-// is transmitted — leaving HA with "Unbekannt" for LED/beep/SD indefinitely.
+// is transmitted Ã¢â‚¬â€ leaving HA with "Unbekannt" for LED/beep/SD indefinitely.
 static volatile bool s_send_state_pids = false;
 
-// Cached SD card capacity/free space (MiB) — updated by process() each time it
+// Cached SD card capacity/free space (MiB) Ã¢â‚¬â€ updated by process() each time it
 // emits PID_SD_TOTAL_MB / PID_SD_FREE_MB.  Read (not written) by the telemetry
 // inject block so it does not need to access the SD SPI bus from the wrong task.
 static uint32_t s_cachedSdTotalMb = 0;
@@ -424,10 +501,10 @@ static uint32_t s_cachedSdFreeMb  = 0;
 // Pull-OTA constants used in initialize(), standby(), performPullOtaFlash(),
 // and performPullOtaCheck().  Defined here (before any function body) so that
 // all translation-unit uses see them regardless of source order.
-// Minimum plausible firmware binary size — rejects short error pages returned
+// Minimum plausible firmware binary size Ã¢â‚¬â€ rejects short error pages returned
 // instead of the real binary.
 #define PULL_OTA_MIN_FW_SIZE       65536U   // 64 KB
-// Chunk size for SD download and SD→flash write loops.
+// Chunk size for SD download and SDÃ¢â€ â€™flash write loops.
 #define PULL_OTA_CHUNK_SIZE        4096U    // 4 KB
 // Per-chunk receive timeout when streaming from the network socket.
 #define PULL_OTA_CHUNK_TIMEOUT_MS  30000U   // 30 s
@@ -491,16 +568,229 @@ OLED_SH1106 oled;
 
 State state;
 
+// 2026-09-14: exposes SD-log writing (logger.logEvent(), gated on
+// STATE_STORAGE_READY - same pattern used everywhere else in this file) to
+// teleclient.cpp, a separate translation unit that cannot see the State/
+// Logger class definitions above (they're defined directly in this .ino,
+// not in a shared header). Root-caused via a full code-trace: the entire
+// WiFi/cellular connect path in TeleClientUDP::connect()/notify()
+// (teleclient.cpp) only ever did Serial.println() on failure - never
+// logger.logEvent() - so every connection failure there was invisible to
+// /api/events, making a 40+-minute total telemetry silence look identical
+// to "nothing is even trying" from the SD log alone. Not static: needs
+// external linkage so teleclient.cpp's extern declaration can reach it.
+void logNetEvent(const char* msg)
+{
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) {
+    logger.logEvent(msg);
+  }
+#endif
+}
+
+// Live-diagnostic wrapper for dataserver.cpp's /api/control?cmd=STATE? -
+// exposes the raw state.m_state bitmask and the teleClient login flag over
+// HTTP without needing a Serial connection.  Added 2026-09-15 while
+// debugging "on WiFi, nothing reaches Traccar" with the device outside the
+// car (no USB/Serial available) - reading telelogger.ino/teleclient.cpp
+// alone could not tell whether the WiFi connect branch in telemetry() was
+// ever actually being reached and running.
+uint16_t getStateBits()
+{
+  return state.m_state;
+}
+
+bool teleLoginState()
+{
+  return teleClient.login;
+}
+
+// More live-diagnostic getters for dataserver.cpp's /api/info - added
+// 2026-09-15 per request: "nech clovek vidi ze nieco ide, statusy, ip, gps
+// satelity pozicia, logovanie, kolko odoslalo dat akou cestou" (a status
+// view without needing Serial - IP, GPS satellites/position, how much data
+// was sent and over which route). JSON output is cheap on memory (just a
+// few extra snprintf fields on the existing /api/info buffer), unlike a
+// full HTML status page.
+const char* teleConnMethod()
+{
+  if (state.check(STATE_WIFI_CONNECTED)) return "wifi";
+  if (state.check(STATE_CELL_CONNECTED)) return "cell";
+  return "none";
+}
+
+const char* teleNetOperator() { return netop.c_str(); }
+const char* teleIpAddress()   { return ip.c_str(); }
+int16_t teleRssi()            { return rssi; }
+uint32_t teleTxCount()        { return teleClient.txCount; }
+uint32_t teleTxBytes()        { return teleClient.txBytes; }
+uint32_t teleRxBytes()        { return teleClient.rxBytes; }
+
+int gpsSatCount() { return gd ? (int)gd->sat : 0; }
+float gpsLat()    { return gd ? gd->lat : 0; }
+float gpsLng()    { return gd ? gd->lng : 0; }
+// 0xFFFFFFFF sentinel = no GPS fix data yet at all (gd null or never timestamped).
+uint32_t gpsAgeMs() { return (gd && gd->ts) ? (uint32_t)(millis() - gd->ts) : 0xFFFFFFFF; }
+
+// Thin OBD-link wrappers, same reasoning as logNetEvent() above: per-vehicle
+// .cpp files (vag_odo_fuel.cpp, psa_odo_fuel.cpp, ...) are separate
+// translation units that cannot see the .ino-local `OBD` subclass definition,
+// so they drive the link through these instead of touching `obd` directly.
+// Not vehicle-specific despite living next to the VAG/PSA modules' callers -
+// shared by all of them.
+bool obdLinkUp()
+{
+  return obd.link != 0;
+}
+
+int obdSendCommand(const char* cmd, char* buf, int bufsize, int timeout)
+{
+  if (!obd.link) return 0;
+  return obd.link->sendCommand(cmd, buf, bufsize, timeout);
+}
+
+bool obdReadStdPID(byte pid, int& value)
+{
+  return obd.readPID(pid, value);
+}
+
+// ESP32 WiFi disconnect reason codes (wifi_err_reason_t, esp_wifi_types.h) -
+// sent as telemetry (see wifiDisconnectPending, declared earlier alongside
+// wifiConnect()) so repeated WiFi drops during real-world (in-car,
+// engine-running) testing can be diagnosed remotely instead of guessed at.
+// Common values worth knowing on sight:
+//   2   = AUTH_EXPIRE (AP-initiated re-auth failure)
+//   3   = AUTH_LEAVE
+//   6/7 = ASSOC_EXPIRE / NOT_AUTHED
+//   8   = ASSOC_LEAVE (station left - e.g. our own disconnect() call)
+//   15  = 4WAY_HANDSHAKE_TIMEOUT (wrong password OR AP not responding in time)
+//   200 = BEACON_TIMEOUT (lost the AP's signal - range/interference)
+//   201 = NO_AP_FOUND
+//   202 = AUTH_FAIL
+//   203 = ASSOC_FAIL
+//   204 = HANDSHAKE_TIMEOUT
+// Full list: esp-idf esp_wifi_types.h WIFI_REASON_*.
+static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+    wifiDisconnectCount++;
+    wifiDisconnectPending = true;
+    Serial.printf("[WIFI] Disconnected, reason=%d (count=%d)\n",
+        (int)wifiDisconnectReason, (int)wifiDisconnectCount);
+#if STORAGE != STORAGE_NONE
+    if (state.check(STATE_STORAGE_READY)) {
+      char diag[48];
+      snprintf(diag, sizeof(diag), "WIFI DISCONNECT REASON=%d N=%d",
+          (int)wifiDisconnectReason, (int)wifiDisconnectCount);
+      logger.logEvent(diag);
+    }
+#endif
+  }
+}
+
+// Sent once (see wifiScanPending, declared earlier alongside wifiConnect())
+// as regular telemetry over whatever channel is actually up (cellular
+// included) - the whole point of this scan is diagnosing a WiFi
+// connectivity problem, so it has to be readable even when WiFi itself is
+// the thing not working (SD-card/Serial logging alone wouldn't help there
+// without physical device access, same reasoning as the UDS diagnostic
+// PIDs elsewhere in this file). wifiScanCount = networks found (0 if
+// none); wifiScanTargetRssi = RSSI of the configured SSID (wifiSSID/
+// wifiSSID2) if it showed up in the scan, or -999 as a sentinel meaning
+// "not seen at all". Scans once (see the `scanned` static in
+// wifiConnect()), not on every reconnect attempt - WiFi.scanNetworks()
+// takes a couple of seconds, not worth paying on every retry.
+static void wifiScanAndLog()
+{
+  // Explicit STA mode before scanning - scanNetworks() can otherwise return
+  // WIFI_SCAN_FAILED (-2) if called before the radio is in a scan-capable
+  // mode this early in the connect sequence. Harmless/idempotent if the
+  // radio is already in STA mode (which is what the connect below needs
+  // anyway).
+  WiFi.mode(WIFI_STA);
+  // 2026-09-14: WiFi.mode() only *requests* the mode change - the underlying
+  // esp_wifi_start() (radio init, RF calibration, buffer allocation) runs on
+  // the WiFi event task and is not guaranteed done by the time mode() returns,
+  // especially on a fresh cold boot (confirmed via real-drive telemetry:
+  // io800=-2/WIFI_SCAN_FAILED on a cold boot in the car, but io800=5 - a
+  // clean scan - when the device had already been running a while on the
+  // bench with the driver already warm). The mode() call alone doesn't fix
+  // that race, so retry the scan itself a few times with a short wait
+  // in between, giving the driver time to actually come up, before
+  // reporting a real failure.
+  Serial.println("[WIFI] Scanning for networks...");
+  int n = WiFi.scanNetworks();
+  for (byte scanRetry = 0; n < 0 && scanRetry < 3; scanRetry++) {
+    Serial.printf("[WIFI] Scan attempt failed (ret=%d), retrying...\n", n);
+    delay(300);
+    n = WiFi.scanNetworks();
+  }
+  // Preserve a negative return as-is (WIFI_SCAN_FAILED=-2, WIFI_SCAN_RUNNING
+  // =-1) instead of clamping to 0 - "found 0 networks" and "the scan call
+  // itself failed" are different problems and worth telling apart in the
+  // telemetry/log.
+  wifiScanCount = n;
+  wifiScanTargetRssi = -999;
+  if (n <= 0) {
+    Serial.printf("[WIFI] Scan: no networks found (ret=%d)\n", n);
+#if STORAGE != STORAGE_NONE
+    if (state.check(STATE_STORAGE_READY)) {
+      char diag0[24];
+      snprintf(diag0, sizeof(diag0), "WIFI SCAN=%d", n);
+      logger.logEvent(diag0);
+    }
+#endif
+    WiFi.scanDelete();
+    wifiScanPending = true;
+    return;
+  }
+  char diag[200];
+  int len = snprintf(diag, sizeof(diag), "WIFI SCAN=%d", n);
+  // List up to the first few strongest-looking entries (as returned by the
+  // scan, typically already sorted by RSSI) - enough to see what's around
+  // without risking the event-log line length limit (FileLogger::logEvent
+  // truncates the combined line beyond ~132 chars).
+  int shown = n < 4 ? n : 4;
+  for (int i = 0; i < shown && len < (int)sizeof(diag) - 32; i++) {
+    len += snprintf(diag + len, sizeof(diag) - len, " %s(%d)",
+        WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+  }
+  Serial.print("[WIFI] "); Serial.println(diag);
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) logger.logEvent(diag);
+#endif
+  // Look for the configured SSID(s) specifically among the scan results,
+  // regardless of whether they were in the first few logged above.
+  for (int i = 0; i < n; i++) {
+    String found = WiFi.SSID(i);
+    if ((wifiSSID[0] && found == wifiSSID) || (wifiSSID2[0] && found == wifiSSID2)) {
+      wifiScanTargetRssi = WiFi.RSSI(i);
+      break;
+    }
+  }
+  WiFi.scanDelete();
+  wifiScanPending = true;
+}
+
 // ---------------------------------------------------------------------------
 // Volatile request flags set by the httpd task (handlerControl) to request
 // telemetry state changes.  All actual state.m_state modifications are
 // applied by the net task at the top of its main loop so that m_state is
-// always written from a single task context — same thread-safety pattern
+// always written from a single task context Ã¢â‚¬â€ same thread-safety pattern
 // as s_ota_active.
 // ---------------------------------------------------------------------------
 static volatile bool s_http_standby_enter = false;
 static volatile bool s_http_standby_exit  = false;
-
+// Set by handlerControl (cmd=OTA_CHECK_NOW) to make the periodic pull-OTA
+// check in telemetry() run on its very next pass instead of waiting for
+// otaCheckIntervalS - lets an external push-decision service (one that
+// knows, from Traccar + each device's own /api/info, which devices are
+// actually out of date) skip the wait instead of just editing registry.json
+// and hoping the device polls soon. Consumed (cleared) by telemetry() the
+// moment it fires; does not bypass otaToken[0]/STATE_WIFI_CONNECTED, so it's
+// a no-op if OTA isn't provisioned or WiFi isn't up.
+static volatile bool s_ota_check_now = false;
 
 // Called from handlerControl (httpd task) to pause or resume the telemetry task.
 void httpControlStandby(bool enter) {
@@ -517,6 +807,12 @@ void httpControlStandby(bool enter) {
 // standby mode.  Called from handlerControl to answer "ON?" queries.
 bool httpIsStandby() {
     return state.check(STATE_STANDBY) || s_http_standby_enter;
+}
+
+// Called from handlerControl (httpd task, cmd=OTA_CHECK_NOW) to request an
+// immediate pull-OTA check on the telemetry task's next pass.
+void httpTriggerOtaCheckNow() {
+    s_ota_check_now = true;
 }
 
 void printTimeoutStats()
@@ -596,77 +892,10 @@ int handlerLiveData(UrlHandlerParam* param)
 // block below).
 static long parseUdsHexValue(const char* resp, uint16_t did);
 
-// Forward declaration: defined right after parseUdsHexValue(); extracts a
-// specific byte range from a UDS ReadDataByIdentifier response instead of
-// treating all trailing data as one value (see the ODOMETER PROCESSING
-// block below).
-static long parseUdsByteRange(const char* resp, uint16_t did, int byteOffset, int byteLen);
-
 // Forward declaration: defined later alongside processGPS(); accumulates
 // GPS-based distance since boot, used as a fallback when OBD/UDS odometer
 // reads fail (see the ODOMETER PROCESSING block below).
 uint32_t gpsOdometerKm();
-
-// Diagnostic PIDs for the ODO/FUEL UDS blocks below, sent as regular
-// telemetry fields alongside GPS/OBD data over the SAME cellular/WiFi
-// channel already used for everything else. Traccar's FreematicsProtocolDecoder
-// has no case for these keys, so they fall through to its default branch and
-// get stored as generic "io<key>" position attributes - readable any time the
-// car has signal (not just on WiFi/USB), without any decoder change needed.
-// Range 0x300+ chosen to avoid colliding with standard OBD PIDs (max 0xFF,
-// sent |0x100 => up to 0x1FF) or the existing custom ones (0x81/0x82/0x11f/0x12f/0x1a6).
-// diagCode: 0 = obd.link not up, 1 = no/timeout response, 2 = response
-// received but byte-range parse failed, 3 = success (matches the value
-// actually used for KM/DL that run).
-#define PID_ODO_DIAG  0x300
-#define PID_ODO_RET   0x301
-#define PID_ODO_LEN   0x302
-#define PID_FUEL_DIAG 0x310
-#define PID_FUEL_RET  0x311
-#define PID_FUEL_LEN  0x312
-// Session-control (1003) outcome, sent alongside the above so it's readable
-// remotely too - previously this only went into the SD event log's SESS=
-// text, which needs WiFi/USB access to the device to read at all, defeating
-// the point of diagnosing a real-drive failure. sessCode: 0 = no/timeout
-// response, 1 = negative response (session request rejected - sessNrc holds
-// the UDS NRC byte, e.g. 0x22 conditionsNotCorrect, 0x33 securityAccess
-// required), 2 = some other unexpected response (garbage, or "NO DATA" -
-// no hex digits at all), 3 = positive response confirmed (50 03).
-#define PID_ODO_SESS      0x303
-#define PID_ODO_SESS_NRC  0x304
-#define PID_FUEL_SESS     0x313
-#define PID_FUEL_SESS_NRC 0x314
-
-// Classifies a UDS session-control (1003) response so the outcome can be
-// sent as a compact telemetry value instead of the raw text. See the
-// PID_ODO_SESS comment above for the meaning of the returned code.
-static int classifySessionResponse(int ret, const char* resp, int* nrcOut)
-{
-  *nrcOut = 0;
-  if (ret <= 0) return 0;
-  char hex[16];
-  int n = 0;
-  for (const char* p = resp; *p && n < (int)sizeof(hex) - 1; p++) {
-    if (isxdigit((unsigned char)*p)) hex[n++] = *p;
-  }
-  hex[n] = 0;
-  if (n < 2) return 2; // e.g. "NO DATA" - no hex digits at all
-  char sidStr[3] = { hex[0], hex[1], 0 };
-  long sid = strtol(sidStr, nullptr, 16);
-  if (sid == 0x50) {
-    if (n >= 4) {
-      char subStr[3] = { hex[2], hex[3], 0 };
-      if (strtol(subStr, nullptr, 16) == 0x03) return 3;
-    }
-    return 2;
-  }
-  if (sid == 0x7F && n >= 6) {
-    char nrcStr[3] = { hex[4], hex[5], 0 };
-    *nrcOut = (int)strtol(nrcStr, nullptr, 16);
-    return 1;
-  }
-  return 2;
-}
 
 void processOBD(CBuffer* buffer)
 {
@@ -719,275 +948,12 @@ void processOBD(CBuffer* buffer)
     vehiclePidIdx++;
   }
 
-  // =========================================================================
-  // ODOMETER PROCESSING (Passat B8 UDS / Standard OBD2 / Fallback to GPS)
-  // Runs once per minute - the odometer value changes slowly, and each run
-  // costs several extra CAN protocol AT commands (ATSP6/ATSH/1003 + restore),
-  // so there's no benefit to checking as often as the 5s tier-poll cycle.
-  // Independent of GPS position transmission, which is unaffected by this.
-  // =========================================================================
-  static uint32_t lastOdoCheck = 0;
-  if (millis() - lastOdoCheck >= 60000) {
-    lastOdoCheck = millis();
-    int odoVal = 0;
-    uint32_t odometerKm = 0;
-    char responseBuf[64];
-
-    // Ak je komunikácia s linkou aktívna (obd.link je platný ukazovateľ)
-    char rawBuf[20] = "-"; // truncated raw hex response, for the diag line
-    int ret1 = 0;
-    long parsed1 = -1;
-    const char* src = "NONE";
-    char sessResp1[24] = "-"; // response to 1003 (extended session request)
-    int sessRet1 = 0;
-
-    if (obd.link) {
-      // Odometer confirmed 2026-09-12 via a HexSniff bench capture against
-      // a real VCDS session (module "19 - Gateway", its "odo read" menu
-      // entry) - full raw capture + byte breakdown in the HexSniff repo at
-      // vehicles/VAG/VW/PassatB8/decoded.md. The two hypotheses previously
-      // tried here - extended 29-bit addressing straight to the instrument
-      // cluster (0x18DA17F1/0x18DAF117) and standard 11-bit 0x714/0x77E -
-      // are both confirmed dead ends: on this MQB platform the odometer is
-      // only reachable through the CAN Gateway module (0x19) itself, not
-      // through the cluster, and DID 0x0505 isn't it anyway.
-      char ignore[32];
-      obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
-      // Confirmed 2026-09-14 via server-side telemetry (SESS=9:NO DATA on
-      // EVERY single attempt across 2 real drives, no exceptions) - even
-      // the 1003 session-open request itself never gets a response during
-      // real driving, not just the follow-up DID read. Cross-checked
-      // against the HexSniff capture of a real VCDS session on this same
-      // vehicle: VCDS continuously broadcasts TesterPresent (3E 80) on
-      // FUNCTIONAL address 0x700 throughout the whole session (every
-      // ~200ms, confirmed present right up to and through the successful
-      // odometer read). This firmware never sent that broadcast at all -
-      // the Gateway/Instruments modules apparently won't answer ANY
-      // physically-addressed diagnostic request, including the session
-      // request, without it. Announce tester presence functionally first.
-      obd.link->sendCommand("ATSH700\r", ignore, sizeof(ignore), 100);   // funkčná (broadcast) adresa
-      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);     // bez filtra (nečakáme konkrétnu odpoveď)
-      // VCDS neposiela len jeden paket - v zázname beží nepretržite ~9+
-      // sekúnd (opakovane každých ~200-400ms) predtým, než modul začne
-      // odpovedať na fyzicky adresované požiadavky. Jeden jediný broadcast
-      // tesne pred prepnutím adresy nemusí stačiť, ak Gateway vyžaduje
-      // "udržateľnú" prítomnosť testera. Každé sendCommand tu aj tak čaká
-      // celý timeout (odpoveď na 3E 80 je potlačená), takže 5 opakovaní
-      // samo osebe rozloží vysielanie na ~500ms.
-      for (int i = 0; i < 5; i++) {
-        obd.link->sendCommand("3E80\r", ignore, sizeof(ignore), 100);    // TesterPresent, potlačená odpoveď
-      }
-      obd.link->sendCommand("ATSH710\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Gateway (0x19)
-      obd.link->sendCommand("ATCRA77A\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
-      // ELM327 auto-guesses the flow-control CAN ID it replies with as
-      // "request header + 8" (the standard 11-bit convention, e.g.
-      // 7E0->7E8). VAG's gateway-routed addressing here does NOT follow
-      // that offset (0x710 -> 0x77A), so without telling the chip
-      // explicitly, its auto flow-control frame goes out on the wrong ID,
-      // the module never sees a valid "continue to send" and the multi-frame
-      // UDS response never completes - ELM327 then reports "NO DATA" even
-      // though the module did answer. Every read today failed exactly this
-      // way (see SESS=/R1=/RAW1= diagnostics). Set it explicitly instead:
-      // per ISO-TP, flow control is sent BY the tester (the receiver of the
-      // multi-frame response) using the tester's OWN request ID (0x710),
-      // not the module's response ID - FCSD = "30 00 00" (continue to send,
-      // no block-size limit, no separation delay), FCSM 1 = use both.
-      obd.link->sendCommand("ATFCSH710\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATFCSD300000\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATFCSM1\r", ignore, sizeof(ignore), 100);
-      // Capture (instead of discarding) the response to the session-switch
-      // request - every UDS read today came back "NO DATA" with no
-      // exceptions, which points at 1003 itself being rejected (e.g. a
-      // negative response "7F 10 xx") rather than at a timing/vehicle-speed
-      // issue, since we were previously blind to what this call actually
-      // returned.
-      sessResp1[0] = 0;
-      sessRet1 = obd.link->sendCommand("1003\r", sessResp1, sizeof(sessResp1), 200);
-
-      responseBuf[0] = 0;
-      ret1 = obd.link->sendCommand("2202BD\r", responseBuf, sizeof(responseBuf), 100);
-      strncpy(rawBuf, responseBuf, sizeof(rawBuf) - 1);
-      if (ret1 > 0) {
-        // Dátový blok je CA <km: 3 bajty BE> 00 00 6A 58 D4 <rolling ctr> -
-        // km sú bajty 1..3 (0-indexované) dát, hneď za úvodným stavovým
-        // bajtom. Posledný bajt (rolling counter) sa mení pri každom
-        // pollovaní a nie je súčasťou hodnoty - zámerne sa neparsuje.
-        parsed1 = parseUdsByteRange(responseBuf, 0x02BD, 1, 3);
-        if (parsed1 > 0) { odometerKm = (uint32_t)parsed1; src = "UDS02BD"; }
-      }
-
-      // --- Vrátiť späť predvolené (11-bit) adresovanie na motor, aby
-      // pokračovalo bežné čítanie Mode 1 PID-ov (RPM, rýchlosť, ...) v
-      // hlavnej tier-poll slučke bez zmeny.
-      obd.link->sendCommand("ATFCSM0\r", ignore, sizeof(ignore), 100); // späť na auto flow-control
-      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);   // zruš response filter
-      obd.link->sendCommand("ATSH7E0\r", ignore, sizeof(ignore), 100); // späť na motor
-      obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);   // späť na auto-detekciu protokolu
-    }
-
-    // 4. Skúsime štandardný 8-bitový OBD2 PID 0xA6 (ak ho auto podporuje)
-    if (odometerKm == 0 && obd.readPID(0xA6, odoVal) && odoVal > 0) {
-      odometerKm = (uint32_t)odoVal;
-      src = "PID_A6";
-    }
-
-    // 5. Ak OBD/UDS vyčítanie zlyhá (napr. Peugeot Traveller, alebo VAG s
-    // uzamknutým gateway), použije sa vzdialenosť napočítaná z GPS súradníc
-    // (pozri gpsOdometerKm() / processGPS). Ide o vzdialenosť najazdenú od
-    // posledného reštartu zariadenia, nie o skutočný stav tachometra vozidla.
-    if (odometerKm == 0) {
-      uint32_t gpsKm = gpsOdometerKm();
-      if (gpsKm > 0) { odometerKm = gpsKm; src = "GPS"; }
-    }
-
-    // Jeden konsolidovaný diagnostický riadok za cyklus (každých 5 s) -
-    // ide na Serial (živé sledovanie) aj do existujúceho SD/SPIFFS
-    // event logu (logger.logEvent), takže je čitateľný aj bez pripojenia
-    // k počítaču - stačí vytiahnuť SD kartu a pozrieť si log súbor.
-    // Formát: ODO FW=<firmware verzia> SRC=<zdroj> KM=<hodnota>
-    //         SESS=<ret 1003>:<odp. 1003> R1=<ret 0x02BD @710/77A> RAW1=<surová odp. 0x02BD @710/77A>
-    {
-      char diag[192];
-      snprintf(diag, sizeof(diag), "ODO FW=%s SRC=%s KM=%lu SESS=%d:%s R1=%d RAW1=%s",
-          FIRMWARE_VERSION, src, (unsigned long)odometerKm, sessRet1, sessResp1, ret1, rawBuf);
-      Serial.print("[ODO] "); Serial.println(diag);
-#if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) {
-        logger.logEvent(diag);
-      }
-#endif
-    }
-
-    // Send the same diagnosis as regular telemetry fields (see PID_ODO_DIAG
-    // comment above) so it's readable from the server even when this run
-    // happens on a real drive with no WiFi/USB nearby.
-    {
-      int32_t diagCode = !obd.link ? 0 : (ret1 <= 0 ? 1 : (parsed1 <= 0 ? 2 : 3));
-      int32_t diagRet = ret1;
-      int32_t diagLen = (int32_t)strlen(rawBuf);
-      buffer->add(PID_ODO_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
-      buffer->add(PID_ODO_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
-      buffer->add(PID_ODO_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
-
-      int sessNrc = 0;
-      int32_t sessCode = classifySessionResponse(sessRet1, sessResp1, &sessNrc);
-      int32_t sessNrc32 = sessNrc;
-      buffer->add(PID_ODO_SESS, ELEMENT_INT32, &sessCode, sizeof(sessCode));
-      buffer->add(PID_ODO_SESS_NRC, ELEMENT_INT32, &sessNrc32, sizeof(sessNrc32));
-    }
-
-    if (odometerKm > 0) {
-      buffer->add(PID_ODOMETER | 0x100, ELEMENT_INT32, &odometerKm, sizeof(odometerKm));
-    }
-  }
-  // =========================================================================
-
-  // =========================================================================
-  // FUEL LEVEL PROCESSING (Passat B8 UDS "Calculated volume", module 17)
-  // Same once-per-minute cadence as the odometer block above, for the same
-  // reason - several extra AT commands per read, value doesn't change fast
-  // enough to justify polling on the 5s tier cycle. Independent of the
-  // odometer block (different module/addressing: 0x714/0x77E here vs.
-  // 0x710/0x77A for odometer's Gateway).
-  // =========================================================================
-  static uint32_t lastFuelCheck = 0;
-  if (millis() - lastFuelCheck >= 60000) {
-    lastFuelCheck = millis();
-    long fuelParsed = -1;
-    int fuelDeciLiters = 0; // liters * 10, e.g. 475 = 47.5 l
-    char fuelRawBuf[24] = "-";
-    int fuelRet = 0;
-    char fuelSessResp[24] = "-"; // response to 1003 (extended session request)
-    int fuelSessRet = 0;
-
-    if (obd.link) {
-      // Confirmed 2026-09-12 via a HexSniff bench capture against a real
-      // VCDS session (module "17 - Instruments" -> "Advanced Measuring
-      // Values" -> "Calculated volume - Fuel level") - see
-      // vehicles/VAG/VW/PassatB8/decoded.md in the HexSniff repo for the
-      // raw capture. NOT the same DID as the standard Mode 1 fuel-level
-      // PID (see the note next to PID_FUEL_LEVEL above) - that one gets
-      // zero responses on this vehicle; this UDS DID is the one that
-      // actually works.
-      char ignore[32];
-      obd.link->sendCommand("ATSP6\r", ignore, sizeof(ignore), 200);     // štandardné CAN 11-bit/500k
-      // See the ODO block's comment above (same fix, same reason) - announce
-      // functional TesterPresence (0x700, 3E 80) before switching to a
-      // physical module address, matching what a real VCDS session does
-      // continuously throughout its session on this vehicle.
-      obd.link->sendCommand("ATSH700\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);
-      for (int i = 0; i < 5; i++) {
-        obd.link->sendCommand("3E80\r", ignore, sizeof(ignore), 100);
-      }
-      obd.link->sendCommand("ATSH714\r", ignore, sizeof(ignore), 100);   // hlavička požiadavky -> Prístroje (0x17)
-      obd.link->sendCommand("ATCRA77E\r", ignore, sizeof(ignore), 100);  // filtruj len jeho odpoveď
-      // See the ODO block's comment above (same fix, same reason) - flow
-      // control uses the tester's own request ID (0x714), not the module's
-      // response ID (0x77E). The 54-byte fuel response is 8 Consecutive
-      // Frames, far more likely to stall on a wrong auto-guessed FC ID than
-      // the odometer's single-CF response.
-      obd.link->sendCommand("ATFCSH714\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATFCSD300000\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATFCSM1\r", ignore, sizeof(ignore), 100);
-      fuelSessResp[0] = 0;
-      fuelSessRet = obd.link->sendCommand("1003\r", fuelSessResp, sizeof(fuelSessResp), 200);
-
-      char fuelResponseBuf[200]; // response is 56 bytes total, needs room for hex+spacing
-      fuelResponseBuf[0] = 0;
-      fuelRet = obd.link->sendCommand("2222B0\r", fuelResponseBuf, sizeof(fuelResponseBuf), 150);
-      strncpy(fuelRawBuf, fuelResponseBuf, sizeof(fuelRawBuf) - 1);
-      if (fuelRet > 0) {
-        // Data block is 54 bytes; "Calculated volume - Fuel level" is the
-        // big-endian 2-byte field at offset [33:35] - divide by 10 for
-        // liters. Rest of the block (other tank sensor readings) isn't
-        // decoded/needed here.
-        fuelParsed = parseUdsByteRange(fuelResponseBuf, 0x22B0, 33, 2);
-        if (fuelParsed >= 0) { fuelDeciLiters = (int)fuelParsed; }
-      }
-
-      // --- Vrátiť späť predvolené (11-bit) adresovanie na motor
-      obd.link->sendCommand("ATFCSM0\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATCRA\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATSH7E0\r", ignore, sizeof(ignore), 100);
-      obd.link->sendCommand("ATSP0\r", ignore, sizeof(ignore), 200);
-    }
-
-    // Formát: FUEL FW=<firmware verzia> DL=<decilitre, t.j. l*10>
-    //         SESS=<ret 1003>:<odp. 1003> R1=<ret> RAW1=<surová odpoveď 0x22B0 @714/77E>
-    {
-      char diag[192];
-      snprintf(diag, sizeof(diag), "FUEL FW=%s DL=%d SESS=%d:%s R1=%d RAW1=%s",
-          FIRMWARE_VERSION, fuelDeciLiters, fuelSessRet, fuelSessResp, fuelRet, fuelRawBuf);
-      Serial.print("[FUEL] "); Serial.println(diag);
-#if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) {
-        logger.logEvent(diag);
-      }
-#endif
-    }
-
-    // See PID_ODO_DIAG comment above - same idea, fuel block.
-    {
-      int32_t diagCode = !obd.link ? 0 : (fuelRet <= 0 ? 1 : (fuelParsed < 0 ? 2 : 3));
-      int32_t diagRet = fuelRet;
-      int32_t diagLen = (int32_t)strlen(fuelRawBuf);
-      buffer->add(PID_FUEL_DIAG, ELEMENT_INT32, &diagCode, sizeof(diagCode));
-      buffer->add(PID_FUEL_RET, ELEMENT_INT32, &diagRet, sizeof(diagRet));
-      buffer->add(PID_FUEL_LEN, ELEMENT_INT32, &diagLen, sizeof(diagLen));
-
-      int fuelSessNrc = 0;
-      int32_t fuelSessCode = classifySessionResponse(fuelSessRet, fuelSessResp, &fuelSessNrc);
-      int32_t fuelSessNrc32 = fuelSessNrc;
-      buffer->add(PID_FUEL_SESS, ELEMENT_INT32, &fuelSessCode, sizeof(fuelSessCode));
-      buffer->add(PID_FUEL_SESS_NRC, ELEMENT_INT32, &fuelSessNrc32, sizeof(fuelSessNrc32));
-    }
-
-    if (fuelDeciLiters > 0) {
-      buffer->add(PID_FUEL_LEVEL | 0x100, ELEMENT_INT32, &fuelDeciLiters, sizeof(fuelDeciLiters));
-    }
-  }
-  // =========================================================================
+#if ENABLE_VAG_ODO_FUEL
+  processVagOdoFuel(buffer);
+#endif // ENABLE_VAG_ODO_FUEL
+#if ENABLE_PSA_ODO_FUEL
+  processPsaOdoFuel(buffer);
+#endif // ENABLE_PSA_ODO_FUEL
 
   int kph = obdData[0].value;
   if (kph >= 2) lastMotionTime = millis();
@@ -997,7 +963,7 @@ void processOBD(CBuffer* buffer)
 // Parses a UDS ReadDataByIdentifier positive response (SID 0x62) for the
 // given DID. The response text coming back from obd.link->sendCommand() is
 // an ASCII-hex string such as "62 05 05 00 01 86 A0\r>" or "620505000186A0"
-// (formatting/spacing/prompt characters vary by adapter) — NOT a decimal
+// (formatting/spacing/prompt characters vary by adapter) Ã¢â‚¬â€ NOT a decimal
 // number, so atoi() on it silently returns garbage (it stops at the first
 // non-digit character, e.g. "62" -> 62). This strips everything that isn't
 // a hex digit, verifies the response is a positive match for the requested
@@ -1024,46 +990,6 @@ static long parseUdsHexValue(const char* resp, uint16_t did)
   return strtol(hex + 6, nullptr, 16);
 }
 
-// Like parseUdsHexValue(), but for DIDs whose value isn't the *entire*
-// trailing data block - e.g. the Passat B8 Gateway (0x19) DID 0x02BD
-// returns 10 data bytes packed together (status byte, the odometer value,
-// then more unidentified bytes ending in a rolling/alive counter that
-// changes on every poll - see vehicles/VAG/VW/PassatB8/decoded.md in the
-// HexSniff repo for the full byte-by-byte breakdown). This extracts
-// `byteLen` bytes starting at `byteOffset` within the data (0 = the first
-// data byte right after the DID) as a single big-endian unsigned value,
-// ignoring everything before/after that slice. Same validation and
-// negative-response handling as parseUdsHexValue().
-static long parseUdsByteRange(const char* resp, uint16_t did, int byteOffset, int byteLen)
-{
-  if (!resp) return -1;
-  // 128 hex chars = up to a 64-byte UDS response (SID+DID+62 data bytes) -
-  // comfortably covers the largest response seen so far (the Passat B8
-  // "Calculated volume" DID 0x22B0, 56 bytes total, needing offsets up to
-  // ~35 = hex index ~76). Bump this if a vehicle ever needs a bigger DID.
-  char hex[128];
-  int n = 0;
-  for (const char* p = resp; *p && n < (int)sizeof(hex) - 1; p++) {
-    if (isxdigit((unsigned char)*p)) hex[n++] = *p;
-  }
-  hex[n] = 0;
-  if (n < 6) return -1;
-
-  char sidStr[3] = { hex[0], hex[1], 0 };
-  if (strtoul(sidStr, nullptr, 16) != 0x62) return -1;
-
-  char didStr[5] = { hex[2], hex[3], hex[4], hex[5], 0 };
-  if (strtoul(didStr, nullptr, 16) != did) return -1;
-
-  int start = 6 + byteOffset * 2;
-  int end = start + byteLen * 2;
-  if (end > n) return -1; // response too short for the requested byte range
-
-  char slice[16];
-  memcpy(slice, hex + start, byteLen * 2);
-  slice[byteLen * 2] = 0;
-  return strtol(slice, nullptr, 16);
-}
 
 bool initGPS()
 {
@@ -1081,7 +1007,7 @@ bool initGPS()
 
 // Distance driven since boot, accumulated from consecutive valid GPS fixes
 // (haversine great-circle distance between fixes). This is NOT the vehicle's
-// true lifetime odometer — it resets to 0 on every reboot/deep-sleep wake —
+// true lifetime odometer Ã¢â‚¬â€ it resets to 0 on every reboot/deep-sleep wake Ã¢â‚¬â€
 // but it's a usable fallback for vehicles/situations where the OBD/UDS
 // odometer read fails, so Traccar still receives an increasing distance
 // value instead of nothing at all.
@@ -1139,7 +1065,7 @@ bool processGPS(CBuffer* buffer)
     *(p + 1) = 0;
   }
   if (gd->lng == 0 && gd->lat == 0) {
-    // No position fix yet – still log satellite count and HDOP so that
+    // No position fix yet Ã¢â‚¬â€œ still log satellite count and HDOP so that
     // sensor.gps_satellites / sensor.gps_hdop in HA show the GPS is actively
     // searching even before the first valid position is obtained.
     if (buffer) {
@@ -1327,7 +1253,7 @@ void initialize()
   // first buffer of the new telemetry session.  initialize() is called at the
   // start of every logging session (boot and after each network disconnection),
   // so resetting here ensures the device always reports its live LED/beep state
-  // and active transport type to HA after a reconnect — preventing a permanent
+  // and active transport type to HA after a reconnect Ã¢â‚¬â€ preventing a permanent
   // "Unbekannt" IST-Status when HA is reloaded while the device was connected
   // (HA loses diag state, device never resends unchanged values unless the
   // sentinels are reset).
@@ -1362,7 +1288,7 @@ void initialize()
     // Pre-wake: send OBD2 diagnostic requests BEFORE obd.init() so the vehicle ECU
     // is active when init() tries to communicate.  Many vehicles (especially VAG:
     // VW/Skoda/Audi/Seat, but also BMW and Mercedes) keep the diagnostic CAN bus
-    // silent until they receive an initial request — obd.init() alone may time out
+    // silent until they receive an initial request Ã¢â‚¬â€ obd.init() alone may time out
     // because it expects the ECU to already be responsive.
     // Sequence: minimal ELM327 reset + two PID requests (RPM=0x0C, coolant=0x05).
     // The ECU may not reply yet (still waking up), which is fine; the intent is to
@@ -1373,8 +1299,8 @@ void initialize()
       obd.link->sendCommand("ATZ\r",  wbuf, sizeof(wbuf), 1000); // reset ELM327
       obd.link->sendCommand("ATE0\r", wbuf, sizeof(wbuf),  500); // disable echo
       obd.link->sendCommand("ATH0\r", wbuf, sizeof(wbuf),  500); // disable headers
-      obd.link->sendCommand("010C\r", wbuf, sizeof(wbuf),  500); // RPM – wake req 1
-      obd.link->sendCommand("0105\r", wbuf, sizeof(wbuf),  500); // coolant – wake req 2
+      obd.link->sendCommand("010C\r", wbuf, sizeof(wbuf),  500); // RPM Ã¢â‚¬â€œ wake req 1
+      obd.link->sendCommand("0105\r", wbuf, sizeof(wbuf),  500); // coolant Ã¢â‚¬â€œ wake req 2
       Serial.println("OBD:pre-wake sent");
       delay(100); // give ECU time to start its diagnostic task
     }
@@ -1391,7 +1317,7 @@ void initialize()
     }
   }
   // CAN bus sniffing: enable/disable only on transitions to minimise AT commands.
-  // sniff(true) sends ATM1 to the ELM327 – puts it in "monitor all" mode so every
+  // sniff(true) sends ATM1 to the ELM327 Ã¢â‚¬â€œ puts it in "monitor all" mode so every
   // CAN frame on the bus is captured and readable via receiveData().
   // Works independently of STATE_OBD_READY; useful even when OBD-II init fails.
   if (enableCan != s_canSniffActive) {
@@ -1447,6 +1373,13 @@ void initialize()
       snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s BUILD=%s", FIRMWARE_VERSION, devid,
           BUILD_CAN_SNIFF ? "CAN_SNIFF" : "ODO_READ");
       logger.logEvent(diag);
+      // See PID_RESET_REASON comment above - answers "why did it reboot"
+      // definitively, on SD (readable even with no network at all) and as
+      // telemetry (see resetReasonPending, consumed in process()).
+      resetReasonCode = (int32_t)esp_reset_reason();
+      resetReasonPending = true;
+      snprintf(diag, sizeof(diag), "RESET_REASON=%ld", (long)resetReasonCode);
+      logger.logEvent(diag);
       snprintf(diag, sizeof(diag), "STATE OBD=%c GPS=%c MEMS=%c",
           state.check(STATE_OBD_READY)  ? '1' : '0',
           state.check(STATE_GPS_READY)  ? '1' : '0',
@@ -1466,7 +1399,7 @@ void initialize()
   // Startup check: detect a firmware staged by a previous session.
   // against the actual /ota_fw.bin file size.  A match means the download
   // completed successfully; set s_ota_pending so the flash happens at the
-  // next standby transition.  Any mismatch means a partial download —
+  // next standby transition.  Any mismatch means a partial download Ã¢â‚¬â€
   // clean up both files to avoid a corrupt flash attempt.
   if (state.check(STATE_STORAGE_READY)) {
     if (SD.exists(OTA_META_PATH)) {
@@ -1488,14 +1421,14 @@ void initialize()
         stagingValid = (actual == expectedSize);
       }
       if (stagingValid) {
-        Serial.println("[OTA-PULL] Staged firmware found on SD — flashing at boot");
+        Serial.println("[OTA-PULL] Staged firmware found on SD Ã¢â‚¬â€ flashing at boot");
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL BOOT_FLASH");
         // Flash immediately at boot: the telemetry task has not started yet so
         // there is no need for s_ota_active synchronisation.  Flashing at boot
         // also ensures the update is applied even on devices that never reach
         // standby naturally (e.g. no OBD / no MEMS stationary timeout).
         if (performPullOtaFlash()) {
-          // Flash succeeded; reboot timer is running — block here until it fires.
+          // Flash succeeded; reboot timer is running Ã¢â‚¬â€ block here until it fires.
           while (true) delay(1000);
         }
         // Flash failed (corrupt image etc.): staging files already cleaned up
@@ -1508,7 +1441,7 @@ void initialize()
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL STALE_REMOVED");
       }
     } else if (SD.exists(OTA_PENDING_PATH)) {
-      // Firmware file without companion meta — can't verify, remove it.
+      // Firmware file without companion meta Ã¢â‚¬â€ can't verify, remove it.
       SD.remove(OTA_PENDING_PATH);
       SD.remove(OTA_NVS_PATH);
     } else {
@@ -1661,9 +1594,9 @@ void process()
       }
     }
   } else {
-    // STATE_OBD_READY not set – attempt reconnection.
+    // STATE_OBD_READY not set Ã¢â‚¬â€œ attempt reconnection.
     // Limit to one attempt every 30 s: obd.init() sends ATZ which hard-resets
-    // the ELM327.  Calling it every process() cycle (every 1–5 s) resets the
+    // the ELM327.  Calling it every process() cycle (every 1Ã¢â‚¬â€œ5 s) resets the
     // adapter before it can finish its auto-protocol detection, creating a
     // permanent reconnect loop where OBD-II never connects.
     // Use full init (quick=false): tries readPID twice instead of once, which
@@ -1682,28 +1615,24 @@ void process()
   }
 #endif
 
-#if ENABLE_OBD
+#if ENABLE_OBD && BUILD_CAN_SNIFF
   // CAN bus frame capture (when enableCan=true via NVS key CAN_EN).
-  // Drains all frames currently buffered by the ELM327 ATM1 monitor-all mode.
-  // Each receiveData() call reads one frame's payload bytes.  Frames are
-  // hex-encoded and stored in s_canFrameList (ring buffer, newest last).
-  // The HA integration reads this via /api/control?cmd=CAN_DATA, clears it.
+  // BUILD_CAN_SNIFF=1 builds only. Drains all frames currently buffered by
+  // the ELM327 ATM1 monitor-all mode and logs each one (hex-encoded) to SD,
+  // for bench-testing alongside VCDS.
   if (enableCan) {
     byte rxbuf[32];  // one CAN frame payload: up to 8 data bytes from receiveData
     int rxbytes;
     while ((rxbytes = obd.receiveData(rxbuf, sizeof(rxbuf))) > 0) {
-      // Hex-encode the received payload bytes into a local string.
-      char hexEntry[sizeof(rxbuf) * 2 + 1];
-      int hexLen = 0;
-      for (int i = 0; i < rxbytes && hexLen < (int)sizeof(hexEntry) - 2; i++) {
-        hexLen += snprintf(hexEntry + hexLen, sizeof(hexEntry) - hexLen, "%02X", rxbuf[i]);
-      }
-      hexEntry[hexLen] = 0;
 #if STORAGE == STORAGE_SD
-      // Full capture to SD - not subject to the RAM ring buffer's small
-      // capacity, so a busy bus can't push VCDS's request/response out
-      // before we get a chance to read it back.
       if (s_canSniffLogFile) {
+        // Hex-encode the received payload bytes into a local string.
+        char hexEntry[sizeof(rxbuf) * 2 + 1];
+        int hexLen = 0;
+        for (int i = 0; i < rxbytes && hexLen < (int)sizeof(hexEntry) - 2; i++) {
+          hexLen += snprintf(hexEntry + hexLen, sizeof(hexEntry) - hexLen, "%02X", rxbuf[i]);
+        }
+        hexEntry[hexLen] = 0;
         s_canSniffLogFile.print(millis());
         s_canSniffLogFile.print(',');
         s_canSniffLogFile.println(hexEntry);
@@ -1713,21 +1642,6 @@ void process()
         }
       }
 #endif
-      portENTER_CRITICAL(&s_canBufMux);
-      if (s_canFrameCount < CAN_DATA_LIST_MAX) {
-        // Append entry to the list.
-        strncpy(s_canFrameList[s_canFrameCount], hexEntry, sizeof(s_canFrameList[0]) - 1);
-        s_canFrameList[s_canFrameCount][sizeof(s_canFrameList[0]) - 1] = 0;
-        s_canFrameCount++;
-      } else {
-        // Ring buffer full – drop oldest entry and shift.
-        memmove(s_canFrameList[0], s_canFrameList[1],
-                (CAN_DATA_LIST_MAX - 1) * sizeof(s_canFrameList[0]));
-        strncpy(s_canFrameList[CAN_DATA_LIST_MAX - 1], hexEntry, sizeof(s_canFrameList[0]) - 1);
-        s_canFrameList[CAN_DATA_LIST_MAX - 1][sizeof(s_canFrameList[0]) - 1] = 0;
-      }
-      s_canFrameTotal++;
-      portEXIT_CRITICAL(&s_canBufMux);
     }
   }
 #endif
@@ -1735,6 +1649,22 @@ void process()
     int val = (rssiLast = rssi);
     buffer->add(PID_CSQ, ELEMENT_INT32, &val, sizeof(val));
   }
+  if (resetReasonPending) {
+    resetReasonPending = false;
+    buffer->add(PID_RESET_REASON, ELEMENT_INT32, &resetReasonCode, sizeof(resetReasonCode));
+  }
+#if ENABLE_WIFI
+  if (wifiDisconnectPending) {
+    wifiDisconnectPending = false;
+    buffer->add(PID_WIFI_DISCONNECT_REASON, ELEMENT_INT32, &wifiDisconnectReason, sizeof(wifiDisconnectReason));
+    buffer->add(PID_WIFI_DISCONNECT_COUNT, ELEMENT_INT32, &wifiDisconnectCount, sizeof(wifiDisconnectCount));
+  }
+  if (wifiScanPending) {
+    wifiScanPending = false;
+    buffer->add(PID_WIFI_SCAN_COUNT, ELEMENT_INT32, &wifiScanCount, sizeof(wifiScanCount));
+    buffer->add(PID_WIFI_TARGET_RSSI, ELEMENT_INT32, &wifiScanTargetRssi, sizeof(wifiScanTargetRssi));
+  }
+#endif
 #if ENABLE_OBD
   if (sys.devType > 12) {
     batteryVoltage = (float)(analogRead(A0) * 45) / 4095;
@@ -1798,7 +1728,7 @@ void process()
 
   // Report active transport type (WiFi vs Cellular) via PID_CONN_TYPE (0x88).
   // Only added when a network connection is active (STATE_NET_READY) so the
-  // value is always meaningful — the device is either on WiFi or cellular,
+  // value is always meaningful Ã¢â‚¬â€ the device is either on WiFi or cellular,
   // never in AP-only mode when this PID reaches HA.  The sentinel is reset on
   // every new connection, so the first packet of each session always includes
   // this PID, enabling HA to correctly update "WiFi letzte Verbindung" /
@@ -1941,7 +1871,15 @@ void process()
   for (byte i = 0; i < stationaryCount; i++) {
     stationaryTime[i] = stationaryTimeDefaults[i];
   }
-  if (nvsStandbyTimeS >= 5) {
+  if (nvsStandbyTimeS == 0xFFFF) {
+    // Sentinel: disable standby entirely (e.g. for extended bench/parked
+    // testing where the vehicle deliberately never moves - normal standby
+    // would otherwise suspend WiFi/OBD polling and cut off exactly the
+    // telemetry being watched). 0 in the stationaryTime table means "never
+    // reaches this tier" per the loop below (motionless < 0 is never true
+    // via the || stationaryTime[i] == 0 check).
+    stationaryTime[stationaryCount - 1] = 0;
+  } else if (nvsStandbyTimeS >= 5) {
     stationaryTime[stationaryCount - 1] = nvsStandbyTimeS;
   }
   unsigned int motionless = (millis() - lastMotionTime) / 1000;
@@ -1966,11 +1904,11 @@ void process()
     static bool s_obdAliveChecked = false; // reset each time motion resumes
     const bool inStationaryPhase = (motionless >= stationaryTime[0]);
     if (!inStationaryPhase) {
-      // Vehicle is moving – clear the flag so we probe again next time it stops.
+      // Vehicle is moving Ã¢â‚¬â€œ clear the flag so we probe again next time it stops.
       s_obdAliveChecked = false;
     } else if (enableObd && state.check(STATE_OBD_READY) && !s_obdAliveChecked) {
       s_obdAliveChecked = true;
-      // Probe with "01 00" (Mode 1 PID 0 – supported PIDs [01-20]).  This is a
+      // Probe with "01 00" (Mode 1 PID 0 Ã¢â‚¬â€œ supported PIDs [01-20]).  This is a
       // read-only request with no side effects; 1 s timeout keeps the check
       // non-blocking.  The ELM327 link is accessed directly to control the
       // timeout, bypassing obd.readPID() which uses OBD_TIMEOUT_LONG (10 s).
@@ -2326,26 +2264,28 @@ void telemetry(void* inst)
           state.check(STATE_WIFI_CONNECTED)) {
         static uint32_t lastOtaCheckMs = 0;
         uint32_t nowMs = millis();
-        if (lastOtaCheckMs == 0 || nowMs - lastOtaCheckMs >= (uint32_t)otaCheckIntervalS * 1000UL) {
+        bool checkNow = s_ota_check_now;
+        if (checkNow || lastOtaCheckMs == 0 || nowMs - lastOtaCheckMs >= (uint32_t)otaCheckIntervalS * 1000UL) {
+          s_ota_check_now = false;
           lastOtaCheckMs = nowMs;
-          Serial.println("[OTA-PULL] Checking for firmware update...");
+          Serial.println(checkNow ? "[OTA-PULL] Checking for firmware update (triggered)..." : "[OTA-PULL] Checking for firmware update...");
           // Do NOT close the telemetry TLS session here.  In virtually all
           // deployments (Nabu Casa / hooks.nabu.casa) the OTA host and the
           // telemetry webhook host are the same *.ui.nabu.casa or
           // hooks.nabu.casa domain.  Calling wifi.close() before the OTA
           // check would tear down the active TLS session and force a new
-          // TLS handshake, creating an alloc→free→alloc cycle that fragments
+          // TLS handshake, creating an allocÃ¢â€ â€™freeÃ¢â€ â€™alloc cycle that fragments
           // the mbedTLS heap over time (each cycle leaves behind tiny holes
           // that reduce the maximum contiguous block).  Over ~30 telemetry
-          // packets the max block shrinks from ~40 KB to ~20 KB — well below
-          // the 38 KB TLS_MIN_FREE_HEAP threshold — causing Guard 2 in
-          // WifiHTTP::open() to fire ("Low heap … after cleanup, skipping TLS
+          // packets the max block shrinks from ~40 KB to ~20 KB Ã¢â‚¬â€ well below
+          // the 38 KB TLS_MIN_FREE_HEAP threshold Ã¢â‚¬â€ causing Guard 2 in
+          // WifiHTTP::open() to fire ("Low heap Ã¢â‚¬Â¦ after cleanup, skipping TLS
           // connect") on every subsequent OTA check, rendering OTA unusable.
           //
           // WifiHTTP::open() already handles both cases correctly:
-          //   • Same host: reuse the existing TLS session (zero TLS cycles).
-          //   • Different host, heap OK: stop() + connect() atomically.
-          //   • Different host, heap low: Guard 1 returns false; the post-OTA
+          //   Ã¢â‚¬Â¢ Same host: reuse the existing TLS session (zero TLS cycles).
+          //   Ã¢â‚¬Â¢ Different host, heap OK: stop() + connect() atomically.
+          //   Ã¢â‚¬Â¢ Different host, heap low: Guard 1 returns false; the post-OTA
           //     check below restarts WiFi to coalesce the heap.
           if (performPullOtaCheck()) {
             // Direct-flash path: firmware flash started; device will reboot
@@ -2361,7 +2301,7 @@ void telemetry(void* inst)
           // enters its delay(1000)/continue idle path.
           // performPullOtaCheck() called wifi.close() internally which reset
           // m_state to HTTP_DISCONNECTED, so the HTTP_ERROR-based guard below
-          // would never fire after a successful SD download — break explicitly.
+          // would never fire after a successful SD download Ã¢â‚¬â€ break explicitly.
           if (s_ota_pending) {
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
@@ -2404,11 +2344,11 @@ void telemetry(void* inst)
       //
       // Without this injection, there is a race between process() and the
       // telemetry loop that reliably loses these PIDs on cellular connections:
-      //   1. Sentinel reset → process() adds PIDs to Buffer A, updates sentinel.
+      //   1. Sentinel reset Ã¢â€ â€™ process() adds PIDs to Buffer A, updates sentinel.
       //   2. OTA meta-check over cellular takes several seconds while process()
-      //      fills Buffers B, C, D … (sentinel already matches, no PIDs).
+      //      fills Buffers B, C, D Ã¢â‚¬Â¦ (sentinel already matches, no PIDs).
       //   3. getNewest() returns Buffer D (newest), Buffer A is overwritten.
-      //   4. Result: HA never receives LED/beep/SD → "Unbekannt" forever.
+      //   4. Result: HA never receives LED/beep/SD Ã¢â€ â€™ "Unbekannt" forever.
       // WiFi is not immune but the OTA check is much faster there, so the race
       // is rarely observed.  With this injection both transports are reliable.
       if (s_send_state_pids) {
@@ -2486,7 +2426,7 @@ void telemetry(void* inst)
             // cannot allocate its internal buffers) rather than a transient
             // server-side error.  ESP.getMaxAllocHeap() returns the largest
             // contiguous free DRAM block; values below TLS_MIN_FREE_HEAP
-            // indicate that mbedtls_ssl_setup()'s 2×17 KB record buffers
+            // indicate that mbedtls_ssl_setup()'s 2Ãƒâ€”17 KB record buffers
             // cannot be satisfied even if total free memory is nominally OK.
             // In that case waiting for MAX_CONN_ERRORS_RECONNECT attempts
             // wastes ~40 s in an unrecoverable state.  Disconnect WiFi now to
@@ -2566,12 +2506,12 @@ void standby()
   // Safety net: if s_ota_pending is set (e.g. esp_restart() failed in
   // performPullOtaCheck), apply the staged firmware now before shutting down.
   // Normally the device restarts immediately after staging and the boot-time
-  // flash path handles this — this block should rarely execute.
+  // flash path handles this Ã¢â‚¬â€ this block should rarely execute.
   if (s_ota_pending && state.check(STATE_STORAGE_READY)) {
     s_ota_active = true;
     delay(OTA_TELEMETRY_YIELD_DELAY_MS); // give the telemetry task one scheduling cycle to yield
     if (performPullOtaFlash()) {
-      // Flash succeeded; reboot timer is running — block here until it fires.
+      // Flash succeeded; reboot timer is running Ã¢â‚¬â€ block here until it fires.
       while (true) delay(1000);
     }
     // Flash failed: clear flags and fall through to normal standby.
@@ -2831,9 +2771,9 @@ void loadConfig()
   // All default to 1 (enabled) when the NVS key is absent so un-provisioned
   // devices keep the original out-of-box behaviour.
   //
-  // LED_RED_EN  – red/power LED (standby / power-on indicator)
-  // LED_WHITE_EN – white/network LED (data-transmission indicator)
-  // BEEP_EN     – short buzzer beep on each WiFi/cellular connect event
+  // LED_RED_EN  Ã¢â‚¬â€œ red/power LED (standby / power-on indicator)
+  // LED_WHITE_EN Ã¢â‚¬â€œ white/network LED (data-transmission indicator)
+  // BEEP_EN     Ã¢â‚¬â€œ short buzzer beep on each WiFi/cellular connect event
   uint8_t nvsLedRedEn = 1;
   if (nvs_get_u8(nvs, "LED_RED_EN", &nvsLedRedEn) == ESP_OK) {
     enableLedRed = nvsLedRedEn != 0;
@@ -2933,7 +2873,7 @@ void loadConfig()
   nvs_get_str(nvs, "NVS_VER", nvsVersion, &len);
 
   // Vehicle identification (NVS keys VEHICLE_MAKE, VEHICLE_MODEL, VEHICLE_YEAR).
-  // Optional – absent on devices not provisioned with vehicle info.
+  // Optional Ã¢â‚¬â€œ absent on devices not provisioned with vehicle info.
   size_t vlen = sizeof(vehicleMake);
   nvs_get_str(nvs, "VEHICLE_MAKE", vehicleMake, &vlen);
   vlen = sizeof(vehicleModel);
@@ -2955,7 +2895,7 @@ void loadConfig()
     char *tok = strtok(tmp, ",");
     while (tok && vehicleObdDataCount < MAX_VEHICLE_PIDS) {
       byte pid = (byte)strtol(tok, nullptr, 16);
-      // Skip PID 0x00 (the "PIDs supported [01-20]" support bitmap) – it is
+      // Skip PID 0x00 (the "PIDs supported [01-20]" support bitmap) Ã¢â‚¬â€œ it is
       // handled internally by isValidPID() and not a pollable value PID.
       if (pid > 0) {
         vehicleObdData[vehicleObdDataCount].pid   = pid;
@@ -3031,7 +2971,7 @@ static bool _applyNvsFromSD()
   // partition size (20 KB).  Anything outside that range is corrupt.
   if (nvsSize < 4096 || nvsSize > 0x5000) {
     nvsFile.close();
-    Serial.printf("[OTA-PULL] NVS staging file has invalid size: %u — skipping\n",
+    Serial.printf("[OTA-PULL] NVS staging file has invalid size: %u Ã¢â‚¬â€ skipping\n",
                   (unsigned)nvsSize);
     SD.remove(OTA_NVS_PATH);
     return false;
@@ -3040,7 +2980,7 @@ static bool _applyNvsFromSD()
   // Read the entire NVS image into a heap buffer BEFORE touching the NVS flash
   // partition.  This is critical: if we erased the partition first and then
   // encountered an SD read error mid-write, the device would reboot with a
-  // blank NVS — losing WiFi credentials, OTA_TOKEN, and all other settings.
+  // blank NVS Ã¢â‚¬â€ losing WiFi credentials, OTA_TOKEN, and all other settings.
   // By buffering the full image first we guarantee that either (a) the SD read
   // succeeds and we can safely erase + write, or (b) we leave the existing NVS
   // intact and return false so the caller logs "rebooting with old NVS".
@@ -3052,7 +2992,7 @@ static bool _applyNvsFromSD()
   uint8_t* nvsBuf = (uint8_t*)malloc(nvsBufSize);
   if (!nvsBuf) {
     nvsFile.close();
-    Serial.println("[OTA-PULL] NVS: not enough RAM to buffer image — skipping NVS update");
+    Serial.println("[OTA-PULL] NVS: not enough RAM to buffer image Ã¢â‚¬â€ skipping NVS update");
     SD.remove(OTA_NVS_PATH);
     return false;
   }
@@ -3079,7 +3019,7 @@ static bool _applyNvsFromSD()
 
   if (!readOk || readTotal != nvsSize) {
     free(nvsBuf);
-    Serial.println("[OTA-PULL] NVS staging file read incomplete — NVS unchanged");
+    Serial.println("[OTA-PULL] NVS staging file read incomplete Ã¢â‚¬â€ NVS unchanged");
     return false;
   }
 
@@ -3105,7 +3045,7 @@ static bool _applyNvsFromSD()
   // Write the buffered NVS image to the flash partition in PULL_OTA_CHUNK_SIZE
   // (4 KB) chunks.  The SD file has already been read and removed above.
   // The tail of nvsBuf was pre-filled with 0xFF so alignment padding for the
-  // last chunk is already in place — no per-chunk memset is needed.
+  // last chunk is already in place Ã¢â‚¬â€ no per-chunk memset is needed.
   size_t written = 0;
   bool writeOk = true;
   while (written < nvsSize) {
@@ -3140,13 +3080,13 @@ static bool _applyNvsFromSD()
 //
 // Reads the firmware binary staged on the SD card (/ota_fw.bin) and writes
 // it to the OTA flash partition using the Arduino Update library.  Called by
-// standby() at the next power-down / sleep transition — NEVER during active
-// telemetry — so no live data is lost.
+// standby() at the next power-down / sleep transition Ã¢â‚¬â€ NEVER during active
+// telemetry Ã¢â‚¬â€ so no live data is lost.
 //
 // Pre-conditions (checked here):
-//   • s_ota_pending == true  (set by performPullOtaCheck() after download)
-//   • OTA_META_PATH exists on SD and contains the expected byte count
-//   • OTA_PENDING_PATH exists on SD and its size matches OTA_META_PATH
+//   Ã¢â‚¬Â¢ s_ota_pending == true  (set by performPullOtaCheck() after download)
+//   Ã¢â‚¬Â¢ OTA_META_PATH exists on SD and contains the expected byte count
+//   Ã¢â‚¬Â¢ OTA_PENDING_PATH exists on SD and its size matches OTA_META_PATH
 //
 // Returns true if the flash succeeded and the reboot timer is running.
 // On any error, staging files are cleaned up and false is returned so that
@@ -3180,7 +3120,7 @@ static bool performPullOtaFlash()
     unsigned long actual = ff ? (unsigned long)ff.size() : 0UL;
     if (ff) ff.close();
     if (expectedSize < PULL_OTA_MIN_FW_SIZE || actual != expectedSize) {
-      Serial.printf("[OTA-PULL] SD staging size mismatch: file=%lu expected=%lu — removing\n",
+      Serial.printf("[OTA-PULL] SD staging size mismatch: file=%lu expected=%lu Ã¢â‚¬â€ removing\n",
                     actual, expectedSize);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SD_SIZE");
@@ -3287,10 +3227,10 @@ static bool performPullOtaFlash()
       if (_nvsStaged) {
         Serial.println("[OTA-PULL] Settings (NVS) updated successfully");
       } else {
-        Serial.println("[OTA-PULL] No NVS settings staged — rebooting with firmware only");
+        Serial.println("[OTA-PULL] No NVS settings staged Ã¢â‚¬â€ rebooting with firmware only");
       }
     } else {
-      Serial.println("[OTA-PULL] Settings (NVS) update failed — rebooting with old NVS");
+      Serial.println("[OTA-PULL] Settings (NVS) update failed Ã¢â‚¬â€ rebooting with old NVS");
     }
   }
 
@@ -3361,12 +3301,21 @@ static String _maskOtaHost(const char* host) {
 // Returns false in all other cases, including the SD-staging success case
 // (caller must NOT block waiting for a reboot when false is returned).
 // ---------------------------------------------------------------------------
-// Pull-OTA needs an HTTP(S)-capable teleClient.wifi (WifiHTTP: .open/.send/
-// .receiveHeaders/.rawClient/.code). With SERVER_PROTOCOL=PROTOCOL_UDP,
-// teleClient.wifi is WifiUDP instead, which has none of those methods, so the
-// real implementation below is only compiled for HTTP-capable protocols; the
-// UDP build gets a no-op stub instead.
-#if SERVER_PROTOCOL != PROTOCOL_UDP
+// 2026-09-14: this used to depend on teleClient.wifi being HTTP-capable
+// (WifiHTTP: .open/.send/.receiveHeaders/.rawClient/.code), which only holds
+// for HTTP-capable SERVER_PROTOCOL builds - with SERVER_PROTOCOL=PROTOCOL_UDP
+// (this device's actual build), teleClient.wifi is WifiUDP instead, which has
+// none of those methods, so the real implementation below never got compiled
+// at all for this build - performPullOtaCheck() silently resolved to the
+// no-op stub further down, and pull-OTA never worked, no matter how long
+// WiFi stayed connected. Root-caused 2026-09-14 by reading the actual
+// #if/#else split, not by guessing at network/timing causes (which is what
+// consumed most of a day's debugging before this was found).
+// Fix: a dedicated otaWifiClient (WifiHTTP, declared where teleClient is)
+// used ONLY by pull-OTA, completely independent of SERVER_PROTOCOL/
+// teleClient.wifi's type - so this now compiles and runs on every
+// ENABLE_WIFI build regardless of the main telemetry transport.
+#if ENABLE_WIFI
 bool performPullOtaCheck()
 {
   if (!otaToken[0] || !otaHost[0]) return false;
@@ -3377,7 +3326,7 @@ bool performPullOtaCheck()
 #if ENABLE_WIFI
   if (!WiFi.isConnected()) return false;
 #else
-  return false;  // No WiFi compiled in — OTA unavailable
+  return false;  // No WiFi compiled in Ã¢â‚¬â€ OTA unavailable
 #endif
 
 #if STORAGE == STORAGE_SD
@@ -3393,9 +3342,27 @@ bool performPullOtaCheck()
 
   // ---- Step 1: Fetch metadata JSON ----------------------------------------
   // Build the metadata path: /api/freematics/ota_pull/{token}/meta.json
-  char metaPath[384];
-  snprintf(metaPath, sizeof(metaPath),
-           "/api/freematics/ota_pull/%s/meta.json", otaToken);
+  // Query string reports the currently-running build (__DATE__ __TIME__,
+  // e.g. "Sep 14 2026 12:04:32") so the server can tell whether the
+  // firmware it would offer is already installed, instead of blindly
+  // offering "available:true" forever and re-flashing the same build every
+  // OTA_INTERVAL cycle. Spaces are the only character in that string not
+  // safe raw in a query value - percent-encoded here.
+  char metaPath[448];
+  {
+    char buildEnc[48];
+    int bi = 0;
+    for (const char* p = __DATE__ " " __TIME__; *p && bi < (int)sizeof(buildEnc) - 4; p++) {
+      if (*p == ' ') {
+        buildEnc[bi++] = '%'; buildEnc[bi++] = '2'; buildEnc[bi++] = '0';
+      } else {
+        buildEnc[bi++] = *p;
+      }
+    }
+    buildEnc[bi] = 0;
+    snprintf(metaPath, sizeof(metaPath),
+             "/api/freematics/ota_pull/%s/meta.json?build=%s", otaToken, buildEnc);
+  }
 
   Serial.printf("[OTA-PULL] URL: https://%s:%u/api/freematics/ota_pull/%.8s.../meta.json\n",
                 _maskOtaHost(otaHost).c_str(), (unsigned)otaPort, otaToken);
@@ -3406,10 +3373,10 @@ bool performPullOtaCheck()
 
 #if ENABLE_WIFI
   // WifiHTTP::open() handles all session-reuse and heap-guard logic:
-  //   • Same host as telemetry: reuse the existing TLS session (zero cost).
-  //   • Different host, heap OK: stop() + connect() atomically.
-  //   • Low heap: Guard 1 or Guard 2 fires, returns false → caller restarts WiFi.
-  if (!teleClient.wifi.open(otaHost, otaPort)) {
+  //   Ã¢â‚¬Â¢ Same host as telemetry: reuse the existing TLS session (zero cost).
+  //   Ã¢â‚¬Â¢ Different host, heap OK: stop() + connect() atomically.
+  //   Ã¢â‚¬Â¢ Low heap: Guard 1 or Guard 2 fires, returns false Ã¢â€ â€™ caller restarts WiFi.
+  if (!otaWifiClient.open(otaHost, otaPort)) {
     Serial.printf("[OTA-PULL] Cannot connect to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CONNECT");
@@ -3417,23 +3384,23 @@ bool performPullOtaCheck()
     return false;
   }
 
-  if (!teleClient.wifi.send(METHOD_GET, metaPath)) {
+  if (!otaWifiClient.send(METHOD_GET, metaPath)) {
     Serial.println("[OTA-PULL] META send failed");
-    teleClient.wifi.close();
+    otaWifiClient.close();
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=META_SEND");
 #endif
     return false;
   }
 
-  metaBody = teleClient.wifi.receive(metaBuf, sizeof(metaBuf) - 1, &metaBytes);
-  if (!metaBody || teleClient.wifi.code() != 200) {
-    Serial.printf("[OTA-PULL] META HTTP %u\n", (unsigned)teleClient.wifi.code());
-    teleClient.wifi.close();
+  metaBody = otaWifiClient.receive(metaBuf, sizeof(metaBuf) - 1, &metaBytes);
+  if (!metaBody || otaWifiClient.code() != 200) {
+    Serial.printf("[OTA-PULL] META HTTP %u\n", (unsigned)otaWifiClient.code());
+    otaWifiClient.close();
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) {
       char _ota_diag[48];
-      snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=META_HTTP%d", (int)teleClient.wifi.code());
+      snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=META_HTTP%d", (int)otaWifiClient.code());
       logger.logEvent(_ota_diag);
     }
 #endif
@@ -3458,7 +3425,7 @@ bool performPullOtaCheck()
     return false;
   }
 
-  // Parse optional nvs_only flag — set by the HA server when the firmware
+  // Parse optional nvs_only flag Ã¢â‚¬â€ set by the HA server when the firmware
   // binary was already delivered (version matches in ota_pull_state.json) but
   // the NVS settings partition is outdated (e.g. WiFi credentials or LED/beep
   // state changed, or nvs.bin failed to download alongside the firmware in a
@@ -3488,7 +3455,7 @@ bool performPullOtaCheck()
 
   // ---- NVS-only update path -----------------------------------------------
   // Entered when firmware is current but NVS settings are outdated.
-  // Downloads only the NVS binary (heap is fresh — no prior firmware download),
+  // Downloads only the NVS binary (heap is fresh Ã¢â‚¬â€ no prior firmware download),
   // applies it directly, and restarts to activate the new settings.
 #if STORAGE == STORAGE_SD
   if (nvsOnly) {
@@ -3500,14 +3467,14 @@ bool performPullOtaCheck()
     if (SD.exists(OTA_NVS_PATH)) SD.remove(OTA_NVS_PATH);
     if (nvsPath[0]) {
 #if ENABLE_WIFI
-      if (teleClient.wifi.open(otaHost, otaPort) &&
-          teleClient.wifi.send(METHOD_GET, nvsPath)) {
+      if (otaWifiClient.open(otaHost, otaPort) &&
+          otaWifiClient.send(METHOD_GET, nvsPath)) {
         int _nvsCL = 0;
-        int _nvsHC = teleClient.wifi.receiveHeaders(&_nvsCL);
+        int _nvsHC = otaWifiClient.receiveHeaders(&_nvsCL);
         if (_nvsHC == 200 && _nvsCL > 0) {
           File _nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
           if (_nvsFile) {
-            WiFiClientSecure& _nvsRaw = teleClient.wifi.rawClient();
+            WiFiClientSecure& _nvsRaw = otaWifiClient.rawClient();
             size_t _nvsWr = 0, _nvsExp = (size_t)_nvsCL;
             bool _nvsOk = true;
             while (_nvsWr < _nvsExp) {
@@ -3523,19 +3490,19 @@ bool performPullOtaCheck()
             }
             _nvsFile.close();
             if (!_nvsOk || _nvsWr != _nvsExp) {
-              Serial.println("[OTA-PULL] NVS download incomplete — settings unchanged");
+              Serial.println("[OTA-PULL] NVS download incomplete Ã¢â‚¬â€ settings unchanged");
               SD.remove(OTA_NVS_PATH);
             } else {
               Serial.printf("[OTA-PULL] NVS staged: %u bytes\n", (unsigned)_nvsWr);
             }
           }
         } else {
-          Serial.printf("[OTA-PULL] NVS HTTP %d — settings unchanged\n", _nvsHC);
+          Serial.printf("[OTA-PULL] NVS HTTP %d Ã¢â‚¬â€ settings unchanged\n", _nvsHC);
         }
-        teleClient.wifi.close();
+        otaWifiClient.close();
       } else {
-        Serial.println("[OTA-PULL] NVS connect/send failed — settings unchanged");
-        teleClient.wifi.close();
+        Serial.println("[OTA-PULL] NVS connect/send failed Ã¢â‚¬â€ settings unchanged");
+        otaWifiClient.close();
       }
 #endif  // ENABLE_WIFI
     }
@@ -3546,20 +3513,20 @@ bool performPullOtaCheck()
       return false;
     }
     if (_applyNvsFromSD()) {
-      Serial.println("[OTA-PULL] Settings (NVS) applied — restarting");
+      Serial.println("[OTA-PULL] Settings (NVS) applied Ã¢â‚¬â€ restarting");
       esp_restart();
       return false;  // unreachable
     } else {
       // Apply failed (e.g. RAM allocation error, SD read error, flash write
       // error).  The NVS partition is unchanged; leave the device running so
       // it retries the download + apply on the next OTA check interval.
-      Serial.println("[OTA-PULL] Settings (NVS) apply failed — will retry on next check");
+      Serial.println("[OTA-PULL] Settings (NVS) apply failed Ã¢â‚¬â€ will retry on next check");
       return false;
     }
   }
 #endif  // STORAGE == STORAGE_SD
   if (nvsOnly) {
-    // No SD storage available — cannot download NVS binary; skip silently.
+    // No SD storage available Ã¢â‚¬â€ cannot download NVS binary; skip silently.
     Serial.println("[OTA-PULL] NVS-only update skipped (no SD storage)");
     return false;
   }
@@ -3594,10 +3561,10 @@ bool performPullOtaCheck()
 
   // Parse optional sha256 field for post-download integrity verification.
   // When present, the downloaded firmware file is checked against this digest
-  // immediately after the download loop — before the companion meta file is
+  // immediately after the download loop Ã¢â‚¬â€ before the companion meta file is
   // written.  A mismatch (e.g. due to Transfer-Encoding: chunked manglings
   // or cellular bit-errors) is caught here and the staging file is removed so
-  // the next OTA interval triggers a clean retry.  Missing field → skip check.
+  // the next OTA interval triggers a clean retry.  Missing field Ã¢â€ â€™ skip check.
   char fwSha256Hex[65] = "";
   {
     char* sf = strstr(metaBody, "\"sha256\":");
@@ -3651,7 +3618,7 @@ bool performPullOtaCheck()
     size_t lastLogAt = 0;
     bool dlOk = true;
 
-    // Streaming SHA256 context — updated with every chunk written to SD.
+    // Streaming SHA256 context Ã¢â‚¬â€ updated with every chunk written to SD.
     // Verification happens after the download loop and before the meta file
     // is written, so a corrupted download is detected without any flash attempt.
     mbedtls_sha256_context sha256Ctx;
@@ -3663,7 +3630,7 @@ bool performPullOtaCheck()
 
 
 #if ENABLE_WIFI
-    if (!teleClient.wifi.open(otaHost, otaPort)) {
+    if (!otaWifiClient.open(otaHost, otaPort)) {
       Serial.printf("[OTA-PULL] FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
       fwFile.close();
       SD.remove(OTA_PENDING_PATH);
@@ -3673,9 +3640,9 @@ bool performPullOtaCheck()
       return false;
     }
 
-    if (!teleClient.wifi.send(METHOD_GET, fwPath)) {
+    if (!otaWifiClient.send(METHOD_GET, fwPath)) {
       Serial.println("[OTA-PULL] FW send failed");
-      teleClient.wifi.close();
+      otaWifiClient.close();
       fwFile.close();
       SD.remove(OTA_PENDING_PATH);
 #if STORAGE != STORAGE_NONE
@@ -3685,10 +3652,10 @@ bool performPullOtaCheck()
     }
 
     int contentLength = 0;
-    int httpCode = teleClient.wifi.receiveHeaders(&contentLength);
+    int httpCode = otaWifiClient.receiveHeaders(&contentLength);
     if (httpCode != 200) {
       Serial.printf("[OTA-PULL] FW HTTP %d\n", httpCode);
-      teleClient.wifi.close();
+      otaWifiClient.close();
       fwFile.close();
       SD.remove(OTA_PENDING_PATH);
 #if STORAGE != STORAGE_NONE
@@ -3706,7 +3673,7 @@ bool performPullOtaCheck()
       fwSize = (size_t)contentLength;
     }
 
-    WiFiClientSecure& rawSock = teleClient.wifi.rawClient();
+    WiFiClientSecure& rawSock = otaWifiClient.rawClient();
 
     while (written < fwSize) {
       uint32_t chunkStart = millis();
@@ -3760,11 +3727,11 @@ bool performPullOtaCheck()
       }
     }
     fwFile.close();
-    teleClient.wifi.close();
+    otaWifiClient.close();
 #endif  // ENABLE_WIFI
 
     if (!dlOk || written != fwSize) {
-      Serial.printf("[OTA-PULL] Download incomplete (%u / %u bytes) — staging file removed\n",
+      Serial.printf("[OTA-PULL] Download incomplete (%u / %u bytes) Ã¢â‚¬â€ staging file removed\n",
                     (unsigned)written, (unsigned)fwSize);
       SD.remove(OTA_PENDING_PATH);
       if (doSha256) mbedtls_sha256_free(&sha256Ctx);
@@ -3775,7 +3742,7 @@ bool performPullOtaCheck()
     // meta.json.  Done BEFORE writing the companion meta file so that a corrupt
     // download (e.g. chunked-encoding artefacts from the reverse-proxy, or a
     // partial transfer) is detected immediately and the staging file is removed
-    // — the next OTA check interval will retry with a clean download.
+    // Ã¢â‚¬â€ the next OTA check interval will retry with a clean download.
     if (doSha256) {
       static const int SHA256_DIGEST_BYTES = 32;  // SHA-256 produces a 256-bit (32-byte) digest
       uint8_t digest[SHA256_DIGEST_BYTES];
@@ -3785,7 +3752,7 @@ bool performPullOtaCheck()
       for (int i = 0; i < SHA256_DIGEST_BYTES; i++) snprintf(actualHex + i * 2, 3, "%02x", digest[i]);
       actualHex[SHA256_DIGEST_BYTES * 2] = '\0';
       if (strncmp(actualHex, fwSha256Hex, SHA256_DIGEST_BYTES * 2) != 0) {
-        Serial.printf("[OTA-PULL] SHA256 mismatch — staging file removed (retry at next interval)\n"
+        Serial.printf("[OTA-PULL] SHA256 mismatch Ã¢â‚¬â€ staging file removed (retry at next interval)\n"
                       "[OTA-PULL]   expected: %s\n"
                       "[OTA-PULL]   actual:   %s\n",
                       fwSha256Hex, actualHex);
@@ -3799,8 +3766,8 @@ bool performPullOtaCheck()
     }
 
     // Notify HA that the firmware was downloaded and verified on the device.
-    // This is a WiFi-only, best-effort call — OTA proceeds even if it fails.
-    // The HA server only updates "OTA letzte Übertragung" upon receiving this
+    // This is a WiFi-only, best-effort call Ã¢â‚¬â€ OTA proceeds even if it fails.
+    // The HA server only updates "OTA letzte ÃƒÅ“bertragung" upon receiving this
     // request, ensuring the status reflects a device-confirmed download rather
     // than merely a completed server-side transmission.
 #if ENABLE_WIFI
@@ -3811,9 +3778,9 @@ bool performPullOtaCheck()
     if (ESP.getMaxAllocHeap() < TLS_MIN_FREE_HEAP) {
       Serial.printf("[OTA-PULL] Heap fragmented (%u bytes), restarting WiFi\n",
                     (unsigned)ESP.getMaxAllocHeap());
-      teleClient.wifi.end();
+      otaWifiClient.end();
       wifiReconnectCurrent();
-      if (!teleClient.wifi.setup(WIFI_JOIN_TIMEOUT)) {
+      if (!otaWifiClient.setup(WIFI_JOIN_TIMEOUT)) {
         Serial.println("[OTA-PULL] WiFi reconnect timeout after heap recovery");
       }
     }
@@ -3821,16 +3788,16 @@ bool performPullOtaCheck()
       char _confirmPath[128];
       snprintf(_confirmPath, sizeof(_confirmPath),
                "/api/freematics/ota_pull/%s/ota_confirm", otaToken);
-      if (teleClient.wifi.open(otaHost, otaPort) &&
-          teleClient.wifi.send(METHOD_GET, _confirmPath)) {
+      if (otaWifiClient.open(otaHost, otaPort) &&
+          otaWifiClient.send(METHOD_GET, _confirmPath)) {
         int _confirmCL = 0;
-        int _confirmCode = teleClient.wifi.receiveHeaders(&_confirmCL);
+        int _confirmCode = otaWifiClient.receiveHeaders(&_confirmCL);
         Serial.printf("[OTA-PULL] Confirm %s (HTTP %d)\n",
                       _confirmCode == 200 ? "OK" : "FAILED", _confirmCode);
       } else {
         Serial.println("[OTA-PULL] Confirm request failed (non-fatal)");
       }
-      teleClient.wifi.close();
+      otaWifiClient.close();
     }
 #endif
 
@@ -3850,14 +3817,14 @@ bool performPullOtaCheck()
     if (nvsPath[0]) {
       Serial.printf("[OTA-PULL] Downloading NVS settings from %s\n", nvsPath);
 #if ENABLE_WIFI
-      if (teleClient.wifi.open(otaHost, otaPort) &&
-          teleClient.wifi.send(METHOD_GET, nvsPath)) {
+      if (otaWifiClient.open(otaHost, otaPort) &&
+          otaWifiClient.send(METHOD_GET, nvsPath)) {
         int nvsContentLen = 0;
-        int nvsHttpCode = teleClient.wifi.receiveHeaders(&nvsContentLen);
+        int nvsHttpCode = otaWifiClient.receiveHeaders(&nvsContentLen);
         if (nvsHttpCode == 200 && nvsContentLen > 0) {
           File nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
           if (nvsFile) {
-            WiFiClientSecure& rawSock2 = teleClient.wifi.rawClient();
+            WiFiClientSecure& rawSock2 = otaWifiClient.rawClient();
             size_t nvsWritten = 0;
             size_t nvsExpected = (size_t)nvsContentLen;
             bool nvsOk = true;
@@ -3879,24 +3846,24 @@ bool performPullOtaCheck()
               if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL NVS DL OK");
 #endif
             } else {
-              Serial.println("[OTA-PULL] NVS download incomplete — skipping settings update");
+              Serial.println("[OTA-PULL] NVS download incomplete Ã¢â‚¬â€ skipping settings update");
               SD.remove(OTA_NVS_PATH);
             }
           }
         } else {
-          Serial.printf("[OTA-PULL] NVS HTTP %d — skipping settings update\n", nvsHttpCode);
+          Serial.printf("[OTA-PULL] NVS HTTP %d Ã¢â‚¬â€ skipping settings update\n", nvsHttpCode);
         }
-        teleClient.wifi.close();
+        otaWifiClient.close();
       } else {
-        Serial.println("[OTA-PULL] NVS connect/send failed — skipping settings update");
-        teleClient.wifi.close();
+        Serial.println("[OTA-PULL] NVS connect/send failed Ã¢â‚¬â€ skipping settings update");
+        otaWifiClient.close();
       }
 #endif  // ENABLE_WIFI
     }  // nvsPath[0]
 
     s_ota_pending = true;
     Serial.printf("[OTA-PULL] Download complete: %u bytes in %u ms\n"
-                  "[OTA-PULL] Firmware staged on SD (%s) — restarting to flash\n",
+                  "[OTA-PULL] Firmware staged on SD (%s) Ã¢â‚¬â€ restarting to flash\n",
                   (unsigned)written, (unsigned)(millis() - dlStart), OTA_PENDING_PATH);
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) {
@@ -3922,7 +3889,7 @@ bool performPullOtaCheck()
   s_ota_active = true;
   delay(1500);
 
-  if (!teleClient.wifi.open(otaHost, otaPort)) {
+  if (!otaWifiClient.open(otaHost, otaPort)) {
     Serial.printf("[OTA-PULL] FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
@@ -3931,9 +3898,9 @@ bool performPullOtaCheck()
     return false;
   }
 
-  if (!teleClient.wifi.send(METHOD_GET, fwPath)) {
+  if (!otaWifiClient.send(METHOD_GET, fwPath)) {
     Serial.println("[OTA-PULL] FW send failed");
-    teleClient.wifi.close();
+    otaWifiClient.close();
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_SEND");
@@ -3942,10 +3909,10 @@ bool performPullOtaCheck()
   }
 
   int contentLength = 0;
-  int httpCode = teleClient.wifi.receiveHeaders(&contentLength);
+  int httpCode = otaWifiClient.receiveHeaders(&contentLength);
   if (httpCode != 200) {
     Serial.printf("[OTA-PULL] FW HTTP %d\n", httpCode);
-    teleClient.wifi.close();
+    otaWifiClient.close();
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) {
@@ -3964,7 +3931,7 @@ bool performPullOtaCheck()
 
   if (!Update.begin(fwSize)) {
     Serial.printf("[OTA-PULL] Update.begin failed: %s\n", Update.errorString());
-    teleClient.wifi.close();
+    otaWifiClient.close();
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=UPD_BEGIN");
@@ -3972,7 +3939,7 @@ bool performPullOtaCheck()
     return false;
   }
 
-  WiFiClientSecure& rawSock = teleClient.wifi.rawClient();
+  WiFiClientSecure& rawSock = otaWifiClient.rawClient();
   size_t written = 0;
   uint32_t dlStart = millis();
   size_t lastLogAt = 0;
@@ -3983,7 +3950,7 @@ bool performPullOtaCheck()
     if (!rawSock.available()) {
       Serial.printf("[OTA-PULL] Recv timeout at offset %u\n", (unsigned)written);
       Update.abort();
-      teleClient.wifi.close();
+      otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_TIMEOUT");
@@ -3997,7 +3964,7 @@ bool performPullOtaCheck()
     if (n <= 0) {
       Serial.printf("[OTA-PULL] Read error at offset %u\n", (unsigned)written);
       Update.abort();
-      teleClient.wifi.close();
+      otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_READ");
@@ -4009,7 +3976,7 @@ bool performPullOtaCheck()
     if (w != (size_t)n) {
       Serial.printf("[OTA-PULL] Flash write error at offset %u\n", (unsigned)written);
       Update.abort();
-      teleClient.wifi.close();
+      otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FLASH_WRITE");
@@ -4026,7 +3993,7 @@ bool performPullOtaCheck()
     }
   }
 
-  teleClient.wifi.close();
+  otaWifiClient.close();
   Serial.printf("[OTA-PULL] Download complete: %u bytes in %u ms\n",
                 (unsigned)written, (unsigned)(millis() - dlStart));
 
@@ -4049,22 +4016,22 @@ bool performPullOtaCheck()
   }
 #endif
   // Notify HA that firmware was written to flash (best-effort, WiFi-only).
-  // The HA server only updates "OTA letzte Übertragung" upon receiving this
+  // The HA server only updates "OTA letzte ÃƒÅ“bertragung" upon receiving this
   // request, so the attribute accurately reflects a device-confirmed flash.
   {
     char _confirmPath[128];
     snprintf(_confirmPath, sizeof(_confirmPath),
              "/api/freematics/ota_pull/%s/ota_confirm", otaToken);
-    if (teleClient.wifi.open(otaHost, otaPort) &&
-        teleClient.wifi.send(METHOD_GET, _confirmPath)) {
+    if (otaWifiClient.open(otaHost, otaPort) &&
+        otaWifiClient.send(METHOD_GET, _confirmPath)) {
       int _confirmCL = 0;
-      int _confirmCode = teleClient.wifi.receiveHeaders(&_confirmCL);
+      int _confirmCode = otaWifiClient.receiveHeaders(&_confirmCL);
       Serial.printf("[OTA-PULL] Confirm %s (HTTP %d)\n",
                     _confirmCode == 200 ? "OK" : "FAILED", _confirmCode);
     } else {
       Serial.println("[OTA-PULL] Confirm request failed (non-fatal)");
     }
-    teleClient.wifi.close();
+    otaWifiClient.close();
   }
   // s_ota_active remains true; device reboots shortly.
   static esp_timer_handle_t s_pull_ota_timer = NULL;
@@ -4079,15 +4046,15 @@ bool performPullOtaCheck()
   }
   esp_timer_start_once(s_pull_ota_timer, 1500000);
   return true;
-#endif  // ENABLE_WIFI
+#endif  // ENABLE_WIFI (inner - line ~4445, the STORAGE_NONE/SPIFFS direct-flash fallback)
   return false;
 }
-#else   // SERVER_PROTOCOL == PROTOCOL_UDP
+#else   // !ENABLE_WIFI (outer - whole function; see #if ENABLE_WIFI near performPullOtaCheck's top)
 bool performPullOtaCheck()
 {
-  return false;  // Pull-OTA requires an HTTP-capable SERVER_PROTOCOL.
+  return false;  // Pull-OTA requires WiFi (ENABLE_WIFI) - no longer tied to SERVER_PROTOCOL.
 }
-#endif  // SERVER_PROTOCOL != PROTOCOL_UDP
+#endif  // ENABLE_WIFI (outer)
 
 void processBLE(int timeout)
 {
@@ -4332,10 +4299,10 @@ void processBLE(int timeout)
 // the current OTA state immediately without needing to reboot.
 //
 // Outputs one of:
-//   OTA:disabled                                    – OTA_TOKEN not in NVS
-//   OTA:TOKEN=38f90170... HOST=… PORT=… INTERVAL=Xs – fully active
-//   OTA:TOKEN=38f90170... HOST=… PORT=… INTERVAL=0s (checks disabled)
-//                                                   – token set, INTERVAL=0
+//   OTA:disabled                                    Ã¢â‚¬â€œ OTA_TOKEN not in NVS
+//   OTA:TOKEN=38f90170... HOST=Ã¢â‚¬Â¦ PORT=Ã¢â‚¬Â¦ INTERVAL=Xs Ã¢â‚¬â€œ fully active
+//   OTA:TOKEN=38f90170... HOST=Ã¢â‚¬Â¦ PORT=Ã¢â‚¬Â¦ INTERVAL=0s (checks disabled)
+//                                                   Ã¢â‚¬â€œ token set, INTERVAL=0
 // The first 8 hex characters of the token are shown so it is recognisable
 // in the serial log without exposing the full 64-character secret.
 // ---------------------------------------------------------------------------
@@ -4423,9 +4390,42 @@ void setup()
   showSysInfo();
 
   bufman.init();
-  
+
   //Serial.print(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10);
   //Serial.println("KB");
+
+  state.set(STATE_WORKING);
+
+  // Create the telemetry (WiFi/cellular connect + transmit) task as early as
+  // possible in setup(), right after bufman.init() and before OBD/MEMS/
+  // HTTPD/BLE run - all of which allocate from and fragment the same ~213KB
+  // internal DRAM that xTaskCreate's stack must come out of (task stacks
+  // can't come from PSRAM here). Originally this was created LAST, after
+  // BLE+HTTPD+MEMS+OBD had already run; measured live on 2026-09-15, that
+  // left only free=19512 maxblock=14836 bytes internal - too fragmented for
+  // the requested 16384-byte stack, so Task::create() failed EVERY time,
+  // silently (its return value used to be discarded): the telemetry task
+  // never started, so WiFi/cellular never connected, nothing was ever sent,
+  // while httpd/GPS/OBD kept working fine - looking exactly like "WiFi is
+  // connected but nothing is ever sent". Moving creation here gives it first
+  // claim on a much less fragmented heap. Retries + logs the outcome either
+  // way so a future regression here can never be silently invisible again.
+  {
+    Serial.printf("HEAP:free=%u maxblock=%u (internal, before telemetry task stack)\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    bool telemetryStarted = false;
+    for (byte tries = 0; tries < 5 && !telemetryStarted; tries++) {
+      if (tries) delay(500);
+      telemetryStarted = subtask.create(telemetry, "telemetry", 2, 16384);
+    }
+    Serial.print("TASK:telemetry=");
+    Serial.println(telemetryStarted ? "OK" : "FAILED(heap?)");
+#if STORAGE != STORAGE_NONE
+    if (state.check(STATE_STORAGE_READY)) {
+      logger.logEvent(telemetryStarted ? "TASK TELEMETRY_OK" : "TASK TELEMETRY_FAILED");
+    }
+#endif
+  }
 
 #if ENABLE_OBD
   if (sys.begin()) {
@@ -4485,8 +4485,6 @@ if (!state.check(STATE_MEMS_READY)) do {
   }
 #endif
 
-  state.set(STATE_WORKING);
-
 #if ENABLE_BLE
   if (enableBle) {
     // init BLE
@@ -4494,20 +4492,21 @@ if (!state.check(STATE_MEMS_READY)) do {
   }
 #endif
 
+  // Measured to answer "with the telemetry task's 16KB already reserved
+  // earlier, is there still enough internal heap left for BLE+HTTPD+MEMS+
+  // OBD to run safely, or should BLE be dropped instead of just reordered?"
+  Serial.printf("HEAP:free=%u maxblock=%u (internal, after BLE+HTTPD+MEMS+OBD init)\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
   // Print pull-OTA configuration so users can verify NVS provisioning via the
   // serial console.  This makes silent failures immediately obvious:
-  // "OTA:disabled"        → OTA_TOKEN not in NVS (re-flash with HA serial-flash button).
-  // "INTERVAL=0 (checks disabled)" → token set but OTA_INTERVAL not provisioned;
+  // "OTA:disabled"        Ã¢â€ â€™ OTA_TOKEN not in NVS (re-flash with HA serial-flash button).
+  // "INTERVAL=0 (checks disabled)" Ã¢â€ â€™ token set but OTA_INTERVAL not provisioned;
   //                           re-flash or use Send Config to set OTA_INTERVAL > 0.
   printOtaStatus();
 
   // initialize components
   initialize();
-
-  // initialize network and maintain connection.
-  // Stack of 16 KB gives mbedTLS / WiFiClientSecure enough room for the TLS
-  // handshake (typically 4–6 KB of stack) on top of the task's own frames.
-  subtask.create(telemetry, "telemetry", 2, 16384);
 
 #ifdef PIN_LED
   digitalWrite(PIN_LED, LOW);

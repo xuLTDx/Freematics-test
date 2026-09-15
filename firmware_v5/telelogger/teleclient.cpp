@@ -25,6 +25,9 @@ extern char devid[];
 extern char vin[];
 extern GPS_DATA* gd;
 extern char isoTime[];
+// See telelogger.ino's definition (right after "State state;") for why this
+// wrapper exists instead of calling logger.logEvent() directly from here.
+extern void logNetEvent(const char* msg);
 // Runtime-configurable server settings (set from NVS by loadConfig() in telelogger.ino).
 // The macro names SERVER_HOST / SERVER_PORT defined in config.h are overridden below
 // so that all existing code in this file uses the runtime values transparently.
@@ -307,6 +310,7 @@ bool TeleClientUDP::notify(byte event, const char* payload)
     }
     if (!data || bytesRecv == 0) {
       Serial.println("[UDP] Timeout");
+      logNetEvent("NET UDP_TIMEOUT");
       continue;
     }
     rxBytes += bytesRecv;
@@ -314,6 +318,7 @@ bool TeleClientUDP::notify(byte event, const char* payload)
     if (!verifyChecksum(data)) {
       Serial.print("[UDP] Checksum mismatch:");
       Serial.println(data);
+      logNetEvent("NET UDP_CHECKSUM_MISMATCH");
       continue;
     }
     char pattern[16];
@@ -321,6 +326,7 @@ bool TeleClientUDP::notify(byte event, const char* payload)
     if (!strstr(data, pattern)) {
       Serial.print("[UDP] Invalid reply: ");
       Serial.println(data);
+      logNetEvent("NET UDP_INVALID_REPLY");
       continue;
     }
     if (event == EVENT_LOGIN) {
@@ -369,17 +375,33 @@ bool TeleClientUDP::connect(bool quick)
   packets = 0;
 
   // connect to telematics server
+  //
+  // 2026-09-14: added logNetEvent() calls throughout this loop - previously
+  // every diagnostic here (LOGIN/RECONNECT attempts, WIFI/NET open failures,
+  // server timeouts) went to Serial.print/println ONLY, never to the SD
+  // event log. That meant a real-drive/bench connection failure here was
+  // completely invisible to /api/events, making "no telemetry at all" look
+  // identical to "not even trying" from the SD log alone - traced end-to-end
+  // via a full code review after 40+ minutes of silent WiFi-connected-but-
+  // no-telemetry with nothing in the log to explain why.
   for (byte attempts = 0; attempts < 3; attempts++) {
     Serial.print(event == EVENT_LOGIN ? "LOGIN(" : "RECONNECT(");
     Serial.print(SERVER_HOST);
     Serial.print(':');
     Serial.print(SERVER_PORT);
     Serial.println(")...");
+    {
+      char diag[64];
+      snprintf(diag, sizeof(diag), "%s %s:%u attempt=%d",
+          event == EVENT_LOGIN ? "LOGIN" : "RECONNECT", SERVER_HOST, (unsigned)SERVER_PORT, (int)attempts);
+      logNetEvent(diag);
+    }
 #if ENABLE_WIFI
     if (wifi.connected())
     {
       if (!wifi.open(SERVER_HOST, SERVER_PORT)) {
         Serial.println("[WIFI] Unable to connect");
+        logNetEvent("NET WIFI_OPEN_FAIL");
         delay(1000);
         continue;
       }
@@ -390,6 +412,7 @@ bool TeleClientUDP::connect(bool quick)
       if (!cell.open(SERVER_HOST, SERVER_PORT)) {
         if (!cell.check()) break;
         Serial.println("[NET] Unable to connect");
+        logNetEvent("NET CELL_OPEN_FAIL");
         delay(3000);
         continue;
       }
@@ -408,10 +431,14 @@ bool TeleClientUDP::connect(bool quick)
         cell.close();
       }
       Serial.println("[NET] Server timeout");
+      logNetEvent("NET NOTIFY_TIMEOUT");
       continue;
     }
     success = true;
     break;
+  }
+  if (!success) {
+    logNetEvent("NET CONNECT_FAILED_ALL_ATTEMPTS");
   }
   if (event == EVENT_LOGIN) startTime = millis();
   if (success) {
@@ -512,6 +539,7 @@ void TeleClientUDP::inbound()
     if (!verifyChecksum(data)) {
       Serial.print("[UDP] Checksum mismatch:");
       Serial.println(data);
+      logNetEvent("NET INBOUND_CHECKSUM_MISMATCH");
       break;
     }
     char *p = strstr(data, "EV=");

@@ -75,6 +75,23 @@
 #define ENABLE_UDS 1
 #define OBD_TIMEOUT_UDS 300 /* ms */
 
+// Zapnutie VAG-špecifického ODO/FUEL UDS bloku (natvrdo zakódované VW/Audi
+// gateway adresy 0x710/0x77A a 0x714/0x77E, DID 0x02BD/0x22B0). Toto je
+// špecifické pre Passat B8 - na inej značke (napr. PSA/Stellantis) tieto
+// adresy/DID nezodpovedajú ničomu, takže blok treba pre taký build vypnúť
+// cez -DENABLE_VAG_ODO_FUEL=0 (viď platformio.ini env:esp32dev_zafira).
+#ifndef ENABLE_VAG_ODO_FUEL
+#define ENABLE_VAG_ODO_FUEL 1
+#endif
+
+// Zapnutie PSA/Stellantis (K0 platforma) ODO/FUEL UDS bloku (psa_odo_fuel.cpp).
+// Default 0 - zapnuté explicitne cez -DENABLE_PSA_ODO_FUEL=1 pre PSA build
+// (viď platformio.ini env:esp32dev_zafira), aby to nemalo žiadny vplyv na
+// Passat build bez zásahu do neho.
+#ifndef ENABLE_PSA_ODO_FUEL
+#define ENABLE_PSA_ODO_FUEL 0
+#endif
+
 // maximum consecutive OBD access errors before entering standby
 // Set to a high value so that a temporarily unreachable ECU does not
 // permanently disconnect OBD-II.  The process() loop already retries
@@ -237,8 +254,19 @@
 //             attempt via standard 11-bit addressing (0x714 request /
 //             0x77E response) alongside the existing extended-addressing
 //             attempts, with R3/RAW3 added to the ODO diagnostic log line
+// Vehicle-profile suffix appended below so the boot log / diag lines /
+// /api/info unambiguously show which vehicle-specific UDS module this
+// build has compiled in - critical once the same physical device gets
+// flashed with different vehicle builds and swapped between cars (VAG
+// Passat vs PSA Zafira/Traveller/Proace Verso).
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "5.3-odo"
+#if ENABLE_PSA_ODO_FUEL
+#define FIRMWARE_VERSION "5.3-odo-PSA"
+#elif ENABLE_VAG_ODO_FUEL
+#define FIRMWARE_VERSION "5.3-odo-VAG"
+#else
+#define FIRMWARE_VERSION "5.3-odo-NONE"
+#endif
 #endif
 
 // Build purpose, chosen interactively at build time by wifi_secrets.py
