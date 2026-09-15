@@ -35,6 +35,13 @@ extern void logNetEvent(const char* msg);
 // same NAT mapping its own outbound packets keep open - works over cellular,
 // not just LAN) can request the same check without any new fetch logic.
 extern void httpTriggerOtaCheckNow();
+// The exact build timestamp (__DATE__ " " __TIME__, e.g. "Sep 15 2026
+// 20:53:10") - same string /api/info reports as "fw_build" and what
+// ota_server.py/ota_push_watcher.py compare against target_build. NOT
+// FIRMWARE_VERSION (a short tag like "5.3-odo-PSA") - that string can't be
+// compared as a timestamp, only found the mismatch by checking what
+// actually reached Traccar after wiring this up.
+extern const char FW_BUILD_STR[];
 // Runtime-configurable server settings (set from NVS by loadConfig() in telelogger.ino).
 // The macro names SERVER_HOST / SERVER_PORT defined in config.h are overridden below
 // so that all existing code in this file uses the runtime values transparently.
@@ -425,13 +432,22 @@ bool TeleClientUDP::connect(bool quick)
       }
     }
     // log in or reconnect to Freematics Hub.
-    // LOGIN only (not every RECONNECT) carries FW=<FIRMWARE_VERSION> as the
-    // payload - Traccar logs the raw incoming line regardless of whether its
-    // decoder parses this field, so ota_push_watcher.py can read a device's
-    // current build straight from that log without querying the device
-    // directly (which would only work when it's reachable on the LAN).
-    // Minimal added data: one short field, once per session.
-    if (!notify(event, event == EVENT_LOGIN ? ("FW=" FIRMWARE_VERSION) : 0)) {
+    // LOGIN only (not every RECONNECT) carries FW=<FW_BUILD_STR> as the
+    // payload - the exact build timestamp (e.g. "Sep 15 2026 20:53:10"),
+    // NOT FIRMWARE_VERSION (a short tag like "5.3-odo-PSA") - it has to be
+    // the same timestamp format /api/info's fw_build reports and
+    // ota_server.py/ota_push_watcher.py's is_update_needed() compares
+    // against target_build, or every comparison against it is meaningless.
+    // FreematicsProtocolDecoder.java stores this as Position.KEY_VERSION_FW
+    // regardless of whether it parses as a date, so ota_push_watcher.py can
+    // read a device's current build from Traccar's database without
+    // querying the device directly (only works while it's reachable on the
+    // LAN). Minimal added data: one short field, once per session.
+    char fwPayload[40];
+    if (event == EVENT_LOGIN) {
+      snprintf(fwPayload, sizeof(fwPayload), "FW=%s", FW_BUILD_STR);
+    }
+    if (!notify(event, event == EVENT_LOGIN ? fwPayload : 0)) {
 #if ENABLE_WIFI
       if (wifi.connected())
       {
