@@ -419,6 +419,7 @@ bool TeleClientUDP::connect(bool quick)
         delay(1000);
         continue;
       }
+      logNetEvent("NET WIFI_OPEN_OK");
     }
     else
 #endif
@@ -430,6 +431,7 @@ bool TeleClientUDP::connect(bool quick)
         delay(3000);
         continue;
       }
+      logNetEvent("NET CELL_OPEN_OK");
     }
     // log in or reconnect to Freematics Hub.
     // LOGIN only (not every RECONNECT) carries two fields, each answering a
@@ -464,6 +466,7 @@ bool TeleClientUDP::connect(bool quick)
     if (event == EVENT_LOGIN) {
       snprintf(fwPayload, sizeof(fwPayload), "FW=%s,VARIANT=%s", FW_BUILD_STR, FIRMWARE_VERSION);
     }
+    logNetEvent("NET NOTIFY_CALLED");
     if (!notify(event, event == EVENT_LOGIN ? fwPayload : 0)) {
 #if ENABLE_WIFI
       if (wifi.connected())
@@ -480,6 +483,7 @@ bool TeleClientUDP::connect(bool quick)
       logNetEvent("NET NOTIFY_TIMEOUT");
       continue;
     }
+    logNetEvent("NET NOTIFY_OK");
     success = true;
     break;
   }

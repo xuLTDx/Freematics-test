@@ -29,8 +29,6 @@ extern UpdateClass Update;
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
-#include "vag_odo_fuel.h"
-#include "psa_odo_fuel.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -543,6 +541,10 @@ void logNetEvent(const char* msg)
 #if STORAGE != STORAGE_NONE
   if (state.check(STATE_STORAGE_READY)) {
     logger.logEvent(msg);
+    // Flush immediately: this function exists specifically to diagnose
+    // crashes/resets that happen moments later (e.g. mid-connect) - an
+    // unflushed event is invisible after a reset, defeating the purpose.
+    logger.flush();
   }
 #endif
 }
@@ -590,28 +592,6 @@ float gpsLat()    { return gd ? gd->lat : 0; }
 float gpsLng()    { return gd ? gd->lng : 0; }
 // 0xFFFFFFFF sentinel = no GPS fix data yet at all (gd null or never timestamped).
 uint32_t gpsAgeMs() { return (gd && gd->ts) ? (uint32_t)(millis() - gd->ts) : 0xFFFFFFFF; }
-
-// Thin OBD-link wrappers, same reasoning as logNetEvent() above: per-vehicle
-// .cpp files (vag_odo_fuel.cpp, psa_odo_fuel.cpp, ...) are separate
-// translation units that cannot see the .ino-local `OBD` subclass definition,
-// so they drive the link through these instead of touching `obd` directly.
-// Not vehicle-specific despite living next to the VAG/PSA modules' callers -
-// shared by all of them.
-bool obdLinkUp()
-{
-  return obd.link != 0;
-}
-
-int obdSendCommand(const char* cmd, char* buf, int bufsize, int timeout)
-{
-  if (!obd.link) return 0;
-  return obd.link->sendCommand(cmd, buf, bufsize, timeout);
-}
-
-bool obdReadStdPID(byte pid, int& value)
-{
-  return obd.readPID(pid, value);
-}
 
 // ESP32 WiFi disconnect reason codes (wifi_err_reason_t, esp_wifi_types.h) -
 // sent as telemetry (see wifiDisconnectPending, declared earlier alongside
@@ -907,12 +887,15 @@ void processOBD(CBuffer* buffer)
     vehiclePidIdx++;
   }
 
-#if ENABLE_VAG_ODO_FUEL
-  processVagOdoFuel(buffer);
-#endif // ENABLE_VAG_ODO_FUEL
-#if ENABLE_PSA_ODO_FUEL
-  processPsaOdoFuel(buffer);
-#endif // ENABLE_PSA_ODO_FUEL
+  // VAG/PSA UDS odo/fuel module (vag_odo_fuel.cpp/psa_odo_fuel.cpp) removed
+  // entirely 2026-09-16: confirmed dead end on this hardware. The Freematics
+  // ONE+'s CAN goes through a closed-firmware STM32 co-processor
+  // ("OBD2USART") that does not support UDS on a non-default CAN header -
+  // see DIY_Telemetry_Build/04_Fyzicky_bypass_povodneho_Freematics/SUPIS.md.
+  // Every UDS attempt through this AT-command interface is inconclusive by
+  // construction, on any vehicle, until that co-processor is bypassed in
+  // hardware. Single unified build/OTA target now (no more VAG/PSA split -
+  // see FIRMWARE_VERSION in config.h).
 
   int kph = obdData[0].value;
   if (kph >= 2) lastMotionTime = millis();
@@ -2041,6 +2024,7 @@ void telemetry(void* inst)
           if (ip.length()) {
             Serial.print("[WIFI] IP:");
             Serial.println(ip);
+            logNetEvent("NET WIFI_GOT_IP");
           }
           connErrors = 0;
           if (teleClient.connect()) {
