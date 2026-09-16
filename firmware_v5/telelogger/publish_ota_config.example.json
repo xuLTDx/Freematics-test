@@ -1,6 +1,6 @@
 {
   "ota_host": "ultd@10.74.18.4",
-  "ota_dir": "/home/ultd/ota-server",
+  "ota_dir": "/opt/freematics-ota",
   "profiles": {
     "esp32dev": {
       "remote_name": "telelogger.bin",
