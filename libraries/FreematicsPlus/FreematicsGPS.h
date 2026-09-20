@@ -70,6 +70,14 @@ public:
   // horizontal dilution of precision in 100ths
   inline unsigned long hdop() { return _hdop; }
 
+  // true only if the last decoded sentence carried a genuinely valid fix
+  // (GPRMC status 'A', or GPGGA fix-quality > 0) - false for a void/no-fix
+  // sentence ('V' / quality 0). get_position()/f_get_position() do NOT
+  // reset lat/lng on an invalid sentence, they keep returning the last good
+  // fix, so callers that need to know whether a fix is CURRENT (not just
+  // previously obtained) must check this alongside them.
+  inline bool dataGood() { return _gps_data_good; }
+
   void f_get_position(float *latitude, float *longitude, unsigned long *fix_age = 0);
   void crack_datetime(int *year, byte *month, byte *day,
     byte *hour, byte *minute, byte *second, byte *hundredths = 0, unsigned long *fix_age = 0);

@@ -662,6 +662,22 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd)
     } else {
         gps.stats(&gpsData.sentences, &gpsData.errors);
         if (!gpsHasDecodedData) return false;
+        if (!gps.dataGood()) {
+            // Lost/never had a real fix (NMEA GPRMC status 'V' or GGA fix
+            // quality 0). gps.get_position() below does NOT clear its cached
+            // lat/lng on an invalid sentence - without this check, every
+            // subsequent poll after losing lock would keep silently
+            // reporting that stale last-known position as a fresh
+            // successful fix forever. Confirmed 2026-09-17: a real device
+            // got stuck for 3+ days broadcasting one frozen position this
+            // way after losing GPS lock once. Returning false here also
+            // lets telelogger.ino's GNSS_RESET_TIMEOUT watchdog correctly
+            // see repeated failures and eventually power-cycle the GNSS
+            // receiver, instead of never firing because every poll looked
+            // like a success.
+            gpsHasDecodedData = false;
+            return false;
+        }
         long lat, lng;
         bool good = true;
         gps.get_position(&lat, &lng, 0);
