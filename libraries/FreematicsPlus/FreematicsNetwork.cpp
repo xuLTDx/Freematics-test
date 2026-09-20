@@ -101,6 +101,16 @@ String ClientWIFI::getIP()
 bool ClientWIFI::begin(const char* ssid, const char* password)
 {
   //listAPs();
+  // 2026-09-20: tried WiFi.setSleep(false) here to fix WIFI_REASON_
+  // 4WAY_HANDSHAKE_TIMEOUT(15)/NO_AP_FOUND(201) disconnects - reverted the
+  // same day. This device runs BLE (SPP server) alongside WiFi, and the
+  // ESP-IDF WiFi/BT coexistence layer hard-requires WiFi modem sleep to stay
+  // ON whenever BT is active ("Error! Should enable WiFi modem sleep when
+  // both WiFi and Bluetooth are enabled" -> abort() in coex_core_enable).
+  // Disabling sleep only survives until the next WiFi reconnect after BT has
+  // started (e.g. the OTA-pull low-heap reconnect path), which aborts every
+  // time - confirmed as a live boot loop. Do not re-add setSleep(false) here
+  // without also disabling/gating BLE, which is a bigger change.
 #ifndef ARDUINO_ESP32C3_DEV
   // Set TX power before begin so the full connection handshake (auth + DHCP)
   // uses this power level. 17 dBm gives reliable range without maximum
