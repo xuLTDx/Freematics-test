@@ -329,7 +329,7 @@ char otaToken[68] = "";   // 64 hex chars + null; empty = feature disabled
 // serverHost when Nabu Casa cloud is active (serverHost would be
 // hooks.nabu.casa which does not serve the pull-OTA endpoint).
 char otaHost[128] = "";
-uint16_t otaPort = 443;   // OTA_PORT NVS key (u16)
+uint16_t otaPort = 6001;   // OTA_PORT NVS key (u16) - matches freematics-ota's default LISTEN_PORT
 // Interval between pull-OTA checks in seconds.  0 = disabled (default).
 uint16_t otaCheckIntervalS = 0;  // OTA_INTERVAL NVS key (u16)
 
