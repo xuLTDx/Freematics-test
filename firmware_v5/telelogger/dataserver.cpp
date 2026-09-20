@@ -66,6 +66,8 @@ extern bool enableLedRed;  // read here to apply LED state immediately in handle
 extern bool enableObd;         // runtime OBD enable flag (NVS key OBD_EN)
 extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDBY)
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
+extern uint32_t wmDoneFileId;  // missed-data catch-up watermark (NVS key WM_FILE)
+extern bool s_catchupPending;  // re-run catchUpMissedFiles() next send-loop iteration
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
 extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
 // Set to true while an OTA flash is in progress so the telemetry task yields
@@ -661,6 +663,23 @@ int handlerControl(UrlHandlerParam* param)
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
         printOtaStatus();
+    } else if (!strncmp(cmd, "WM_FILE=", 8)) {
+        // Manually override the missed-data catch-up watermark (NVS key
+        // WM_FILE, u32) - see wmDoneFileId's comment in telelogger.ino. The
+        // device only auto-seeds this on its very first boot with this
+        // feature (to avoid replaying a device's entire lifetime SD history
+        // on activation); this command lets it be lowered deliberately, e.g.
+        // to recover a specific real gap after clearing out older/irrelevant
+        // files from /DATA first so nothing before the intended window gets
+        // replayed. sendCsvFile() silently skips any file id that no longer
+        // exists, so this is safe to set low even if some files in between
+        // have already been deleted.
+        uint32_t wm = (uint32_t)strtoul(cmd + 8, 0, 10);
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_u32(nvs, "WM_FILE", wm) == ESP_OK
+            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
+        wmDoneFileId = wm;
+        s_catchupPending = true;
     } else {
         n = snprintf(buf, bufsize, "ERR");
     }

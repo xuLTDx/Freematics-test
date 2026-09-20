@@ -408,6 +408,27 @@ uint16_t nvsStandbyTimeS = 0;
 // The telemetry task checks this flag and yields the WiFi to the OTA upload.
 volatile bool s_ota_active = false;
 
+// --- Missed-data catch-up (store-and-forward across outages) ------------
+// wmDoneFileId (NVS key WM_FILE, u32): highest /DATA/<id>.CSV file id whose
+// ENTIRE contents were confirmed successfully sent to the server. Written
+// only after a file is fully replayed - never mid-file - so an interruption
+// just means that one file is retried in full next time (small harmless
+// re-send overlap at worst, never a gap). This is deliberately per-FILE, not
+// per-record: PID 0 in each CSV line is a boot-relative millis() counter,
+// not wall-clock time, and cannot be compared across different boot
+// sessions/files, so file-level granularity avoids needing to correlate
+// millis() to real time at all.
+// Left at 0 (meaning "nothing confirmed yet") when never set - see
+// catchUpMissedFiles() for why that is deliberately treated as "everything
+// before the current session's own file is caught up" rather than
+// replaying the device's entire lifetime SD history on first boot.
+uint32_t wmDoneFileId = 0;
+// One-shot per boot: runs catchUpMissedFiles() the first time the telemetry
+// send loop is about to send a live packet, then never again until reboot.
+// Not static: dataserver.cpp's WM_FILE= control-command handler needs to
+// re-arm this after a manual watermark override.
+bool s_catchupPending = true;
+
 // SD card paths for the two-phase pull-OTA staging mechanism (STORAGE_SD only).
 // Phase 1 (during active telemetry): firmware is downloaded to OTA_PENDING_PATH.
 // Phase 2 (at next standby transition): firmware is flashed from SD to flash.
@@ -1269,6 +1290,20 @@ void initialize()
   if (state.check(STATE_STORAGE_READY)) {
     fileid = logger.begin();
     if (fileid) {
+      // Load the catch-up watermark (see wmDoneFileId's own comment above).
+      // ESP_ERR_NVS_NOT_FOUND means this is the first boot ever with this
+      // feature - on a device that already has a long SD history (this one
+      // has hundreds of files from months of use), catching up from file 1
+      // would flood the server with its entire lifetime history. So on first
+      // activation only, seed the watermark to "everything up to and
+      // including the previous file is already handled" and start real
+      // gap-tracking fresh from this boot's own file onward.
+      esp_err_t wmErr = nvs_get_u32(nvs, "WM_FILE", &wmDoneFileId);
+      if (wmErr == ESP_ERR_NVS_NOT_FOUND) {
+        wmDoneFileId = (fileid > 1) ? (uint32_t)(fileid - 1) : 0;
+        nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
+        nvs_commit(nvs);
+      }
       // Write a diagnostic boot banner so that every CSV log file carries
       // the firmware version, device ID, and the initial subsystem status
       // that would otherwise only appear on the serial console.
@@ -1908,6 +1943,131 @@ bool initCell(bool quick = false)
 }
 
 /*******************************************************************************
+  Missed-data catch-up: replay one /DATA/<fileId>.CSV file's contents as
+  live-format packets over the current connection.
+  A CSV line ("<HEXPID>,<valuetext>") is byte-identical to the value text a
+  live wire packet would carry for the same PID - both come from the same
+  CStorage::log() formatting, just with a different delimiter/separator
+  (file: ',' and '\n'; wire: ':' and ','). So no typed re-decoding is needed:
+  each line is reformatted from "PID,value" to "PID:value" and fed straight
+  into replayStore's own dispatch(), bookended by header()/tailer() per
+  record (a record = the lines between one PID-0/timestamp line and the
+  next). PID 0xFE ("FE,<text>") is FileLogger::logEvent()'s diagnostic-text
+  marker, not a sensor reading - skipped during replay.
+  Returns true only if every record in the file was transmitted successfully
+  (false stops at the first failure, so the caller does not advance the
+  watermark past a file that was only partially sent - it will be retried in
+  full, not resumed mid-file, next time).
+*******************************************************************************/
+bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId)
+{
+  char path[24];
+  sprintf(path, "/DATA/%u.CSV", (unsigned int)fileId);
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    // Already purged by SDLogger::purgeOldFiles() under SD space pressure -
+    // nothing left to replay; don't let a deleted file block later ones.
+    return true;
+  }
+
+  char line[64];
+  int lineLen = 0;
+  bool recordOpen = false;
+  bool ok = true;
+  int yieldCounter = 0;
+
+  while (ok && f.available()) {
+    char buf[256];
+    int n = f.readBytes(buf, sizeof(buf));
+    for (int i = 0; i < n && ok; i++) {
+      char c = buf[i];
+      if (c == '\n') {
+        line[lineLen] = 0;
+        char* comma = strchr(line, ',');
+        if (comma) {
+          *comma = 0;
+          const char* valueText = comma + 1;
+          uint16_t pid = (uint16_t)strtoul(line, 0, 16);
+          if (pid == 0) {
+            // New record boundary (PID 0 = timestamp, see CStorage::timestamp()).
+            // Close and send the previous record first, if any.
+            if (recordOpen) {
+              replayStore.tailer();
+              ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
+            }
+            if (ok) {
+              replayStore.header(devid);
+              recordOpen = true;
+            }
+          }
+          if (ok && recordOpen && pid != 0xFE) {
+            char entry[80];
+            int elen = snprintf(entry, sizeof(entry), "%X:%s", pid, valueText);
+            replayStore.dispatch(entry, elen);
+          }
+        }
+        lineLen = 0;
+      } else if (lineLen < (int)sizeof(line) - 1) {
+        line[lineLen++] = c;
+      }
+    }
+    if (++yieldCounter >= 4) { yield(); yieldCounter = 0; }
+  }
+  if (ok && recordOpen) {
+    replayStore.tailer();
+    ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
+  }
+  f.close();
+  return ok;
+}
+
+// Driver: replays every /DATA file between the watermark and the current
+// session's own file (exclusive - the active file is still being live-
+// written and is handled by the normal send loop, not this one). Advances
+// and persists wmDoneFileId to NVS after each fully-successful file so a
+// later interruption resumes at the next unfinished file, not from scratch.
+// Called once per boot (see s_catchupPending) right before the send loop
+// starts sending live packets, so any gap left by an extended outage
+// (Switzerland/ferry-style, no WiFi or cellular for hours+) gets replayed
+// in strict file order before today's live data resumes - this ordering
+// matters because Traccar's DistanceHandler computes totalDistance from
+// consecutive positions in arrival order, so sending newer data before an
+// older backlog would corrupt the odometer calibration chain.
+// Returns true only once every missed file has been fully sent (or there
+// was nothing missed to begin with) - false means the caller must NOT fall
+// through to sending live data this iteration (that would let newer data
+// overtake a still-incomplete backlog), and must retry catch-up again
+// instead, e.g. on the next reconnect.
+bool catchUpMissedFiles(CStorageRAM& replayStore)
+{
+  if (fileid <= 0) return true;
+  uint32_t upTo = (uint32_t)fileid - 1;
+  if (wmDoneFileId >= upTo) return true;  // nothing missed
+
+  Serial.print("[CATCHUP] replaying files ");
+  Serial.print(wmDoneFileId + 1);
+  Serial.print("..");
+  Serial.println(upTo);
+
+  for (uint32_t id = wmDoneFileId + 1; id <= upTo; id++) {
+    if (s_ota_active) return false;  // yield to OTA exactly like the live send loop does
+    if (!sendCsvFile(replayStore, id)) {
+      Serial.print("[CATCHUP] file ");
+      Serial.print(id);
+      Serial.println(" failed, will retry later");
+      return false;
+    }
+    wmDoneFileId = id;
+    nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
+    nvs_commit(nvs);
+    Serial.print("[CATCHUP] file ");
+    Serial.print(id);
+    Serial.println(" done");
+  }
+  return true;
+}
+
+/*******************************************************************************
   Initializing network, maintaining connection and doing transmissions
 *******************************************************************************/
 void telemetry(void* inst)
@@ -2190,6 +2350,24 @@ void telemetry(void* inst)
             break;
           }
 #endif
+        }
+      }
+
+      // One-shot per boot, right before the first live packet: replay any
+      // /DATA files left over from an outage that spanned a reboot (or
+      // simply never got sent) before resuming normal live transmission.
+      // See catchUpMissedFiles()'s own comment for why this must run here,
+      // strictly before getNewest() below, not interleaved with it. If it
+      // returns false (interrupted, e.g. lost connection mid-replay),
+      // s_catchupPending stays true so the NEXT iteration retries catch-up
+      // again instead of falling through to live data below - newer data
+      // must never be sent while an older backlog is still incomplete.
+      if (s_catchupPending) {
+        if (catchUpMissedFiles(store)) {
+          s_catchupPending = false;
+        } else {
+          delay(1000);
+          continue;
         }
       }
 
