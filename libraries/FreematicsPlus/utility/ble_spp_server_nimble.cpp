@@ -364,12 +364,38 @@ char* ble_recv_command(int timeout)
     return nullptr;
 }
 
+// NimBLE-Arduino's BLECharacteristic::notify() silently no-ops when no
+// client has written the CCCD to formally subscribe to notifications
+// (NimBLECharacteristic.cpp's notify(): `if (m_subscribedVec.size() == 0)
+// return;`). The original Bluedroid code (ble_spp_server.c) called the raw
+// esp_ble_gatts_send_indicate() directly, which does NOT check subscription
+// state - it always sends to the tracked connection. Confirmed live
+// 2026-09-21: the real Freematics Controller App connects and its commands
+// (BATT/TEMP/ON?) round-trip and get computed correctly (visible in the
+// [BLE] logs from telelogger.ino's processBLE()), but the app displayed 0
+// for every value - consistent with it never issuing a CCCD subscribe
+// write, so NimBLE's notify() was silently discarding every response.
+// This bypasses NimBLE-Arduino's subscription gate by calling the same
+// underlying raw NimBLE host API (ble_gattc_notify_custom) the library
+// itself uses internally, for every currently connected peer regardless of
+// subscription state - restoring the original's "always send" behaviour.
+static void bleForceNotify(BLECharacteristic* pChar, const uint8_t* data, size_t len)
+{
+    if (!g_server || !pChar) return;
+    for (uint16_t connHandle : g_server->getPeerDevices()) {
+        os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
+        if (om) {
+            ble_gattc_notify_custom(connHandle, pChar->getHandle(), om);
+        }
+    }
+}
+
 void ble_send_response(void* data, int len, char* ptr_to_free)
 {
     if (ptr_to_free) free(ptr_to_free);
     if (len > 0 && g_statusChar && g_server && g_server->getConnectedCount() > 0) {
         g_statusChar->setValue((uint8_t*)data, (size_t)len);
-        g_statusChar->notify();
+        bleForceNotify(g_statusChar, (const uint8_t*)data, (size_t)len);
     }
 }
 
