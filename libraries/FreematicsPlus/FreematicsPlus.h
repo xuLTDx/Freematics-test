@@ -18,8 +18,26 @@
 #include "FreematicsNetwork.h"
 #include "FreematicsMEMS.h"
 #include "FreematicsOBD.h"
+
+// BLE SPP server backend select: classic ESP-IDF Bluedroid (default) or the
+// h2zero/NimBLE-Arduino based alternative, chosen via ENABLE_BLE_NIMBLE
+// (see firmware_v5/telelogger/config.h and platformio.ini). Both headers
+// declare the exact same ble_init()/ble_send()/ble_recv_command()/
+// ble_send_response() interface, so nothing outside this block needs to
+// know which backend is active. Only ONE of ble_spp_server.c /
+// ble_spp_server_nimble.cpp actually defines those symbols for a given
+// build (each is internally guarded the mirror-image way on this same
+// macro) - this #include must stay in sync with that so callers see a
+// declaration matching whichever .c/.cpp actually provides it.
+#ifndef ENABLE_BLE_NIMBLE
+#define ENABLE_BLE_NIMBLE 0
+#endif
 extern "C" {
+#if ENABLE_BLE_NIMBLE
+#include "utility/ble_spp_server_nimble.h"
+#else
 #include "utility/ble_spp_server.h"
+#endif
 }
 
 #define PIN_SD_CS 5
