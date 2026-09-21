@@ -478,10 +478,23 @@ void ble_pause()
 void ble_resume()
 {
     if (!g_bleInitialized || !g_blePaused) return;
+    // Set the flag FIRST, before doing any of the actual re-init work below.
+    // ble_resume() is called from two different call sites that can run on
+    // different FreeRTOS tasks (ClientWIFI::setup()'s success path on the
+    // main loop task, and onWifiEvent()'s ARDUINO_EVENT_WIFI_STA_GOT_IP
+    // handler on the WiFi event task) for the SAME connection event.
+    // Confirmed live 2026-09-21: both can pass the `!g_blePaused` guard
+    // above before either one reaches the old `g_blePaused = false` at the
+    // end, so BOTH re-entered NimBLEDevice::init() - the second call hit an
+    // already-initialized BT controller (ESP_ERR_INVALID_STATE ->
+    // ESP_ERROR_CHECK abort) and boot-looped the device. Clearing the flag
+    // up front closes (most of) that race: the second caller now sees
+    // g_blePaused already false and returns immediately instead of
+    // re-entering init.
+    g_blePaused = false;
     Serial.println("[BLE] resuming BT controller after WiFi (re)connect");
     BLEDevice::init(g_advName);
     bleCreateGattServerAndAdvertise(g_advName);
-    g_blePaused = false;
 }
 
 bool ble_isPausedTooLong(uint32_t maxPauseMs)

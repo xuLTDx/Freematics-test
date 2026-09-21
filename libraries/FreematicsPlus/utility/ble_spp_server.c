@@ -525,16 +525,28 @@ void ble_pause(void)
 void ble_resume(void)
 {
     if (!ble_initialized || !ble_paused) return;
+    // Clear the flag FIRST, before doing any of the actual re-init work.
+    // ble_resume() is called from two call sites that can run on different
+    // FreeRTOS tasks (ClientWIFI::setup()'s success path on the main loop
+    // task, and onWifiEvent()'s ARDUINO_EVENT_WIFI_STA_GOT_IP handler on the
+    // WiFi event task) for the SAME connection event - confirmed live
+    // 2026-09-21 on the NimBLE sibling of this function that both can pass
+    // the `!ble_paused` guard above before either reaches the flag-clear at
+    // the end, double-entering the BT controller init and boot-looping the
+    // device. If btStart() then fails, re-arm the flag so the stale-pause
+    // watchdog/a later call still retries - only the success path needs the
+    // flag cleared early to close the race.
+    ble_paused = false;
     ESP_LOGI(GATTS_TABLE_TAG, "%s resuming BT controller after WiFi (re)connect\n", __func__);
     if (!btStart()) {
         ESP_LOGE(GATTS_TABLE_TAG, "%s btStart() failed - will retry on the next resume trigger\n", __func__);
-        return; // leave ble_paused true so a later call (or the stale-pause
-                // watchdog) tries again instead of silently losing track
+        ble_paused = true; // re-arm: leave it paused so a later call (or the
+                            // stale-pause watchdog) tries again
+        return;
     }
     is_connected = false;
     enable_data_ntf = false;
     esp_ble_gap_start_advertising(&spp_adv_params);
-    ble_paused = false;
 }
 
 bool ble_isPausedTooLong(uint32_t maxPauseMs)
