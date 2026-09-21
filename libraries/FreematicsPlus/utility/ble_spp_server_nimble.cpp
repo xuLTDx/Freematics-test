@@ -2,226 +2,25 @@
  * ble_spp_server_nimble.cpp
  *
  * ============================================================================
- *  Alternative BLE SPP server implementation, built against
- *  h2zero/NimBLE-Arduino instead of raw ESP-IDF Bluedroid.
+ *  BLE SPP server implementation, built against h2zero/NimBLE-Arduino.
+ *  The sole BLE backend as of 2026-09-21 - replaced the classic ESP-IDF
+ *  Bluedroid implementation (ble_spp_server.c/.h, removed) for a smaller
+ *  RAM footprint that coexists better with WiFi. Verified working on real
+ *  hardware with the Freematics Controller phone app 2026-09-21 (device
+ *  advertises, connects, command round-trip confirmed).
  *
- *  ORIGIN: this file started as an untested draft written 2026-09-15/16 by
- *  an earlier agent session with no build/hardware access (see git history
- *  of this repo / the stale worktree it came from for that original text).
- *  On 2026-09-21, in a separate isolated worktree with PlatformIO available
- *  (but still NO hardware access - no device is reachable and none should
- *  be touched from here), it was wired into a real build behind the
- *  ENABLE_BLE_NIMBLE compile-time switch (see below) and iterated on until
- *  `pio run -e esp32dev -D ENABLE_BLE_NIMBLE=1` compiles cleanly. It has
- *  STILL NEVER been flashed or run on real hardware - compiling clean only
- *  proves the code is well-formed C++ against this project's pinned
- *  NimBLE-Arduino version, not that it works. All of the functional/
- *  hardware caveats below are unchanged from the original draft and still
- *  apply in full.
+ *  Same service/characteristic UUIDs as the old Bluedroid implementation
+ *  (SERVICE 0xABF0, COMMAND characteristic 0xFFE1 read/write feeding
+ *  ble_recv_command()'s queue, STATUS characteristic 0xFFE2 read/notify
+ *  written by ble_send_response()) so the phone app needed no changes.
  *
- *  REQUIRED MANUAL TESTING BEFORE TRUSTING THIS (do on the bench first,
- *  then in the car):
- *   1. Flash a USB build with ENABLE_BLE_NIMBLE=1 (see "HOW TO BUILD/TEST
- *      THIS" below) to real hardware.
- *   2. Confirm the "Freematics Controller" phone app can see the device
- *      advertising, connect, and that commands like UPTIME/BATT/VIN/ON?
- *      round-trip correctly (processBLE()'s command table in telelogger.ino
- *      is unchanged, so this is purely "does the transport work").
- *   3. Re-run the SAME heap/stability measurement that motivated this
- *      rewrite: log ESP.getFreeHeap() / ESP.getMaxAllocHeap() periodically
- *      with BLE active, and count WiFi disconnects over a comparable
- *      window (the original bad numbers with classic Bluedroid: free heap
- *      dropping to ~10-13KB, max allocatable block ~6-8KB, and repeated
- *      WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT/NO_AP_FOUND disconnects). This is
- *      the actual pass/fail criterion - "connects over BLE" alone does not
- *      prove the WiFi instability is fixed.
- *   4. Also confirm normal WiFi telemetry to the server keeps working for a
- *      real drive, not just at idle - the original problem only fully
- *      showed up under sustained operation.
- *
- *  HOW TO BUILD/TEST THIS:
- *   a. lib_deps in firmware_v5/telelogger/platformio.ini already includes
- *      h2zero/NimBLE-Arduino (pinned - see that file for the exact version
- *      and why 1.4.x rather than 2.x was chosen).
- *   b. Build with ENABLE_BLE_NIMBLE=1, e.g.:
- *        pio run -e esp32dev -D ENABLE_BLE_NIMBLE=1
- *      (or set it permanently for an env by adding -DENABLE_BLE_NIMBLE=1 to
- *      that env's build_flags in platformio.ini). ENABLE_BLE=1 must also be
- *      in effect (it is, by default) for telelogger.ino to actually call
- *      ble_init()/etc. at all - ENABLE_BLE_NIMBLE only picks WHICH
- *      implementation answers those calls, it doesn't turn BLE on by
- *      itself.
- *   c. Build + flash over USB, then follow the manual testing steps above.
- *   d. To go back to classic Bluedroid, just omit ENABLE_BLE_NIMBLE (or set
- *      it to 0) and rebuild - no other change needed.
- *
- * ----------------------------------------------------------------------------
- *  WHICH NimBLE OPTION, AND WHY
- * ----------------------------------------------------------------------------
- *  Two options were investigated:
- *
- *  (1) ESP-IDF's own NimBLE host (CONFIG_BT_NIMBLE_ENABLED, a Kconfig-level
- *      swap of the Bluetooth HOST stack, keeping Bluedroid's controller-side
- *      code out of the picture) - REJECTED. The pinned platform
- *      (espressif32 @ 6.5.0 -> arduino-esp32 core 2.0.17) ships PRECOMPILED
- *      static libs (tools/sdk/esp32/lib/libbt.a and friends), not ESP-IDF
- *      source rebuilt from this project's sdkconfig. The sdkconfig baked
- *      into that prebuilt lib says CONFIG_BT_BLUEDROID_ENABLED=y and
- *      # CONFIG_BT_NIMBLE_ENABLED is not set, with no per-project
- *      PlatformIO knob that flips a setting baked into an already-compiled
- *      .a file - doing this for real would mean rebuilding arduino-esp32's
- *      entire IDF component set from source with a different sdkconfig, a
- *      framework-packaging-level change, not something available from this
- *      repo's platformio.ini.
- *
- *  (2) h2zero/NimBLE-Arduino (a full Arduino-API-shaped BLE library
- *      implemented on top of the NimBLE host, installable as a normal
- *      PlatformIO lib_dep, requiring NO framework rebuild) - CHOSEN, by
- *      elimination as much as by merit: it's the only one of the two that
- *      is actually usable from this project without a framework-level
- *      rebuild. It also happens to be the standard, widely-used way people
- *      get NimBLE's smaller RAM footprint on off-the-shelf arduino-esp32
- *      installs, so it's a well-trodden path, not an exotic one.
- *
- *  This file is therefore a real rewrite of ble_spp_server.c's GATT-server
- *  logic against NimBLE-Arduino's BLEDevice/BLEServer/BLECharacteristic
- *  API, not a config flip.
- *
- * ----------------------------------------------------------------------------
- *  WHAT THIS FILE REPLICATES FROM THE ORIGINAL, AND WHAT IT DELIBERATELY
- *  DOESN'T
- * ----------------------------------------------------------------------------
- *  Original ble_spp_server.c's SPP_IDX_NB attribute table nominally
- *  declares FOUR characteristics (command, status, data-receive, data-
- *  notify) but the data-receive/data-notify pair is wrapped in `#if 0` and
- *  was never actually created in the live GATT table - only the SERVICE
- *  (UUID 0xABF0), COMMAND characteristic (UUID 0xFFE1, read/write, feeds
- *  ble_recv_command()'s queue) and STATUS characteristic (UUID 0xFFE2,
- *  read/notify, what ble_send_response() writes to) were ever live. This
- *  file replicates exactly that live surface - same service/characteristic
- *  UUIDs (kept as plain 16-bit values via BLEUUID((uint16_t)0x....), which
- *  expand to the same standard Bluetooth-Base 128-bit UUID the original's
- *  ESP_UUID_LEN_16 attributes did, so the existing "Freematics Controller"
- *  phone app should see the same service/characteristics without any app-
- *  side change) - same two live characteristics, same queue-based command
- *  hand-off, same "drop oldest on overflow" queue behaviour.
- *
- *  Known, deliberate deviations from the original (flagged, not hidden):
- *   - No artificial ~20-byte command-length ceiling. The original's GATT
- *     table declared SPP_COMMAND_VAL with max length SPP_CMD_MAX_LEN (20
- *     bytes) - actually smaller than some real commands processBLE() in
- *     telelogger.ino accepts (e.g. "OTA_TOKEN=<64 hex chars>" is 74+ bytes),
- *     and the original's ESP_GATTS_WRITE_EVT handler's `is_prep==true`
- *     branch (BLE "prepared/long write") only logs, never actually
- *     reassembles multi-part writes into one buffer - so long commands were
- *     very likely already broken/truncated over BLE before this rewrite.
- *     NimBLE-Arduino characteristics don't impose that pre-sized ceiling by
- *     default (bounded instead by CONFIG_BT_NIMBLE_ATT_MAX_LEN, default
- *     512), so this file incidentally may or may not fix that pre-existing
- *     limitation - UNVERIFIED either way, not the point of this rewrite,
- *     just noting the behavioural difference exists.
- *   - ble_send_response()/ble_send() check `getConnectedCount() > 0` before
- *     calling notify(). The original called esp_ble_gatts_send_indicate()
- *     unconditionally (relying on a stale spp_conn_id/spp_gatts_if to make
- *     it a silent no-op when nothing is connected). This guard is meant to
- *     be equivalent-or-safer, not a functional change, but it is an
- *     unverified assumption about NimBLE's notify() behaviour when called
- *     with zero connected peers.
- *   - ble_send(SPP_IDX_SPP_DATA_NTY_VAL, ...) is a documented no-op here.
- *     In the original, calling ble_send() with that index against the
- *     never-created data-notify characteristic would have hit
- *     find_char_and_desr_index() returning 0xff and then indexed
- *     spp_handle_table[0xff] - almost certainly a latent bug/undefined
- *     table read in the original that was never triggered because nothing
- *     calls ble_send() with that index today. This file chooses to no-op
- *     safely instead of reproducing that bug. Irrelevant in practice since
- *     no current caller uses this path, but flagged for completeness.
- *   - Advertising interval (setMinInterval/setMaxInterval below) is set to
- *     numerically match the original's spp_adv_params (adv_int_min=0x20,
- *     adv_int_max=0x40, both in 0.625 ms units).
- *
- * ----------------------------------------------------------------------------
- *  REAL UNCERTAINTY / RISK (read before trusting this)
- * ----------------------------------------------------------------------------
- *   - LIBRARY API VERSION: platformio.ini pins h2zero/NimBLE-Arduino to a
- *     1.4.x release deliberately - that's the last line that keeps the
- *     "classic" API this file uses (global BLEDevice/BLEServer/BLEService/
- *     BLECharacteristic/BLECharacteristicCallbacks/BLEServerCallbacks
- *     names, callback signature `onWrite(BLECharacteristic*)` with no extra
- *     connection-info parameter). h2zero's library later (2.x releases)
- *     renamed most classes with an Nim prefix (NimBLEDevice, NimBLEServer,
- *     NimBLECharacteristic, ...) and changed callback signatures to take an
- *     added `NimBLEConnInfo&` parameter, targeting IDF 5.x/arduino-esp32
- *     3.x - a different platform pin than this project's (espressif32 @
- *     6.5.0 -> arduino-esp32 2.0.17 -> IDF 4.4.x). If the lib_deps pin is
- *     ever bumped into the 2.x line, this file will need small, mostly
- *     mechanical renames (BLEDevice -> NimBLEDevice etc., callback
- *     signatures) - do not bump the pin without re-testing compilation.
- *   - PSRAM: BOARD_HAS_PSRAM=1 is set for this board, but the BT controller
- *     (regardless of Bluedroid vs NimBLE host) does DMA out of internal
- *     DRAM - PSRAM does not directly offload BLE controller/host buffers on
- *     the classic ESP32 (single-core radio DMA constraint). So switching to
- *     NimBLE should shrink the HOST-side static/heap footprint substantially
- *     (commonly cited as roughly half-to-a-third of Bluedroid's, though the
- *     exact number depends on config), but PSRAM presence is not expected
- *     to change that math - this is stated from general ESP32 BLE
- *     architecture knowledge, not something independently re-measured for
- *     this exact library/version here. The heap-comparison test in step 3
- *     above is what actually settles it for this device.
- *   - Coexistence with WiFi: NimBLE is expected to help specifically
- *     because its host-side RAM use is smaller, leaving more free internal
- *     DRAM for WiFi/mbedTLS - but BLE and WiFi still share the same 2.4 GHz
- *     radio time-division on ESP32 either way; if any of the original
- *     instability was RF/coexistence-scheduling related rather than purely
- *     heap-starvation related, NimBLE alone may not fully fix it. That's an
- *     inference, not a certainty - worth watching for during step 3/4
- *     testing.
- *   - Further RAM tuning available but NOT applied here (would require
- *     build_flags changes the user should make deliberately, after
- *     confirming the basic swap works): NimBLE-Arduino exposes its own
- *     compile-time config via build_flags, e.g.
- *     -DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=1,
- *     -DCONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED,
- *     -DCONFIG_BT_NIMBLE_ROLE_OBSERVER_DISABLED,
- *     -DCONFIG_BT_NIMBLE_MAX_BONDS=0 - each shrinks static allocations
- *     further for a peripheral-only, single-connection, no-bonding use case
- *     like this one. Left as a documented follow-up, not applied, so the
- *     first test is of the straightforward swap only. Note also that
- *     -DCONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED / ROLE_OBSERVER_DISABLED
- *     would need to be REMOVED again if/when the separate, not-yet-written
- *     "scan for nearby phones to auto-match drivers to trips" feature is
- *     implemented - that feature needs the BLE central/scanning role, which
- *     this file does not implement or use at all (peripheral/GATT-server
- *     role only, same as the original). That scanning feature is still
- *     completely unwritten as of this integration pass.
- *   - This file has been made to COMPILE cleanly (2026-09-21, isolated
- *     worktree, esp32dev env, ENABLE_BLE_NIMBLE=1) but has NOT been
- *     runtime- or hardware-tested at all. Compiling clean only rules out
- *     API-shape mistakes: it says nothing about GATT behaviour, timing, or
- *     the actual heap/WiFi-coexistence question this rewrite exists to
- *     answer.
+ *  h2zero/NimBLE-Arduino is pinned to the 1.4.x release line (see
+ *  platformio.ini's lib_deps comment for why - the last line with the
+ *  "classic" BLEDevice/BLEServer/BLECharacteristic API this file uses,
+ *  matching this project's arduino-esp32 2.x/IDF 4.4.x platform pin; the
+ *  2.x library line renames everything with an Nim prefix and targets
+ *  IDF 5.x/arduino-esp32 3.x - do not bump without re-adapting this file).
  */
-
-#ifndef ENABLE_BLE_NIMBLE
-#define ENABLE_BLE_NIMBLE 0
-#endif
-
-#if !ENABLE_BLE_NIMBLE
-// Inert by default. PlatformIO's Library Dependency Finder auto-compiles
-// every .c/.cpp under libraries/FreematicsPlus/utility/ for the CURRENTLY
-// BUILDING environment (esp32dev) regardless of whether anything #includes
-// this specific file - library.json for FreematicsPlus declares no
-// srcFilter, so the whole utility/ directory is in scope. If this
-// translation unit unconditionally #included <NimBLEDevice.h>, today's
-// real (Bluedroid) build would break the moment this file was added, which
-// is explicitly NOT what was asked for. Everything below only compiles when
-// ENABLE_BLE_NIMBLE is defined to a nonzero value (see config.h /
-// platformio.ini). Until then this file compiles to an empty translation
-// unit, and ble_spp_server.c (guarded the mirror-image way) provides the
-// real ble_init()/ble_send()/ble_recv_command()/ble_send_response()
-// symbols instead.
-
-#else  // ENABLE_BLE_NIMBLE
 
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
@@ -557,9 +356,7 @@ void ble_send(int spp_index, void* data, int len)
         ble_send_response(data, len, nullptr);
         return;
     }
-    // SPP_IDX_SPP_DATA_NTY_VAL and anything else: documented no-op - see
-    // header comment block above ("WHAT THIS FILE REPLICATES ... AND WHAT
-    // IT DELIBERATELY DOESN'T") for why.
+    // SPP_IDX_SPP_DATA_NTY_VAL and anything else: documented no-op - this
+    // characteristic was never created in the live GATT table, no current
+    // caller uses this index.
 }
-
-#endif // ENABLE_BLE_NIMBLE

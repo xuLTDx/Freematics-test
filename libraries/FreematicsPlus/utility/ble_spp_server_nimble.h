@@ -2,23 +2,15 @@
  * ble_spp_server_nimble.h
  *
  * ============================================================================
- *  Alternative BLE SPP server implementation, built against the
- *  h2zero/NimBLE-Arduino library instead of raw ESP-IDF Bluedroid. Selected
- *  at compile time via the ENABLE_BLE_NIMBLE macro (see config.h /
- *  platformio.ini) - OFF by default, so the classic Bluedroid path
- *  (ble_spp_server.c/.h) remains the default build output. Compiled but
- *  proven only to the extent noted in ble_spp_server_nimble.cpp's header
- *  comment - read that first. As of 2026-09-21 this has been made to
- *  compile clean in an isolated worktree (see that file's integration
- *  notes at the top) but has NOT been flashed to or tested on real
- *  hardware.
+ *  BLE SPP server implementation, built against the h2zero/NimBLE-Arduino
+ *  library. The only implementation as of 2026-09-21 - the classic
+ *  ESP-IDF Bluedroid implementation (ble_spp_server.c/.h) was removed
+ *  (dead weight, superseded by this one). Verified working on real
+ *  hardware (Freematics Controller App) 2026-09-21.
  * ============================================================================
  *
- * Drop-in-shaped alternative to ../ble_spp_server.h (SAME original file,
- * untouched, still what actually builds today by default), reimplemented
- * against the h2zero/NimBLE-Arduino library instead of raw ESP-IDF
- * Bluedroid, with the goal of a smaller RAM footprint that coexists with
- * WiFi.
+ * Reimplemented against the h2zero/NimBLE-Arduino library instead of raw
+ * ESP-IDF Bluedroid, for a smaller RAM footprint that coexists with WiFi.
  *
  * External interface preserved exactly (verified against every call site in
  * firmware_v5/telelogger/telelogger.ino and firmware_v5/datalogger/
@@ -64,10 +56,9 @@ void  ble_send_response(void* data, int len, char* ptr_to_free);
 // for the full story (why a full NimBLEDevice::deinit()/init() cycle is used
 // rather than a raw esp_bt_controller_disable()/enable(), and how GATT
 // re-registration on resume was verified against the actual NimBLE-Arduino
-// 1.4.1 source). Same interface as the Bluedroid backend
-// (ble_spp_server.h) - see that header's comment for the exact call-site
-// contract (when to call each, and the WiFi.setSleep() ordering
-// requirement).
+// 1.4.1 source. See the call-site contract (when to call each, and the
+// WiFi.setSleep() ordering requirement) at those call sites in
+// telelogger.ino/FreematicsNetwork.cpp.
 void  ble_pause(void);
 void  ble_resume(void);
 bool  ble_isPausedTooLong(uint32_t maxPauseMs);

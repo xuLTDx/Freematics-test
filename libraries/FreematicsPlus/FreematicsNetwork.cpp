@@ -10,10 +10,9 @@ on
 #include "FreematicsBase.h"
 #include "FreematicsNetwork.h"
 // Pulls in ble_pause()/ble_resume()/ble_isPausedTooLong() (and ble_init()
-// etc.) - see FreematicsPlus.h's top comment for why exactly one of
-// ble_spp_server.c / ble_spp_server_nimble.cpp actually provides these
-// symbols for a given build. Needed here (not just in telelogger.ino) so
-// ClientWIFI::begin()/setup() below can pause/resume BT around each WiFi
+// etc.) from ble_spp_server_nimble.cpp. Needed here (not just in
+// telelogger.ino) so ClientWIFI::begin()/setup() below can pause/resume BT
+// around each WiFi
 // (re)connection attempt - see the 2026-09-21 comment there.
 #include "FreematicsPlus.h"
 
@@ -96,9 +95,9 @@ bool ClientWIFI::setup(unsigned int timeout)
       // Connection attempt succeeded - safe to bring BT back now. Order
       // matters: modem sleep must already be restored BEFORE the BT
       // controller is re-enabled (see ble_pause() comment in
-      // ble_spp_server_nimble.cpp / ble_spp_server.c for why - the
-      // coexistence abort fires specifically when BOTH "BT enabled" and
-      // "WiFi modem sleep off" are true at once). ble_resume() is a no-op
+      // ble_spp_server_nimble.cpp for why - the coexistence abort fires
+      // specifically when BOTH "BT enabled" and "WiFi modem sleep off" are
+      // true at once). ble_resume() is a no-op
       // if BT was never paused (e.g. this setup() call is just polling an
       // already-connected/never-reconnected link), so this is safe to call
       // unconditionally on every successful poll, not just the first.
@@ -146,9 +145,9 @@ bool ClientWIFI::begin(const char* ssid, const char* password)
   // ARDUINO_EVENT_WIFI_STA_GOT_IP once the connection attempt is over) only
   // re-enables it AFTER WiFi.setSleep(true) has restored modem sleep - so
   // "BT enabled" and "WiFi sleep off" are never simultaneously true. See
-  // ble_pause()'s own comment in ble_spp_server_nimble.cpp / ble_spp_server.c
-  // for the exact mechanism and how it was verified against the real
-  // NimBLE-Arduino source. Idempotent/safe to call even if BLE was never
+  // ble_pause()'s own comment in ble_spp_server_nimble.cpp for the exact
+  // mechanism and how it was verified against the real NimBLE-Arduino
+  // source. Idempotent/safe to call even if BLE was never
   // started (ENABLE_BLE=0 build, or disabled at runtime via NVS).
   ble_pause();
 #ifndef ARDUINO_ESP32C3_DEV
