@@ -26,6 +26,7 @@ extern UpdateClass Update;
 #include <FreematicsPlus.h>
 #include <httpd.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/platform.h>
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
@@ -4351,6 +4352,111 @@ void printOtaStatus()
   }
 }
 
+// ---------------------------------------------------------------------------
+// installMbedtlsPsramAllocator()
+//
+// Why this exists: the precompiled mbedTLS static libs shipped with the
+// pinned `platform = espressif32 @ 6.5.0` (arduino-esp32 core 2.0.17) were
+// built with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=1 baked into their
+// sdkconfig.h (confirmed by reading
+// tools/sdk/esp32/qio_qspi/include/sdkconfig.h in the local PlatformIO
+// package cache - line 512 as of this writing). That forces every one of
+// mbedTLS's own internal allocations - most importantly each TLS session's
+// RX/TX record buffers, CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384 bytes
+// EACH direction, so ~32KB+ per active TLS session - onto the ~213KB
+// internal DRAM heap, even though this board has 8MB of PSRAM
+// (CONFIG_ESP32_SPIRAM_SUPPORT / CONFIG_SPIRAM_USE_MALLOC are both already
+// enabled in the same sdkconfig.h, and plain malloc() over 4096 bytes
+// already redirects to PSRAM automatically via
+// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 - mbedTLS just doesn't go
+// through plain malloc() for this, it has its own dedicated allocator
+// hook, which is what's pinned internal-only). Internal DRAM is also where
+// BLE/HTTPD/MEMS/OBD/WiFi buffers live and fragment it over time, so by the
+// time the OTA-pull path (performPullOtaCheck(), and WifiHTTP::open()'s
+// Guard 2) or a telemetry reconnect tries to open a new WiFiClientSecure,
+// ESP.getMaxAllocHeap() (largest contiguous free block) is often already
+// below TLS_MIN_FREE_HEAP (38KB, see FreematicsNetwork.h) - logged at every
+// call site that checks it as "Low heap (N bytes max block) ... skipping
+// TLS connect" / "restarting WiFi".
+//
+// `framework = arduino` with a precompiled platform like this cannot
+// override baked-in Kconfig values such as CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC
+// via platformio.ini/build_flags/sdkconfig edits - a PlatformIO maintainer
+// confirmed directly on the community forum that "changes to the sdkconfig
+// will have no effect" for this setup. The fix below is not a workaround
+// hack: mbedTLS exposes exactly one supported, documented runtime hook for
+// this exact situation, mbedtls_platform_set_calloc_free() (declared in
+// mbedtls/platform.h, confirmed present and callable in this build because
+// MBEDTLS_PLATFORM_MEMORY is unconditionally defined and neither
+// MBEDTLS_PLATFORM_CALLOC_MACRO nor _FREE_MACRO are defined in this port's
+// esp_config.h - those two macros are the only thing that would compile out
+// the runtime setter in favor of a compile-time-fixed pair). It is callable
+// once at startup, before any TLS use, to swap mbedTLS's own calloc/free
+// pair for a custom one - no rebuild of the precompiled libs required.
+//
+// Security tradeoff (intentionally not resolved here, flagging instead of
+// asserting): Espressif's own components/mbedtls/Kconfig help text for
+// CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC says the internal-only default exists
+// for a SECURITY reason, not a reliability one - on plain ESP32, PSRAM
+// contents are not hardware-encrypted the way flash can be with flash
+// encryption enabled, so moving TLS session buffers into PSRAM could matter
+// IF this device ever has flash/PSRAM encryption enabled. This repo was
+// searched (config.h, NVS/partition-related code, comments) for any mention
+// of flash encryption, PSRAM encryption, or secure boot and none was found
+// either way - whether encryption is enabled on the physical device has NOT
+// been investigated or confirmed here, one way or the other. If it turns
+// out to be enabled, this tradeoff should be revisited.
+//
+// Only installs the hook if PSRAM is actually present (checked once here,
+// at install time, not per-allocation) - on a board with no PSRAM this is a
+// correct no-op and mbedTLS keeps using its normal internal-heap allocator.
+// No new config flag/toggle is added: with PSRAM present (always true on
+// this device) installing the hook is safe, and without PSRAM it's a no-op,
+// so there's nothing meaningful for a runtime switch to disable.
+//
+// Must run before any TLS connection is ever attempted - i.e. before WiFi
+// connects and before the telemetry task (which itself opens the first
+// WiFiClientSecure) is created - which is why this is called from setup()
+// immediately after Serial.begin(), early enough to log the outcome but
+// before anything else in setup() touches WiFi/TLS.
+// ---------------------------------------------------------------------------
+static void *mbedtlsPsramCalloc(size_t n, size_t size)
+{
+  // heap_caps_calloc() zero-initializes like standard calloc() and handles
+  // the n*size overflow check internally, matching calloc() semantics
+  // exactly (mbedTLS relies on the zero-init guarantee in some places).
+  void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM);
+  if (!p) {
+    // PSRAM exhausted (or this allocation doesn't fit) - fall back to the
+    // normal internal-heap calloc() rather than returning NULL, which
+    // mbedTLS would otherwise treat as a hard, unrecoverable allocation
+    // failure.
+    p = calloc(n, size);
+  }
+  return p;
+}
+
+static void mbedtlsPsramFree(void *ptr)
+{
+  // In IDF, free(p) is equivalent to heap_caps_free(p) - it frees memory
+  // correctly regardless of which capability/region it was allocated from,
+  // so this single free function is correct for both the PSRAM path and the
+  // internal-calloc() fallback path above.
+  heap_caps_free(ptr);
+}
+
+void installMbedtlsPsramAllocator()
+{
+  if (ESP.getPsramSize() == 0) {
+    Serial.println("MBEDTLS:no PSRAM detected, using default internal-heap allocator");
+    return;
+  }
+  int ret = mbedtls_platform_set_calloc_free(mbedtlsPsramCalloc, mbedtlsPsramFree);
+  Serial.printf("MBEDTLS:PSRAM allocator %s (psram=%uKB)\n",
+                ret == 0 ? "installed" : "FAILED",
+                (unsigned)(ESP.getPsramSize() >> 10));
+}
+
 void setup()
 {
   // Drive the LED pin LOW immediately so that the GPIO output register
@@ -4388,6 +4494,15 @@ void setup()
 #endif
   // initialize USB serial
   Serial.begin(115200);
+
+  // Redirect mbedTLS's internal TLS-session buffer allocations to PSRAM
+  // before anything below can possibly touch WiFi/TLS (fixes the
+  // TLS_MIN_FREE_HEAP low-heap failures in the OTA-pull and telemetry-
+  // reconnect paths - see installMbedtlsPsramAllocator()'s comment above
+  // for the full root-cause writeup). Must run this early: it needs to be
+  // installed before the telemetry task is created further below, since
+  // that task is the one that actually opens the first WiFiClientSecure.
+  installMbedtlsPsramAllocator();
 
   // Set the LED to the state determined by the NVS LED_RED_EN setting loaded
   // above.  When LED_RED_EN=1 (default) the LED is driven HIGH as a visual
