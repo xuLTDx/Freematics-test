@@ -180,6 +180,39 @@ char wifiPassword2[32] = WIFI_PASSWORD2;
 // reconnect to the SAME network instead of alternating.
 uint8_t wifiCurrentIdx = 0;
 
+// --- Adaptive network preference (2026-09-21) -------------------------
+// Confirmed live at the user's home: wifiConnect() below used to
+// unconditionally XOR-alternate between wifiSSID/wifiSSID2 on every single
+// call, regardless of which one actually worked last. At home, wifiSSID2
+// (uLTD_ext, only in range at the workplace) is never reachable, so every
+// OTHER (re)connect attempt was guaranteed to fail with NO_AP_FOUND -
+// wasted airtime/battery and needlessly fell back to cellular half the
+// time even though wifiSSID (NTLIRIS) was right there and working.
+//
+// Fix: remember which network last actually reached
+// ARDUINO_EVENT_WIFI_STA_GOT_IP (onWifiEvent() below sets wifiPreferredIdx/
+// resets wifiPreferredFails there) and prefer trying that one first. Only
+// after WIFI_PREFERRED_FAIL_THRESHOLD consecutive failed attempts on the
+// preferred network does wifiConnect() fall back to the old strict
+// alternation between both configured networks - covering the case where
+// the device genuinely has moved to the other location. Deliberately just
+// three small scalars, not a growing list/log - and does NOT persist
+// across a power cycle (no NVS write).
+//
+// wifiPreferredIdx: network to try first on the next wifiConnect() call.
+uint8_t wifiPreferredIdx = 0;
+// wifiPreferredFails: consecutive times wifiPreferredIdx has been attempted
+// (via wifiConnect()) without succeeding by the time wifiConnect() was
+// called again - since wifiConnect() is only ever called while NOT
+// currently connected (see its call sites), being called again always
+// means the previous attempt did not result in a live connection.
+uint8_t wifiPreferredFails = 0;
+// wifiLastAttemptIdx: which network the most recent wifiConnect() call
+// attempted, so the NEXT call can tell whether to count that as a failure
+// of wifiPreferredIdx. 0xFF = no attempt yet this boot (nothing to count).
+uint8_t wifiLastAttemptIdx = 0xFF;
+#define WIFI_PREFERRED_FAIL_THRESHOLD 3 /* consecutive fails before trying the alternate network first */
+
 // Tries the two configured WiFi networks in turn: each call to this function
 // (which only happens when the device is NOT currently connected Ã¢â‚¬â€ see the
 // call sites) alternates which network it attempts, so if the primary
@@ -271,17 +304,43 @@ void wifiConnect()
     WiFi.onEvent(onWifiEvent);
     wifiScanAndLog();
   }
-  static uint8_t wifiNetIdx = 0;
+
+  // Adaptive network preference (see the block above wifiCurrentIdx's
+  // declaration for the full story). wifiConnect() is only ever called
+  // while NOT currently connected (all call sites gate on
+  // !teleClient.wifi.connected() / !state.check(STATE_WIFI_CONNECTED)), so
+  // being called again always means the PREVIOUS attempt (wifiLastAttemptIdx)
+  // did not end up connected - if that was the preferred network, count one
+  // more consecutive failure. onWifiEvent() resets wifiPreferredFails to 0
+  // on the next successful GOT_IP. 0xFF = no attempt yet this boot.
+  if (wifiLastAttemptIdx != 0xFF && wifiLastAttemptIdx == wifiPreferredIdx
+      && wifiPreferredFails < 250) {
+    wifiPreferredFails++;
+  }
+
+  // Once the preferred network has failed WIFI_PREFERRED_FAIL_THRESHOLD
+  // times in a row, fall back to the old strict alternation between both
+  // configured networks (via wifiAltIdx) until one of them succeeds again -
+  // covers the device genuinely having moved to the other location.
+  static uint8_t wifiAltIdx = 0;
+  uint8_t startIdx;
+  if (wifiPreferredFails < WIFI_PREFERRED_FAIL_THRESHOLD) {
+    startIdx = wifiPreferredIdx;
+  } else {
+    startIdx = wifiAltIdx;
+    wifiAltIdx ^= 1; // next fallback call (if this SSID is empty, or preferred net keeps failing) tries the other network
+  }
+
   const char* ssid = "";
   const char* pass = "";
   for (int tries = 0; tries < 2; tries++) {
-    uint8_t thisIdx = wifiNetIdx;
-    ssid = thisIdx == 0 ? wifiSSID : wifiSSID2;
-    pass = thisIdx == 0 ? wifiPassword : wifiPassword2;
-    wifiNetIdx ^= 1; // next call (if this SSID is empty, or next retry) tries the other network
-    if (ssid[0]) { wifiCurrentIdx = thisIdx; break; }
+    uint8_t thisIdx = (tries == 0) ? startIdx : (startIdx ^ 1);
+    const char* s = thisIdx == 0 ? wifiSSID : wifiSSID2;
+    const char* p = thisIdx == 0 ? wifiPassword : wifiPassword2;
+    if (s[0]) { ssid = s; pass = p; wifiCurrentIdx = thisIdx; break; }
   }
   if (!ssid[0]) return; // neither network configured
+  wifiLastAttemptIdx = wifiCurrentIdx;
   Serial.print("WIFI:");
   Serial.println(ssid);
   teleClient.wifi.begin(ssid, pass);
@@ -685,6 +744,14 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
     // is safe to call on every GOT_IP, not just the first.
     WiFi.setSleep(true);
     ble_resume();
+    // Adaptive network preference (Problem 1 fix, see the block above
+    // wifiCurrentIdx's declaration): the network that just got an IP
+    // becomes the preferred one for the next wifiConnect() call, with the
+    // failure streak reset - wifiCurrentIdx was set synchronously by
+    // wifiConnect() right before it called teleClient.wifi.begin(), so it
+    // reflects whichever network this GOT_IP event is actually for.
+    wifiPreferredIdx = wifiCurrentIdx;
+    wifiPreferredFails = 0;
   }
 }
 
@@ -2307,7 +2374,31 @@ void telemetry(void* inst)
         lastRssiTime = millis();
 
 #if ENABLE_WIFI
-        if ((wifiSSID[0] || wifiSSID2[0]) && !state.check(STATE_WIFI_CONNECTED) && !teleClient.wifi.connected()) {
+        // Problem 2 fix (2026-09-21): retry WiFi periodically even while
+        // already successfully connected via cellular, so the device can
+        // hand back over to WiFi once back in range, without waiting for a
+        // full outage/reboot. This call still goes through wifiConnect() ->
+        // teleClient.wifi.begin() -> ClientWIFI::begin(), the same
+        // ble_pause()-wrapped path as every other WiFi (re)connect attempt -
+        // no parallel/bypassing path. Deliberately gated at
+        // WIFI_CELLULAR_RECHECK_INTERVAL (minutes), NOT this block's own
+        // SIGNAL_CHECK_INTERVAL (10s) cadence: each attempt now pauses/
+        // resumes the BT controller and runs a WiFi join handshake, both of
+        // which cost real battery on this car-12V-powered device - retrying
+        // every 10s would defeat the whole point of the BT-pause work being
+        // "occasional", not continuous. Only "no candidate network configured
+        // or connected" needed at all - the actual network scanning/join
+        // attempt itself only ever tries wifiSSID/wifiSSID2 (wifiConnect()
+        // never scans for open/unknown networks).
+        static uint32_t lastWifiCellRecheckTime = 0;
+        bool wifiRetryDue = true;
+        if (state.check(STATE_CELL_CONNECTED)) {
+          wifiRetryDue = millis() - lastWifiCellRecheckTime > (uint32_t)WIFI_CELLULAR_RECHECK_INTERVAL * 1000UL;
+        }
+        // (else: not on cellular either - e.g. transiently between
+        // connections - keep the fast retry cadence so we don't sit idle.)
+        if ((wifiSSID[0] || wifiSSID2[0]) && !state.check(STATE_WIFI_CONNECTED) && !teleClient.wifi.connected() && wifiRetryDue) {
+          if (state.check(STATE_CELL_CONNECTED)) lastWifiCellRecheckTime = millis();
           wifiConnect();
         }
 #endif
