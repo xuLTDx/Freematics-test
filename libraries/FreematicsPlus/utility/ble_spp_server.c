@@ -78,6 +78,13 @@ static bool enable_data_ntf = false;
 static bool is_connected = false;
 static esp_bd_addr_t spp_remote_bda = {0x0,};
 
+// ble_pause()/ble_resume()/ble_isPausedTooLong() state - declared here
+// (rather than next to their functions, further down) so ble_init() can set
+// ble_initialized without needing a forward declaration.
+static bool       ble_initialized      = false;
+static bool       ble_paused           = false;
+static TickType_t ble_pause_start_tick = 0;
+
 static uint16_t spp_handle_table[SPP_IDX_NB];
 
 static esp_ble_adv_params_t spp_adv_params = {
@@ -454,7 +461,86 @@ void ble_init(const char* adv_name)
     esp_ble_gatts_app_register(ESP_SPP_APP_ID);
 
     cmd_cmd_queue = xQueueCreate(4, sizeof(void*));
+    ble_initialized = true;
     return;
+}
+
+// ---------------------------------------------------------------------------
+// ble_pause() / ble_resume() / ble_isPausedTooLong()
+// ---------------------------------------------------------------------------
+// 2026-09-21: fixes the WiFi/BT coexistence boot loop documented in
+// FreematicsNetwork.cpp's ClientWIFI::begin() - WiFi.setSleep(false) (the
+// standard fix for WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT(15)/NO_AP_FOUND(201)
+// disconnects) aborts the device (coex_core_enable(): "Should enable WiFi
+// modem sleep when both WiFi and Bluetooth are enabled!!!!!!" -> abort(),
+// called from esp_bt_controller_enable()) whenever the BT controller is
+// enabled AT THE SAME TIME WiFi has modem sleep disabled - confirmed live
+// twice (Bluedroid 2026-09-20, NimBLE 2026-09-21, identical abort both
+// times). The fix: never let those two conditions overlap. ble_pause() is
+// called right before WiFi.setSleep(false)+WiFi.begin() starts a connection
+// attempt; ble_resume() is called only after WiFi.setSleep(true) has
+// restored modem sleep, once the attempt is over (success or failure/
+// timeout) - see FreematicsNetwork.cpp and telelogger.ino's onWifiEvent()/
+// wifiConnect() for the exact call sites.
+//
+// Deliberately pauses at the CONTROLLER level only (btStop()/btStart(), the
+// same esp32-hal-bt.c helpers ble_init() above already uses to bring the
+// controller up) rather than tearing down the Bluedroid HOST
+// (esp_bluedroid_disable()/deinit()) as well: btStop() only touches
+// esp_bt_controller_disable()+esp_bt_controller_deinit() (verified by
+// reading framework-arduinoespressif32's cores/esp32/esp32-hal-bt.c in this
+// project's pinned package - it does NOT call any esp_bluedroid_* function),
+// so the already-registered GATT profile/app (spp_gatts_if, spp_handle_table,
+// built once at boot by ble_init()'s esp_ble_gatts_app_register() ->
+// ESP_GATTS_REG_EVT -> esp_ble_gatts_create_attr_tab() chain) is never torn
+// down and does not need to be rebuilt on resume - only advertising needs to
+// be explicitly restarted, exactly like the existing ESP_GATTS_DISCONNECT_EVT
+// handler above already does after a normal client disconnect. This makes
+// the pause/resume cycle cheap and safely repeatable (no re-registration
+// race, no heap churn) across many WiFi reconnects per session.
+//
+// Because the controller (radio) is fully powered off while paused, any BLE
+// client (the phone app) connected at pause time is necessarily dropped -
+// there is no way around that (the radio itself goes away). This resume
+// path explicitly clears is_connected/enable_data_ntf (mirroring
+// ESP_GATTS_DISCONNECT_EVT's handler exactly) before restarting advertising,
+// since no ESP_GATTS_DISCONNECT_EVT fires on its own here (the link didn't
+// close cleanly - the controller just vanished), so that stale state can't
+// be left behind for the phone's actual reconnect to trip over.
+void ble_pause(void)
+{
+    if (!ble_initialized || ble_paused) return;
+    ESP_LOGI(GATTS_TABLE_TAG, "%s pausing BT controller for WiFi (re)connect\n", __func__);
+    if (!btStop()) {
+        ESP_LOGE(GATTS_TABLE_TAG, "%s btStop() failed - BT controller may still be enabled\n", __func__);
+        // Fall through and mark paused anyway: WiFi.setSleep(false) is about
+        // to be requested by the caller regardless, and it is safer to at
+        // least attempt the resume path later than to silently forget this
+        // pause ever happened.
+    }
+    ble_pause_start_tick = xTaskGetTickCount();
+    ble_paused = true;
+}
+
+void ble_resume(void)
+{
+    if (!ble_initialized || !ble_paused) return;
+    ESP_LOGI(GATTS_TABLE_TAG, "%s resuming BT controller after WiFi (re)connect\n", __func__);
+    if (!btStart()) {
+        ESP_LOGE(GATTS_TABLE_TAG, "%s btStart() failed - will retry on the next resume trigger\n", __func__);
+        return; // leave ble_paused true so a later call (or the stale-pause
+                // watchdog) tries again instead of silently losing track
+    }
+    is_connected = false;
+    enable_data_ntf = false;
+    esp_ble_gap_start_advertising(&spp_adv_params);
+    ble_paused = false;
+}
+
+bool ble_isPausedTooLong(uint32_t maxPauseMs)
+{
+    if (!ble_paused) return false;
+    return (xTaskGetTickCount() - ble_pause_start_tick) * portTICK_PERIOD_MS > maxPauseMs;
 }
 
 #endif // !ENABLE_BLE_NIMBLE

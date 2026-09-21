@@ -236,6 +236,14 @@ static NimBLEServer*         g_server     = nullptr;
 static NimBLECharacteristic* g_statusChar = nullptr;
 static QueueHandle_t         g_cmdQueue   = nullptr;
 
+// 2026-09-21: pause/resume support (see ble_pause()/ble_resume() below).
+// g_advName is saved so ble_resume() can recreate the server/advertising
+// with the same name without the caller having to pass it again.
+static char     g_advName[32]        = {0};
+static bool     g_bleInitialized     = false; // ble_init() has run at least once
+static bool     g_blePaused          = false;
+static uint32_t g_blePauseStartMs    = 0;
+
 // ---------------------------------------------------------------------------
 // Server-level connect/disconnect: original's ESP_GATTS_CONNECT_EVT /
 // ESP_GATTS_DISCONNECT_EVT handlers just tracked is_connected/spp_conn_id
@@ -302,20 +310,16 @@ class CommandCharCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
-void ble_init(const char* adv_name)
+// Builds the GATT server/service/characteristics and starts advertising.
+// Factored out of ble_init() so ble_resume() (see below) can run the exact
+// same sequence again after a pause/resume cycle, instead of duplicating it
+// - every field this touches (g_server, g_statusChar, the service/
+// characteristic objects, the advertising object) is freshly (re)created by
+// NimBLEDevice::init() having just been called, so there is never a stale
+// object left over from a previous cycle to worry about (see ble_pause()'s
+// comment for why deinit(true), not deinit(false), is used).
+static void bleCreateGattServerAndAdvertise(const char* name)
 {
-    const char* name = (adv_name && *adv_name) ? adv_name : "FreematicsPlus";
-
-    if (!g_cmdQueue) {
-        g_cmdQueue = xQueueCreate(SPP_CMD_QUEUE_DEPTH, sizeof(char*));
-        if (!g_cmdQueue) {
-            Serial.println("[BLE] command queue create failed");
-            return;
-        }
-    }
-
-    BLEDevice::init(name);
-
     g_server = BLEDevice::createServer();
     g_server->setCallbacks(new SppServerCallbacks());
 
@@ -353,6 +357,137 @@ void ble_init(const char* adv_name)
     BLEDevice::startAdvertising();
 
     Serial.printf("[BLE] NimBLE SPP-like server '%s' advertising\n", name);
+}
+
+void ble_init(const char* adv_name)
+{
+    const char* name = (adv_name && *adv_name) ? adv_name : "FreematicsPlus";
+    strncpy(g_advName, name, sizeof(g_advName) - 1);
+    g_advName[sizeof(g_advName) - 1] = 0;
+
+    if (!g_cmdQueue) {
+        g_cmdQueue = xQueueCreate(SPP_CMD_QUEUE_DEPTH, sizeof(char*));
+        if (!g_cmdQueue) {
+            Serial.println("[BLE] command queue create failed");
+            return;
+        }
+    }
+
+    BLEDevice::init(name);
+    bleCreateGattServerAndAdvertise(name);
+    g_bleInitialized = true;
+}
+
+// ---------------------------------------------------------------------------
+// ble_pause() / ble_resume() / ble_isPausedTooLong()
+// ---------------------------------------------------------------------------
+// 2026-09-21: fixes the WiFi/BT coexistence boot loop documented in
+// FreematicsNetwork.cpp's ClientWIFI::begin() - WiFi.setSleep(false) (the
+// standard fix for WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT(15)/NO_AP_FOUND(201)
+// disconnects) aborts the device (coex_core_enable(): "Should enable WiFi
+// modem sleep when both WiFi and Bluetooth are enabled!!!!!!" -> abort(),
+// called from esp_bt_controller_enable()) whenever the BT controller is
+// enabled AT THE SAME TIME WiFi has modem sleep disabled - confirmed live
+// twice (Bluedroid 2026-09-20, NimBLE 2026-09-21, identical abort both
+// times, same underlying esp_bt_controller_enable() either way). The fix:
+// never let those two conditions overlap. ble_pause() is called right
+// before WiFi.setSleep(false)+WiFi.begin() starts a connection attempt;
+// ble_resume() is called only after WiFi.setSleep(true) has restored modem
+// sleep, once the attempt is over (success or failure/timeout) - see
+// FreematicsNetwork.cpp and telelogger.ino's onWifiEvent()/wifiConnect()
+// for the exact call sites.
+//
+// WHY A FULL NimBLEDevice::deinit(true)/init() CYCLE, NOT A LIGHTER OPTION -
+// verified against the actual pinned NimBLE-Arduino 1.4.1 source
+// (.pio/libdeps/esp32dev/NimBLE-Arduino/src/, fetched into this worktree by
+// a real `pio run` and read directly, not guessed):
+//  - A raw esp_bt_controller_disable()/enable() call (bypassing
+//    NimBLEDevice entirely, mirroring what the Bluedroid backend's
+//    btStop()/btStart() do) was considered and rejected: NimBLE's host
+//    (nimble_port task) owns a continuous HCI transport to the controller
+//    (esp_nimble_hci_init(), only torn down by
+//    esp_nimble_hci_and_controller_deinit() inside NimBLEDevice::deinit())
+//    that Bluedroid's host does not have in the same form - whether the
+//    nimble host task detects and cleanly recovers from the controller
+//    being yanked out from under it without going through that same
+//    deinit path is genuinely unverified from source (would need to trace
+//    into the closed-over esp_nimble_hci/nimble_port transport internals,
+//    not part of this library's own source), and a hang in the host task
+//    is a worse failure mode than a clean, well-understood crash - so this
+//    option was not taken.
+//  - NimBLEDevice::deinit(false) (clearAll=false, keeps g_server/advertising
+//    objects alive) was also considered, since NimBLEDevice::init() called
+//    again afterward re-inits the controller+host cleanly as a matched
+//    pair (verified: NimBLEDevice.cpp's init() blocks in a `while(!m_synced)`
+//    spin until the freshly re-created nimble_port host resyncs with the
+//    controller before returning, so by the time ble_resume() below calls
+//    anything else, the new host instance is confirmed live). BUT: this
+//    was rejected because NimBLEServer::m_gattsStarted (set true the first
+//    time NimBLEAdvertising::start() auto-calls pServer->start(), see
+//    NimBLEAdvertising.cpp line ~405) is never reset by deinit(false)/
+//    init(), so NimBLEAdvertising::start()'s own
+//    `if(!pServer->m_gattsStarted) pServer->start();` guard would
+//    incorrectly skip re-running ble_gatts_start()/ble_gatts_add_svcs() on
+//    the freshly reinitialized (and therefore GATT-table-EMPTY) host
+//    instance - the device would advertise, but a phone connecting would
+//    find no service/characteristics at all. m_gattsStarted is a private
+//    NimBLEServer member (NimBLEServer.h) with no public reset API, so
+//    there is no clean way to correct this without relying on an
+//    unexported implementation detail.
+//  - Chosen instead: NimBLEDevice::deinit(true) (clearAll=true) on pause,
+//    which - per NimBLEDevice.cpp's deinit() - additionally deletes
+//    g_server and the advertising object (verified: their destructors walk
+//    down and delete every owned NimBLEService/NimBLECharacteristic/
+//    callback object too, e.g. NimBLEServer::~NimBLEServer() deletes each
+//    entry in m_svcVec and, via m_deleteCallbacks, the server callbacks
+//    object), then ble_resume() calls NimBLEDevice::init() followed by the
+//    SAME bleCreateGattServerAndAdvertise() helper ble_init() itself uses -
+//    i.e. resume is not a special/lighter path, it is a literal re-run of
+//    first-boot init against the freshly (re)created controller+host. This
+//    guarantees a brand-new NimBLEServer object (m_gattsStarted starts
+//    false in its constructor - NimBLEServer.cpp line ~44) every time, so
+//    NimBLEAdvertising::start()'s auto-start-server guard behaves exactly
+//    as it did at first boot and genuinely re-registers the GATT table on
+//    the new host instance. Slightly more heap churn per pause/resume cycle
+//    (fresh NimBLEServer/NimBLEService/NimBLECharacteristic/callback
+//    objects each time, old ones cleanly deleted by deinit(true) - no
+//    leak) in exchange for not depending on any private/unexported library
+//    state. Given WiFi (re)connect attempts are not a tight loop (seconds
+//    apart at the very least), this trade is the right one here.
+//
+// Because the controller (and, with it, the whole NimBLE host+GATT server)
+// is fully torn down while paused, any BLE client (the phone app) connected
+// at pause time is necessarily dropped - there is no way around that (the
+// radio itself goes away). This is the one piece that could NOT be verified
+// without real hardware: the reasoning above establishes that ble_resume()
+// rebuilds an equivalent, functioning GATT server and starts advertising
+// again every single time (not just the first), but whether the phone app
+// actually notices the disconnect and reconnects cleanly on ITS side is a
+// question for the phone app / BLE stack on that end, untestable from here.
+void ble_pause()
+{
+    if (!g_bleInitialized || g_blePaused) return;
+    Serial.println("[BLE] pausing BT controller for WiFi (re)connect");
+    NimBLEDevice::deinit(true /* clearAll - see comment above for why */);
+    g_server = nullptr;
+    g_statusChar = nullptr;
+    g_blePauseStartMs = millis();
+    g_blePaused = true;
+}
+
+void ble_resume()
+{
+    if (!g_bleInitialized || !g_blePaused) return;
+    Serial.println("[BLE] resuming BT controller after WiFi (re)connect");
+    BLEDevice::init(g_advName);
+    bleCreateGattServerAndAdvertise(g_advName);
+    g_blePaused = false;
+}
+
+bool ble_isPausedTooLong(uint32_t maxPauseMs)
+{
+    if (!g_blePaused) return false;
+    return millis() - g_blePauseStartMs > maxPauseMs;
 }
 
 char* ble_recv_command(int timeout)

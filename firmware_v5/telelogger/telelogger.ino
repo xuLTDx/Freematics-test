@@ -238,8 +238,33 @@ static int32_t wifiDisconnectCount = 0;
 // Defined later (near wifiScanAndLog(), after `logger`/`state` exist).
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
+// Safety-net ceiling for ble_pause()/ble_resume() (see FreematicsNetwork.cpp's
+// ClientWIFI::begin()/setup() and ble_spp_server_nimble.cpp/ble_spp_server.c's
+// ble_pause() comment for the full WiFi/BT coexistence story). Normally
+// ble_resume() fires within WIFI_JOIN_TIMEOUT (15s) via either
+// ARDUINO_EVENT_WIFI_STA_GOT_IP below or ClientWIFI::setup()'s own
+// success/timeout paths - this is only a backstop for the one wifiConnect()
+// call site (the periodic RSSI-check block further down) that does not call
+// teleClient.wifi.setup() right after wifiConnect(), so BT can't be left
+// paused indefinitely if that path's connection attempt never resolves one
+// way or the other. Generous margin over WIFI_JOIN_TIMEOUT on purpose - this
+// is a last resort, not the normal resume path.
+#define BLE_PAUSE_MAX_MS 30000
+
 void wifiConnect()
 {
+#if ENABLE_WIFI
+  // Backstop: force BT back on if a previous pause somehow never got
+  // resumed. WiFi.setSleep(true) MUST happen before ble_resume() (same
+  // ordering requirement as every other resume call site - see
+  // ClientWIFI::begin()'s comment) so the WiFi/BT coexistence abort can't
+  // recur here either.
+  if (ble_isPausedTooLong(BLE_PAUSE_MAX_MS)) {
+    Serial.println("[WIFI] BLE pause exceeded safety timeout - forcing resume");
+    WiFi.setSleep(true);
+    ble_resume();
+  }
+#endif
   static bool scanned = false;
   if (!scanned) {
     scanned = true;
@@ -646,6 +671,20 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
       logger.logEvent(diag);
     }
 #endif
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    // Connection attempt succeeded - resume BT now rather than waiting for
+    // whichever ClientWIFI::setup() call happens to poll next. Matters most
+    // for the periodic RSSI-check wifiConnect() call site further down,
+    // which does not call setup() right after - without this, BT would stay
+    // paused until some later, unrelated setup() call happened to run.
+    // WiFi.setSleep(true) MUST come before ble_resume() (see
+    // ClientWIFI::begin()'s comment for why) - duplicated here rather than
+    // shared with ClientWIFI::setup()'s copy since this fires from a
+    // different translation unit. ble_resume() is a no-op if BT was already
+    // resumed (e.g. setup() got there first) or was never paused, so this
+    // is safe to call on every GOT_IP, not just the first.
+    WiFi.setSleep(true);
+    ble_resume();
   }
 }
 

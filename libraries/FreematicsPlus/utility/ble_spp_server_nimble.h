@@ -59,6 +59,19 @@ void  ble_send(int spp_index, void* data, int len);
 char* ble_recv_command(int timeout);
 void  ble_send_response(void* data, int len, char* ptr_to_free);
 
+// 2026-09-21: BT-controller pause/resume for the WiFi/BT coexistence fix -
+// see the comment block above their definitions in ble_spp_server_nimble.cpp
+// for the full story (why a full NimBLEDevice::deinit()/init() cycle is used
+// rather than a raw esp_bt_controller_disable()/enable(), and how GATT
+// re-registration on resume was verified against the actual NimBLE-Arduino
+// 1.4.1 source). Same interface as the Bluedroid backend
+// (ble_spp_server.h) - see that header's comment for the exact call-site
+// contract (when to call each, and the WiFi.setSleep() ordering
+// requirement).
+void  ble_pause(void);
+void  ble_resume(void);
+bool  ble_isPausedTooLong(uint32_t maxPauseMs);
+
 #ifdef __cplusplus
 }
 #endif
