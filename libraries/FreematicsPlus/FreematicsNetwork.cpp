@@ -103,14 +103,17 @@ bool ClientWIFI::begin(const char* ssid, const char* password)
   //listAPs();
   // 2026-09-20: tried WiFi.setSleep(false) here to fix WIFI_REASON_
   // 4WAY_HANDSHAKE_TIMEOUT(15)/NO_AP_FOUND(201) disconnects - reverted the
-  // same day. This device runs BLE (SPP server) alongside WiFi, and the
-  // ESP-IDF WiFi/BT coexistence layer hard-requires WiFi modem sleep to stay
-  // ON whenever BT is active ("Error! Should enable WiFi modem sleep when
-  // both WiFi and Bluetooth are enabled" -> abort() in coex_core_enable).
-  // Disabling sleep only survives until the next WiFi reconnect after BT has
-  // started (e.g. the OTA-pull low-heap reconnect path), which aborts every
-  // time - confirmed as a live boot loop. Do not re-add setSleep(false) here
-  // without also disabling/gating BLE, which is a bigger change.
+  // same day (boot loop under classic Bluedroid BT/WiFi coexistence).
+  // 2026-09-21: retried again with ENABLE_BLE_NIMBLE=1 (NimBLE instead of
+  // Bluedroid) on the theory that NimBLE's coexistence behavior would
+  // differ - it does NOT: still boot-loops, aborting right after HTTPD
+  // starts (same place, different PC than the Bluedroid crash). So this is
+  // not purely a Bluedroid-specific coexistence limitation - something
+  // about WiFi sleep=false + BT-of-any-kind enabled on this ESP-IDF/
+  // arduino-esp32 version is unsupported. Reverted again. Do not retry
+  // without first fully disabling BT (not just swapping stacks) to confirm
+  // whether ANY BT presence is the blocker, or dig into the new crash's
+  // decoded backtrace first.
 #ifndef ARDUINO_ESP32C3_DEV
   // Set TX power before begin so the full connection handshake (auth + DHCP)
   // uses this power level. 17 dBm gives reliable range without maximum
