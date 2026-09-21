@@ -38,9 +38,6 @@ extern UpdateClass Update;
 #include "nvs.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
-#if ENABLE_OLED
-#include "FreematicsOLED.h"
-#endif
 
 // 2026-09-14: __DATE__/__TIME__ are evaluated per translation unit, not once
 // for the whole firmware - dataserver.cpp has its own copy, which only
@@ -273,8 +270,8 @@ static int32_t wifiDisconnectCount = 0;
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
 // Safety-net ceiling for ble_pause()/ble_resume() (see FreematicsNetwork.cpp's
-// ClientWIFI::begin()/setup() and ble_spp_server_nimble.cpp/ble_spp_server.c's
-// ble_pause() comment for the full WiFi/BT coexistence story). Normally
+// ClientWIFI::begin()/setup() and ble_spp_server_nimble.cpp's ble_pause()
+// comment for the full WiFi/BT coexistence story). Normally
 // ble_resume() fires within WIFI_JOIN_TIMEOUT (15s) via either
 // ARDUINO_EVENT_WIFI_STA_GOT_IP below or ClientWIFI::setup()'s own
 // success/timeout paths - this is only a backstop for the one wifiConnect()
@@ -623,10 +620,6 @@ MEMS_I2C* mems = 0;
 SPIFFSLogger logger;
 #elif STORAGE == STORAGE_SD
 SDLogger logger;
-#endif
-
-#if ENABLE_OLED
-OLED_SH1106 oled;
 #endif
 
 State state;
@@ -1376,9 +1369,6 @@ void initialize()
     if (obd.init()) {
       Serial.println("OBD:OK");
       state.set(STATE_OBD_READY);
-#if ENABLE_OLED
-      oled.println("OBD OK");
-#endif
     } else {
       Serial.println("OBD:NO");
       //state.clear(STATE_WORKING);
@@ -1517,10 +1507,6 @@ void initialize()
       Serial.print("DTC:");
       Serial.println(dtcCount);
     }
-#if ENABLE_OLED
-    oled.print("VIN:");
-    oled.println(vin);
-#endif
   }
 #endif
 
@@ -1530,17 +1516,6 @@ void initialize()
   lastMotionTime = millis();
   state.set(STATE_WORKING);
 
-#if ENABLE_OLED
-  delay(1000);
-  oled.clear();
-  oled.print("DEVICE ID: ");
-  oled.println(devid);
-  oled.setCursor(0, 7);
-  oled.print("Packets");
-  oled.setCursor(80, 7);
-  oled.print("KB Sent");
-  oled.setFontSize(FONT_SIZE_MEDIUM);
-#endif
 }
 
 void showStats()
@@ -1561,14 +1536,6 @@ void showStats()
   Serial.print(" KB/h");
 
   Serial.println();
-#if ENABLE_OLED
-  oled.setCursor(0, 2);
-  oled.println(timestr);
-  oled.setCursor(0, 5);
-  oled.printInt(teleClient.txCount, 2);
-  oled.setCursor(80, 5);
-  oled.printInt(teleClient.txBytes >> 10, 3);
-#endif
 }
 
 bool waitMotion(long timeout)
@@ -1936,6 +1903,19 @@ void process()
   }
 #endif
 
+  // 2026-09-21: with ENABLE_MEMS=0 (see config.h/platformio.ini history for
+  // why), lastMotionTime never updates from real motion at all, so
+  // `motionless` grows unboundedly from boot regardless of context - the
+  // device would standby on a schedule even while sitting on a USB-powered
+  // bench being actively worked on. USB power reads far below real vehicle
+  // system voltage (12V nominal, ~9V+ even on a weak/discharged battery)
+  // via the same batteryVoltage reading used for JUMPSTART_VOLTAGE below -
+  // treat anything under this as "not actually in a vehicle right now" and
+  // never enter standby, regardless of the stationary timer.
+  if (batteryVoltage > 0 && batteryVoltage < 7.0f) {
+    stationary = false;
+  }
+
   if (stationary) {
     // stationery timeout
     Serial.print("Stationary for ");
@@ -1970,18 +1950,9 @@ bool initCell(bool quick = false)
   // power on network module
   if (!teleClient.cell.begin(&sys)) {
     Serial.println("[CELL] No supported module");
-#if ENABLE_OLED
-    oled.println("No Cell Module");
-#endif
     return false;
   }
   if (quick) return true;
-#if ENABLE_OLED
-    oled.print(teleClient.cell.deviceName());
-    oled.println(" OK\r");
-    oled.print("IMEI:");
-    oled.println(teleClient.cell.IMEI);
-#endif
   Serial.print("CELL:");
   Serial.println(teleClient.cell.deviceName());
   // Retry checkSIM up to 3 times; the SIM may not be ready immediately after power-on
@@ -2010,9 +1981,6 @@ bool initCell(bool quick = false)
     if (netop.length()) {
       Serial.print("Operator:");
       Serial.println(netop);
-#if ENABLE_OLED
-      oled.println(op);
-#endif
     }
 
 #if GNSS == GNSS_CELLULAR
@@ -2025,10 +1993,6 @@ bool initCell(bool quick = false)
     if (ip.length()) {
       Serial.print("[CELL] IP:");
       Serial.println(ip);
-#if ENABLE_OLED
-      oled.print("IP:");
-      oled.println(ip);
-#endif
     }
     state.set(STATE_CELL_CONNECTED);
   } else {
@@ -2038,9 +2002,6 @@ bool initCell(bool quick = false)
       if (q) *q = 0;
       Serial.print("[CELL] ");
       Serial.println(p + 7);
-#if ENABLE_OLED
-      oled.println(p + 7);
-#endif
     } else {
       Serial.print(teleClient.cell.getBuffer());
     }
@@ -2417,15 +2378,18 @@ void telemetry(void* inst)
       // returns false (no reboot yet).  The flash happens in standby().
       // For other storage: returns true when direct flash has started (reboot
       // imminent) so the caller blocks here waiting for the reboot timer.
+      // 2026-09-21: periodic timer-based polling removed per explicit
+      // decision - push (ota_push_watcher comparing the device's reported
+      // versionFw against registry.json, then Command.TYPE_CUSTOM
+      // OTA_READY) is now the ONLY trigger. otaCheckIntervalS > 0 is kept
+      // purely as the existing OTA-provisioned/enabled gate (0 = OTA
+      // disabled entirely), no longer as a timer period.
       if (otaToken[0] && otaCheckIntervalS > 0 &&
           state.check(STATE_WIFI_CONNECTED)) {
-        static uint32_t lastOtaCheckMs = 0;
-        uint32_t nowMs = millis();
         bool checkNow = s_ota_check_now;
-        if (checkNow || lastOtaCheckMs == 0 || nowMs - lastOtaCheckMs >= (uint32_t)otaCheckIntervalS * 1000UL) {
+        if (checkNow) {
           s_ota_check_now = false;
-          lastOtaCheckMs = nowMs;
-          Serial.println(checkNow ? "[OTA-PULL] Checking for firmware update (triggered)..." : "[OTA-PULL] Checking for firmware update...");
+          Serial.println("[OTA-PULL] Checking for firmware update (triggered)...");
           // Do NOT close the telemetry TLS session here.  In virtually all
           // deployments (Nabu Casa / hooks.nabu.casa) the OTA host and the
           // telemetry webhook host are the same *.ui.nabu.casa or
@@ -2707,11 +2671,6 @@ void standby()
 
   state.clear(STATE_WORKING | STATE_OBD_READY | STATE_STORAGE_READY);
   // this will put co-processor into sleep mode
-#if ENABLE_OLED
-  oled.print("STANDBY");
-  delay(1000);
-  oled.clear();
-#endif
   Serial.println("STANDBY");
   obd.enterLowPowerMode();
 
@@ -2802,21 +2761,9 @@ void showSysInfo()
     Serial.println(rtc);
   }
 
-#if ENABLE_OLED
-  oled.clear();
-  oled.print("CPU:");
-  oled.print(ESP.getCpuFreqMHz());
-  oled.print("Mhz ");
-  oled.print(getFlashSize() >> 10);
-  oled.println("MB Flash");
-#endif
 
   Serial.print("DEVICE ID:");
   Serial.println(devid);
-#if ENABLE_OLED
-  oled.print("DEVICE ID:");
-  oled.println(devid);
-#endif
   Serial.print("FW:");
   Serial.print(FIRMWARE_VERSION);
   Serial.print(" Built:");
@@ -4618,10 +4565,6 @@ void setup()
     loadConfig();
   }
 
-#if ENABLE_OLED
-  oled.begin();
-  oled.setFontSize(FONT_SIZE_SMALL);
-#endif
   // initialize USB serial
   Serial.begin(115200);
 
@@ -4747,9 +4690,6 @@ if (!state.check(STATE_MEMS_READY)) do {
     if (serverSetup(ip)) {
       Serial.print("HTTPD:");
       Serial.println(ip);
-#if ENABLE_OLED
-      oled.println(ip);
-#endif
     } else {
       Serial.println("HTTPD:NO");
     }

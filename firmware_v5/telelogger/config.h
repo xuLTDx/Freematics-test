@@ -212,7 +212,15 @@
 // motion threshold for waking up
 #define MOTION_THRESHOLD 0.4f /* vehicle motion threshold in G */
 // engine jumpstart voltage for waking up (when MEMS unavailable) 
-#define JUMPSTART_VOLTAGE 14 /* V */
+// 2026-09-21: lowered from 14V - standard automotive thresholds (not yet
+// measured against this specific vehicle's real logs, SD card retrieval
+// endpoints (/api/log, /api/data) returned empty - verify against a real
+// drive's logs once available): engine running (alternator charging)
+// typically 13.8-14.7V, resting battery 12.0-12.8V. 14V sat right at the
+// edge of alternator output and could miss a cold start / low-idle-RPM
+// charging voltage. 13.2V is comfortably above resting voltage (even a
+// weak/discharged battery ~11.8V) and comfortably below alternator output.
+#define JUMPSTART_VOLTAGE 13.2 /* V */
 // reset device after waking up
 #define RESET_AFTER_WAKEUP 1
 
@@ -262,23 +270,10 @@
 #define ENABLE_BLE 1
 #endif
 
-// Select which BLE SPP server implementation gets compiled when ENABLE_BLE
-// is on: 0 (default) = classic ESP-IDF Bluedroid (libraries/FreematicsPlus/
-// utility/ble_spp_server.c - proven, what has always shipped). 1 = the
-// h2zero/NimBLE-Arduino based alternative (ble_spp_server_nimble.cpp),
-// written to shed BLE-related heap usage - UNPROVEN on real hardware as of
-// 2026-09-21, only confirmed to compile cleanly. Only flip this for a
-// deliberate bench/test build; the default (0) must stay Bluedroid until
-// NimBLE has been verified on the device. This macro only selects the
-// implementation - it does not itself turn BLE on (see ENABLE_BLE above).
-// Note: this only affects the .ino files that include config.h. The actual
-// backend selection (FreematicsPlus.h, ble_spp_server.c/.cpp) is driven by
-// the same-named macro passed globally via platformio.ini's build_flags, so
-// the value here is a fallback/documentation default, not the sole source
-// of truth - keep both in sync if you change the default.
-#ifndef ENABLE_BLE_NIMBLE
-#define ENABLE_BLE_NIMBLE 0
-#endif
+// BLE SPP server implementation: NimBLE-Arduino (libraries/FreematicsPlus/
+// utility/ble_spp_server_nimble.cpp) - the only implementation as of
+// 2026-09-21, the old Bluedroid-based ble_spp_server.c/.h was removed
+// (dead weight once NimBLE became the sole backend).
 
 
 #endif // CONFIG_H_INCLUDED
