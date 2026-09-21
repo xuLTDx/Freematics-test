@@ -7,6 +7,23 @@
 */
 
 
+// Compile-time switch: this classic ESP-IDF Bluedroid implementation is the
+// DEFAULT and is compiled unless ENABLE_BLE_NIMBLE selects the NimBLE
+// alternative instead (see ble_spp_server_nimble.cpp, config.h,
+// platformio.ini). PlatformIO's Library Dependency Finder auto-compiles
+// every .c/.cpp under this utility/ directory for the current environment
+// regardless of which header gets #included, so both this file and
+// ble_spp_server_nimble.cpp are always translation units in every build -
+// exactly one of the two must actually define ble_init()/ble_send()/
+// ble_recv_command()/ble_send_response(), or the link step would fail with
+// duplicate symbols. This mirrors the guard in ble_spp_server_nimble.cpp
+// (which compiles to nothing unless ENABLE_BLE_NIMBLE is set).
+#ifndef ENABLE_BLE_NIMBLE
+#define ENABLE_BLE_NIMBLE 0
+#endif
+
+#if !ENABLE_BLE_NIMBLE
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -439,3 +456,5 @@ void ble_init(const char* adv_name)
     cmd_cmd_queue = xQueueCreate(4, sizeof(void*));
     return;
 }
+
+#endif // !ENABLE_BLE_NIMBLE
