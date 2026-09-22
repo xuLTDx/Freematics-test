@@ -1293,8 +1293,6 @@ void processOBD(CBuffer* buffer)
   // hardware. Single unified build/OTA target now (no more VAG/PSA split -
   // see FIRMWARE_VERSION in config.h).
 
-  int kph = obdData[0].value;
-  if (kph >= 2) lastMotionTime = millis();
 }
 #endif
 
@@ -1451,7 +1449,6 @@ bool processGPS(CBuffer* buffer)
   lastGPSLng = gd->lng;
 
   float kph = gd->speed * 1.852f;
-  if (kph >= 2) lastMotionTime = millis();
 
   if (buffer) {
     buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
@@ -1962,6 +1959,23 @@ void process()
     uint16_t v = batteryVoltage * 100;
     buffer->add(PID_BATTERY_VOLTAGE, ELEMENT_UINT16, &v, sizeof(v));
   }
+  // Standby-entry redesign (2026-09-22, replaces the old OBD/GPS-speed-based
+  // "motion" signal): a car stopped at a light with the engine idling is not
+  // "parked" - speed was the wrong proxy for that. Voltage is the correct
+  // one (matches the OVMS 12v.shutdown/12v.wakeup design already researched
+  // for this project): while the alternator is charging, voltage stays well
+  // above resting-battery level. lastMotionTime (kept as the same variable
+  // feeding the existing STATIONARY_TIME_TABLE debounce timer below - only
+  // the SIGNAL feeding it changed, not the debounce machinery itself) now
+  // updates whenever voltage is at-or-above ENGINE_OFF_VOLTAGE, i.e.
+  // "engine appears to be running (or we can't yet prove it isn't)".
+  // ENGINE_OFF_VOLTAGE is a placeholder default (typical resting 12V lead-
+  // acid battery, comfortably below JUMPSTART_VOLTAGE=13.2V to avoid
+  // flapping right at the wake threshold) - NOT yet calibrated against real
+  // drive data (no historical KEY_BATTERY readings survived tonight's DB
+  // wipes). Revisit once a real drive has logged engine-on vs engine-off
+  // voltage to Traccar.
+  if (batteryVoltage >= ENGINE_OFF_VOLTAGE) lastMotionTime = millis();
 #endif
 
 #if LOG_EXT_SENSORS
@@ -2196,7 +2210,15 @@ void process()
       // timeout, bypassing obd.readPID() which uses OBD_TIMEOUT_LONG (10 s).
       char abuf[32] = {};
       const int ret = obd.link ? obd.link->sendCommand("0100\r", abuf, sizeof(abuf), 1000) : 0;
-      if (ret <= 0) {
+      // Same USB/bench guard as the stationary-timeout branch below (2026-09-21
+      // comment) applies here too - this branch used to clear STATE_WORKING
+      // unconditionally on a dead OBD link, which is exactly what a USB/
+      // powerbank bench setup with no real ECU looks like, bypassing the
+      // guard entirely since this check runs BEFORE it. Confirmed missing
+      // 2026-09-22 - a real vehicle's system voltage never reads under 7V
+      // even key-off (resting battery), so treat sub-7V as "not in a
+      // vehicle, don't standby" here too, not just at the stationary check.
+      if (ret <= 0 && !(batteryVoltage > 0 && batteryVoltage < 7.0f)) {
         // No response: ECU is offline (ignition cut).  Enter standby now
         // without waiting for the full countdown to expire.
         Serial.println("OBD:ECU offline at standby-timer start - entering standby immediately");
@@ -2208,15 +2230,12 @@ void process()
   }
 #endif
 
-  // 2026-09-21: with ENABLE_MEMS=0 (see config.h/platformio.ini history for
-  // why), lastMotionTime never updates from real motion at all, so
-  // `motionless` grows unboundedly from boot regardless of context - the
-  // device would standby on a schedule even while sitting on a USB-powered
-  // bench being actively worked on. USB power reads far below real vehicle
-  // system voltage (12V nominal, ~9V+ even on a weak/discharged battery)
-  // via the same batteryVoltage reading used for JUMPSTART_VOLTAGE below -
-  // treat anything under this as "not actually in a vehicle right now" and
-  // never enter standby, regardless of the stationary timer.
+  // USB/bench guard (2026-09-21, still needed after the 2026-09-22 voltage-
+  // based redesign above): a genuine vehicle system voltage never reads
+  // under 7V, even key-off on a weak/discharged battery (~9V+). Anything
+  // under 7V means "not actually in a vehicle right now" (USB/powerbank
+  // bench) - never enter standby in that case, regardless of what the
+  // ENGINE_OFF_VOLTAGE-driven stationary timer above computed.
   if (batteryVoltage > 0 && batteryVoltage < 7.0f) {
     stationary = false;
   }
@@ -3079,10 +3098,12 @@ void standby()
     // Never reached: device restarts from setup() after wake-up.
   }
 
-#if ENABLE_MEMS
-  calibrateMEMS();
-  waitMotion(-1);
-#elif ENABLE_OBD
+  // Wake: voltage-only (2026-09-22, MEMS branch removed - MEMS is unused on
+  // this device, ENABLE_MEMS=0, chip not even confirmed populated - see
+  // project_freematics_one_hardware_inventory). Mirrors the standby-entry
+  // redesign above: same JUMPSTART_VOLTAGE=13.2V threshold as before, now
+  // the ONLY wake condition rather than one of three branches.
+#if ENABLE_OBD
   do {
     delay(5000);
   } while (obd.getVoltage() < JUMPSTART_VOLTAGE);
@@ -3092,9 +3113,6 @@ void standby()
   Serial.println("WAKEUP");
   sys.resetLink();
 #if RESET_AFTER_WAKEUP
-#if ENABLE_MEMS
-  if (mems) mems->end();  
-#endif
   ESP.restart();
 #endif  
   state.clear(STATE_STANDBY);

@@ -221,6 +221,14 @@
 // charging voltage. 13.2V is comfortably above resting voltage (even a
 // weak/discharged battery ~11.8V) and comfortably below alternator output.
 #define JUMPSTART_VOLTAGE 13.2 /* V */
+// 2026-09-22: standby-entry threshold (replaces the old OBD/GPS-speed-based
+// "motion" signal - a car idling at a light isn't "parked", voltage is the
+// correct proxy, not speed). Placeholder default (typical resting 12V
+// lead-acid battery, comfortably below JUMPSTART_VOLTAGE to avoid flapping
+// at the wake boundary) - NOT yet calibrated against this vehicle's real
+// KEY_BATTERY data in Traccar (none survived tonight's DB wipes). Revisit
+// once a real drive has logged engine-on vs engine-off voltage.
+#define ENGINE_OFF_VOLTAGE 12.8 /* V */
 // reset device after waking up
 #define RESET_AFTER_WAKEUP 1
 
