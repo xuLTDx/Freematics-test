@@ -1,12 +1,136 @@
 # Freematics telelogger — firmware architecture
 
-Scope: `firmware_v5/telelogger/` (ESP32, Freematics ONE+, VW Passat B8). Covers
-how a GPS/OBD sample becomes a byte on the wire (or a line on the SD card),
-the state machine driving the whole loop, and what happens when neither
-cellular nor WiFi is available. Written 2026-09-22, verified against the
-actual code (not from memory) - see file:line references throughout.
+`firmware_v5/telelogger/` (ESP32, Freematics ONE+, VW Passat B8). Part A is
+the full firmware — every subsystem, not just the ones touched this
+session. Part B is the detailed GPS/buffer/network/SD data path (this
+session's actual debugging focus) and the WiFi/geofence design. Written
+2026-09-22, verified against the actual code — see file:line references
+throughout. Companion doc: `traccar` repo's `ARCHITECTURE_FREEMATICS.md`.
 
-## 1. Process/task tree
+## Part A — the whole firmware
+
+### A1. Every top-level function (`telelogger.ino`, declaration order)
+
+```
+setup() → loop()                         Arduino entry points
+
+initialize()          full (re-)init: sys.begin(), obd.init(), GPS begin,
+                       MEMS, bufman.init(), logger.init()+begin(), NVS load
+loadConfig()           NVS → every runtime-configurable global
+process()              ONE sample cycle: OBD → GPS → MEMS → ext inputs →
+                        fills a CBuffer slot (runs from loop(), main core)
+standby()              car-off power state — SD close, GPS off, WiFi off
+                        (unconditional), deep-sleep OR JUMPSTART_VOLTAGE
+                        polling loop until the car restarts
+telemetry(void*)       FreeRTOS task — owns WiFi/cellular, drains CBuffers,
+                        writes the SD log, runs catchUpMissedFiles()
+
+processOBD(buffer)      tiered Mode-1 PID polling (A2)
+processGPS(buffer)      GPS fix → buffer (Part B §2)
+processMEMS(buffer)     accelerometer/gyro → buffer (calibrateMEMS() once)
+processBLE(timeout)     NimBLE SPP-like service (A3)
+processExtInputs(buffer) digital/analog aux inputs on spare GPIOs
+
+wifiConnect() / wifiReconnectCurrent()   Part B §6
+syncKnownLocations() / findNearbyKnownLocation()   Part B §8
+
+initGPS() / initCell(quick)              per-subsystem bring-up
+performPullOtaCheck() / performPullOtaFlash()   pull-OTA (A5)
+catchUpMissedFiles() / sendCsvFile()     Part B §5
+
+handlerLiveData(param)  dataserver.cpp-style handler defined in the .ino
+                        (serves /api/live — see A4 for the rest)
+showStats() / showSysInfo() / printTime() / printTimeoutStats() / printOtaStatus()
+                        Serial diagnostics only
+genDeviceID(buf)        derives the device's short ID from efuse MAC
+```
+
+### A2. OBD polling (`processOBD()`, `telelogger.ino:1235`)
+
+```
+obdData[]   compile-time table of standard Mode-1 PIDs, each tagged with a
+            tier (1/2/3) — tier 1 polled every process() cycle, tier 2/3
+            polled less often via a rotating per-tier index (idx[]), so a
+            slow/rarely-needed PID doesn't steal cycles from RPM/speed.
+  → buffer->add((pid | 0x100), ELEMENT_INT32, &value, …)   // 0x100 offset
+    distinguishes "standard OBD PID N" from this firmware's own PID space
+
+vehicleObdData[]   NVS-configured EXTRA PIDs (VEHICLE_PIDS key) — vehicle-
+            specific reads (e.g. this project's VAG UDS odometer/fuel block
+            lives elsewhere, see initialize()/loadConfig() for the UDS
+            session setup) — polled one per call via a separate rotating
+            index, independent of the standard-PID tier system above.
+
+obd.errors >= MAX_OBD_ERRORS → obd.init() retried; failing that,
+STATE_OBD_READY clears and process() returns early for that cycle (OBD
+absent doesn't stall GPS/MEMS/network — each subsystem's readiness is its
+own flag, checked independently in process()).
+```
+
+### A3. BLE (`processBLE()`, NimBLE backend)
+
+A SPP-like GATT service (`ble_spp_server_nimble.cpp`) for local
+configuration/diagnostics over Bluetooth, independent of WiFi/cellular.
+**WiFi/BT coexistence**: `ble_pause()`/`ble_resume()` wrap every WiFi
+(re)connect attempt — `WiFi.setSleep(false)` is rejected by the ESP32's
+radio-coexistence layer while BLE is active, so BLE is paused for the
+duration of a WiFi join handshake and resumed after (`WiFi.setSleep(true)`
+called first, matching the same ordering used everywhere this pattern
+appears — see `ClientWIFI::begin()`'s own comment in `FreematicsNetwork.cpp`).
+
+### A4. Local HTTPD (`dataserver.cpp`, port 80)
+
+| Path | Handler | Purpose |
+|---|---|---|
+| `/api/live` | `handlerLiveData` (in `telelogger.ino`) | current sensor snapshot as JSON |
+| `/api/info` | `handlerInfo` | device ID, firmware build, uptime, … |
+| `/api/control` | `handlerControl` | `?cmd=KEY=value` — the general runtime-config write path (SSID=, WPWD=, OTA_TOKEN=, OTA_PORT=, WM_FILE=, RESET, ON/OFF, …) |
+| `/api/ota` | `handlerOTA` | local (LAN-side) firmware upload, separate from pull-OTA (A5) |
+| `/api/list` | `handlerLogList` | list `/DATA/*.CSV` file ids + sizes |
+| `/api/data` | `handlerLogData` | query a log file's samples by PID |
+| `/api/log` | `handlerLogFile` | raw file download/stream |
+| `/api/events` | `handlerLogEvents` | just the `FE,` diagnostic lines from a log file |
+| `/api/delete` | `handlerLogDelete` | `DELETE /api/delete/<id>` — remove one `/DATA/<id>.CSV` (refuses the currently-active file) |
+
+Also the fallback softAP config portal (`TELELOGGER`/`PASSWORD`,
+`192.168.4.1`) — works independent of `ENABLE_WIFI`'s station-mode setting,
+so the device is always reachable locally even with no home network
+reachable at all.
+
+### A5. Pull-OTA (`performPullOtaCheck()`/`performPullOtaFlash()`)
+
+```
+performPullOtaCheck()   GET .../ota_pull/<token>/meta.json  (WiFi or, for
+                         the meta-only diagnostic path, cellular via
+                         CellHTTP's AT+CCH*)
+  → if a newer build is available: GET .../firmware.bin
+    STORAGE_SD: streamed to /ota_fw.bin on SD + /ota_meta.txt (expected
+                size) — NOT flashed yet, returns false (no reboot).
+    other storage: flashed directly via Update.begin()/write()/end(),
+                    returns true → caller blocks for the reboot timer.
+performPullOtaFlash()   called from standby() when s_ota_pending is set
+                        (STORAGE_SD path) — applies /ota_fw.bin to flash
+                        at the next car-off transition, when the telemetry
+                        TLS heap pressure of an active drive is gone.
+```
+Real cellular firmware-transfer (not just the meta.json diagnostic) is
+explicitly deferred — see project memory.
+
+### A6. NVS configuration (`loadConfig()`, `telelogger.ino:3178`)
+
+Every runtime-tunable value is a flat NVS key read once at boot into a
+global — no structured config blob. Categories: server host/port/webhook
+path (+ cellular-specific overrides), WiFi SSID/password ×2 (build-time
+default via `wifi_secrets.py`, NVS can override live), OTA token/host/
+port/interval, standby time, deep-standby flag, OBD/LED/beep enable
+flags, geofence-WiFi known-locations (persisted separately, see Part B
+§8's `saveKnownLocationsToNvs()`), vehicle-specific extra OBD PIDs
+(`VEHICLE_PIDS`). Every key is also settable live via
+`/api/control?cmd=KEY=value` (A4) without a reflash.
+
+## Part B — GPS/buffer/network/SD data path (this session's focus)
+
+### B1. Process/task tree
 
 ```
 setup()                                     [telelogger.ino]
@@ -30,7 +154,7 @@ Two concurrent logical "tasks" matter here:
   (WiFi/cellular), drains `CBuffer` slots, and is also the one that opens/
   writes the SD log file per sample.
 
-## 2. Data flow, one sample from sensor to server
+## B2. Data flow, one sample from sensor to server
 
 The mechanism that matters here isn't "GPS → buffer → send" — it's that
 **one filled `CBuffer` fans out to two independent, unconditional writers**.
@@ -131,7 +255,7 @@ state to begin with. Concretely, gap-by-gap:
   new live sample is allowed to send (§5) — so a long-outage file gets fully
   replayed, oldest-first, ahead of "now," never interleaved with live data.
 
-## 3. CBuffer / CBufferManager (`teleclient.h`, `teleclient.cpp`)
+## B3. CBuffer / CBufferManager (`teleclient.h`, `teleclient.cpp`)
 
 ```cpp
 class CBuffer {
@@ -162,7 +286,7 @@ before this could happen — dropping from the live send just means "this one
 will only reach the server via `catchUpMissedFiles()` later," not "this
 sample never gets there."
 
-## 4. State machine (`state`, `telelogger.ino:62-71`)
+## B4. State machine (`state`, `telelogger.ino:62-71`)
 
 ```
 STATE_STORAGE_READY  0x001   SD/SPIFFS mounted, logger.begin() succeeded
@@ -181,7 +305,7 @@ STATE_STANDBY          0x200   device is in standby (car off)
 actually established" (not just radio-on) — `CBuffer`s only get *sent* live
 when `STATE_NET_READY`; they always get *SD-logged* independent of this.
 
-## 5. SD store-and-forward / catch-up (`telelogger.ino:659-673`, `2462-2489`)
+## B5. SD store-and-forward / catch-up (`telelogger.ino:659-673`, `2462-2489`)
 
 ```
 wmDoneFileId   (u32, NVS key "WM_FILE")
@@ -216,7 +340,7 @@ days away from reality. Fixed by always sending both PIDs together
 (`telelogger.ino` ~line 1456-1467) — this is a firmware-only fix; already-
 written SD files predating it still lack the date field.
 
-## 6. Network layer (`TeleClientUDP`/`TeleClientHTTP`, `WifiUDP`/`CellUDP`/
+## B6. Network layer (`TeleClientUDP`/`TeleClientHTTP`, `WifiUDP`/`CellUDP`/
 `WifiHTTP`/`CellHTTP` in `FreematicsNetwork.cpp`)
 
 - **WiFi connect model (2026-09-22, corrected same day — see project memory
@@ -239,7 +363,7 @@ written SD files predating it still lack the date field.
   (`performPullOtaCheck()`), using `AT+CCH*` (not `AT+HTTP*`, confirmed
   broken on this chip) for the cellular case.
 
-## 7. Wire/CSV element format
+## B7. Wire/CSV element format
 
 Every PID travels as `<hex-pid><delimiter><value>[;<value>…]`:
 - Wire (live, `:` delimiter): `10:13244940,11:220926,A:49.079,B:19.287,…*<checksum>`
@@ -249,7 +373,7 @@ defined in `FreematicsBase.h`, both now sent (§5/§2) as of the 2026-09-22
 fix. `0x0` (PID_TIMESTAMP-adjacent — the literal key `0x0`) marks a new
 record boundary in `FreematicsProtocolDecoder.java`'s parser.
 
-## 8. Geofence-WiFi known-locations (2026-09-22 feature)
+## B8. Geofence-WiFi known-locations (2026-09-22 feature)
 
 ```cpp
 struct KnownLocation { float lat, lon, radiusM; uint8_t wifiIdx; };
@@ -292,7 +416,7 @@ stateDiagram-v2
     unconditional, geofence proximity does not change that decision.
 ```
 
-## 9. Odometer / distance PIDs sent (relevant to Traccar-side calibration)
+## B9. Odometer / distance PIDs sent (relevant to Traccar-side calibration)
 
 `case 0x1a6` (whole km, UDS/PID-normalised or GPS-distance fallback) is the
 only *absolute* odometer PID this firmware sends — see
@@ -300,7 +424,7 @@ only *absolute* odometer PID this firmware sends — see
 server turns this (or, when unavailable, GPS-integrated `KEY_TOTAL_DISTANCE`)
 into a real-world-calibrated value.
 
-## 10. Known open items (as of 2026-09-22, see project memory for detail)
+## B10. Known open items (as of 2026-09-22, see project memory for detail)
 
 - Cellular OTA with real firmware download-and-flash: diagnostic-only
   (`testCellularOtaMeta()`) confirmed working; the real streaming-flash path
