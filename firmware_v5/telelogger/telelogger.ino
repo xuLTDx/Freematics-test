@@ -2682,6 +2682,23 @@ void telemetry(void* inst)
 
       if (millis() - lastRssiTime > SIGNAL_CHECK_INTERVAL * 1000) {
 #if ENABLE_WIFI
+        // BLE pause watchdog, independent check (2026-09-22): the existing
+        // ble_isPausedTooLong() backstop (see BLE_PAUSE_MAX_MS's comment) was
+        // ONLY ever checked at the top of wifiConnect() - if WiFi connects
+        // and then stays up indefinitely, wifiConnect() is never called
+        // again, so a BLE pause that somehow never got resumed (a missed
+        // GOT_IP event, a race) would stay stuck forever, making the phone
+        // app permanently unable to connect with no self-healing path.
+        // Checked here instead, every SIGNAL_CHECK_INTERVAL (10s) - this
+        // whole block only runs inside the telemetry() task's
+        // `while (state.check(STATE_WORKING))` loop, i.e. never during
+        // standby, matching the explicit requirement that this NOT try to
+        // resume BLE while the device is deliberately powered down.
+        if (ble_isPausedTooLong(BLE_PAUSE_MAX_MS)) {
+          Serial.println("[BLE] Pause exceeded safety timeout with no wifiConnect() to catch it - forcing resume");
+          WiFi.setSleep(true);
+          ble_resume();
+        }
         // Geofence-WiFi sync retry (2026-09-22): the optimistic immediate
         // attempt at the moment WiFi connects (search s_locSynced above)
         // reliably fails that early on this hardware - retry here every
