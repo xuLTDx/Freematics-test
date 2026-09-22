@@ -1,0 +1,298 @@
+# Freematics telelogger — firmware architecture
+
+Scope: `firmware_v5/telelogger/` (ESP32, Freematics ONE+, VW Passat B8). Covers
+how a GPS/OBD sample becomes a byte on the wire (or a line on the SD card),
+the state machine driving the whole loop, and what happens when neither
+cellular nor WiFi is available. Written 2026-09-22, verified against the
+actual code (not from memory) - see file:line references throughout.
+
+## 1. Process/task tree
+
+```
+setup()                                     [telelogger.ino]
+ ├─ loadConfig()                            NVS → globals (server host, WiFi
+ │                                           creds via wifi_secrets.py at
+ │                                           build time, OTA token, …)
+ ├─ initialize()                            [telelogger.ino:1627]
+ │   ├─ sys.begin() / obd.init() / gpsBegin / mems / bufman.init()
+ │   └─ logger.init() + logger.begin()      SD/SPIFFS file open (STORAGE_SD)
+ ├─ xTaskCreatePinnedToCore(telemetry, …)   → runs telemetry() forever on
+ │                                           its own FreeRTOS task/core
+ └─ (main Arduino loop() continues driving
+     OBD/GPS/MEMS polling → process())
+```
+
+Two concurrent logical "tasks" matter here:
+- **`loop()` / `process()`** — polls OBD, GPS, MEMS; fills a `CBuffer` slot
+  with PIDs; also does the local HTTPD (`dataserver.cpp`, port 80) and the
+  standby/wake state transitions.
+- **`telemetry()`** (its own FreeRTOS task) — owns the network connection
+  (WiFi/cellular), drains `CBuffer` slots, and is also the one that opens/
+  writes the SD log file per sample.
+
+## 2. Data flow, one sample from sensor to server
+
+```
+processGPS()/OBD poll          (telelogger.ino, e.g. ~1420-1480)
+   │ gd->lat/lng/time/date, obdData[]…
+   ▼
+CBuffer* buffer = bufman.getFree()
+buffer->add(PID_x, TYPE, &value, …)         [teleclient.h/.cpp CBuffer::add()]
+   │  (raw binary: ELEMENT_HEAD{pid,type,count} + payload, packed
+   │   sequentially into a fixed BUFFER_LENGTH byte array — NOT text yet)
+   ▼
+buffer->state = BUFFER_STATE_FILLED
+   │
+   ├──────────────────────────────┬───────────────────────────────┐
+   ▼ (telelogger.ino:2150-2159,   ▼ (telelogger.ino:2879-2888,     │
+   │  runs EVERY sample,          │  telemetry() task, runs        │
+   │  unconditionally whenever    │  whenever network is up)       │
+   │  STATE_STORAGE_READY)        │                                 │
+   buffer->serialize(logger)      buffer->serialize(store)          │
+   [CBuffer::serialize() walks    [same function, same buffer -     │
+    every add()-ed element,       different CStorage subclass]      │
+    calls store.log(pid,val,…)]                                     │
+   │                              │                                 │
+   ▼                              ▼                                 │
+FileLogger::dispatch()            CStorageRAM::dispatch()           │
+ → SD.write(), CSV text           → builds "<devid>#pid:val,…*CKSUM"│
+   "<pid>,<val>\n" per line          wire packet in RAM              │
+   into /DATA/<fileid>.CSV        │                                 │
+                                   ▼                                 │
+                          teleClient.transmit(packet)                │
+                          → WifiUDP/CellUDP (or HTTP variant)        │
+                          → over the network to Traccar               │
+```
+
+**Key point (this is what "how is the SD buffer used" actually means):**
+the SD file is **not** a fallback that only activates when offline — it is
+an **always-on, continuous, parallel record** of every sample, written by
+the *same task* right after the sample enters the buffer, regardless of
+whether a live transmit succeeds that cycle. What makes it work as a
+store-and-forward buffer during an outage is a separate, later mechanism:
+**`catchUpMissedFiles()`** (§5) replays whatever SD files were never
+confirmed as fully sent, once a connection *does* come back — it doesn't
+matter whether the gap was "no WiFi", "no cellular", or both.
+
+### 2a. Exactly what happens during a total outage (neither cell nor WiFi)
+
+Nothing special is switched on — the same unconditional SD-write path from
+the diagram above just keeps running, because it was never gated on network
+state to begin with. Concretely, gap-by-gap:
+
+- **`process()` / `loop()` (main task) does not stall.** OBD/GPS polling,
+  `buffer->add()`, and `buffer->serialize(logger)` → SD write are driven
+  entirely by sensor timing, not by network state, and `telemetry()` is a
+  *separate* FreeRTOS task — a stuck network retry there cannot block the
+  main task's SD writes.
+- **`telemetry()`'s connect loop keeps retrying, blocking only itself**
+  (`telelogger.ino` ~2630-2649): with `STATE_WIFI_CONNECTED` and
+  `STATE_CELL_CONNECTED` both false, it tries cellular
+  (`initCell()`/`teleClient.connect()`) first; on failure, tries WiFi
+  (`wifiConnect()` + `teleClient.wifi.setup(WIFI_JOIN_TIMEOUT)`, ~15s cap);
+  if *that* also fails, `delay(60000 * 3)` (3 minutes — "avoid turning
+  on/off cellular module too frequently to avoid operator banning", per the
+  code's own comment) before the outer loop tries the whole sequence again.
+  During this entire 3-minute stretch, `buffer->serialize(store)` (the
+  live-transmit path) simply never runs — there is no buffer/queue of
+  "pending live packets" building up in RAM for the network side; each
+  sample either goes out live (if a session is up at that instant) or it
+  doesn't, and either way it was already written to SD moments earlier.
+- **What actually lands on the SD card, byte for byte**, is the CSV form
+  from §2/§7 — one PID per line, comma-delimited, no wire framing/checksum
+  (that only gets added for the RAM/wire form): a real excerpt from
+  `/DATA/<fileid>.CSV` looks like
+  ```
+  0,132449
+  10,132449
+  11,220926
+  A,49.079239
+  B,19.286951
+  C,531.7
+  D,0.1
+  10C,850
+  ```
+  (PID `0` = `PID_TIMESTAMP` (`FreematicsBase.h`), explicitly prepended by
+  the caller via `logger.timestamp(buffer->timestamp)` right before
+  `buffer->serialize(logger)` (`telelogger.ino` ~2158-2159) — this is what
+  lets `handlerLogData()`/the decoder's `key == 0x0` check treat it as a new
+  record's boundary; `10`/`11` = GPS time/date, `A`/`B` = lat/lon, `10C` =
+  RPM, etc. — same PID numbering as the wire format, just `,` instead of `:`
+  and no `<devid>#...*checksum` envelope, since that envelope is only
+  meaningful for addressing/integrity on the network, not for a private
+  local file).
+- **`fileid` increments once per boot**, not per outage (`SDLogger::begin()`,
+  called once from `initialize()`): it scans `/DATA` for the highest
+  existing numeric filename and opens `<highest+1>.CSV` fresh. So a single
+  multi-hour outage spanning one continuous boot session is still just ONE
+  file growing the whole time — `catchUpMissedFiles()`'s file-level
+  granularity (§5) means the "gap" is really "how many whole boot-session
+  files exist between `wmDoneFileId` and the current one," not a literal
+  clock-time gap.
+- **Recovery**: the instant `initCell()`/`teleClient.connect()` or
+  `wifiConnect()`/`teleClient.wifi.setup()` succeeds, `STATE_NET_READY`
+  goes true, `s_catchupPending` (still true from boot, or re-armed by a
+  manual `WM_FILE=` override) triggers `catchUpMissedFiles()` **before** any
+  new live sample is allowed to send (§5) — so a long-outage file gets fully
+  replayed, oldest-first, ahead of "now," never interleaved with live data.
+
+## 3. CBuffer / CBufferManager (`teleclient.h`, `teleclient.cpp`)
+
+```cpp
+class CBuffer {
+  uint32_t timestamp;      // millis() when filled
+  uint16_t offset;         // bytes used in m_data
+  uint8_t  total;          // element count
+  uint8_t  state;          // EMPTY / FILLING / FILLED / LOCKED
+  void add(pid, type, values, bytes, count=1);   // append one ELEMENT_HEAD+payload
+  void purge();                                   // reset to EMPTY
+  void serialize(CStorage& store);                 // replay all elements → store.log()
+};
+class CBufferManager {
+  CBuffer** slots;          // BUFFER_SLOTS pre-allocated, PSRAM if available
+  CBuffer* getFree();        // first EMPTY slot (or evict oldest FILLED)
+  CBuffer* getOldest();      // oldest FILLED slot, by timestamp
+  CBuffer* getNewest();      // newest FILLED slot — used by the live-send path
+  void free(CBuffer* slot);  // → back to EMPTY
+};
+```
+
+`process()` (main loop) always calls `bufman.getFree()`/fills it/marks it
+`FILLED`. `telemetry()`'s live-send path calls `bufman.getNewest()` (not
+oldest!) — meaning under load, the live wire only ever sends the **freshest**
+sample, and if several buffers back up, older ones are silently dropped from
+the live stream. They are **not** lost, though: the SD-write path
+(`buffer->serialize(logger)`, §2) already wrote every one of them to disk
+before this could happen — dropping from the live send just means "this one
+will only reach the server via `catchUpMissedFiles()` later," not "this
+sample never gets there."
+
+## 4. State machine (`state`, `telelogger.ino:62-71`)
+
+```
+STATE_STORAGE_READY  0x001   SD/SPIFFS mounted, logger.begin() succeeded
+STATE_OBD_READY      0x002   ELM327/OBD link up
+STATE_GPS_READY      0x004   GPS module powered/initialised
+STATE_MEMS_READY     0x008   accelerometer/gyro present
+STATE_NET_READY      0x010   ANY network (WiFi or cellular) has a live session
+STATE_GPS_ONLINE     0x020   GPS has produced ≥1 valid fix since power-on
+STATE_CELL_CONNECTED 0x040   cellular session specifically is up
+STATE_WIFI_CONNECTED 0x080   WiFi session specifically is up
+STATE_WORKING         0x100   telemetry() inner loop is actively running
+STATE_STANDBY          0x200   device is in standby (car off)
+```
+
+`STATE_NET_READY` is the OR of the two transport flags plus "a session is
+actually established" (not just radio-on) — `CBuffer`s only get *sent* live
+when `STATE_NET_READY`; they always get *SD-logged* independent of this.
+
+## 5. SD store-and-forward / catch-up (`telelogger.ino:659-673`, `2462-2489`)
+
+```
+wmDoneFileId   (u32, NVS key "WM_FILE")
+  highest /DATA/<id>.CSV file id CONFIRMED fully sent — advances only
+  after a file replays start-to-finish without interruption.
+s_catchupPending (bool)
+  true at every boot; catchUpMissedFiles() runs once, gating ALL live
+  sends until it returns true (fully caught up) or yields (OTA/standby).
+
+catchUpMissedFiles(CStorageRAM& replayStore):
+  upTo = fileid - 1                      // never touch the file being written now
+  for id in (wmDoneFileId+1 .. upTo):
+      sendCsvFile(replayStore, id)       // read CSV line-by-line, re-dispatch
+                                          // through the SAME wire-format path
+                                          // as a live packet (CSV "," → wire
+                                          // ":" via CStorage::log()/dispatch())
+      wmDoneFileId = id; nvs_commit()    // only after the WHOLE file sent OK
+      if s_ota_active: return false      // yield, retry this file next pass
+```
+
+This is why a mid-file interruption is safe (small re-send overlap at
+worst, per the code's own comment) and why file-level (not record-level)
+granularity was chosen — PID 0 in each CSV line is a `millis()`-relative
+value, meaningless across different boot sessions, so there is no reliable
+way to resume mid-file across a reboot anyway.
+
+**2026-09-22 bug, now fixed:** for years this file→wire replay carried
+`PID_GPS_TIME` (0x10) but never `PID_GPS_DATE` (0x11) — see §7. A file
+replayed on a *later calendar day* than it was recorded decoded server-side
+with today's date stitched onto the original time-of-day, landing hours or
+days away from reality. Fixed by always sending both PIDs together
+(`telelogger.ino` ~line 1456-1467) — this is a firmware-only fix; already-
+written SD files predating it still lack the date field.
+
+## 6. Network layer (`TeleClientUDP`/`TeleClientHTTP`, `WifiUDP`/`CellUDP`/
+`WifiHTTP`/`CellHTTP` in `FreematicsNetwork.cpp`)
+
+- **WiFi connect model (2026-09-22, corrected same day — see project memory
+  for the two intermediate designs that were tried and rejected):**
+  `wifiConnect()` tries **only** `wifiPreferredIdx` (whichever of
+  `wifiSSID`/`wifiSSID2` last reached `ARDUINO_EVENT_WIFI_STA_GOT_IP`) — no
+  alternation, no retry-the-other-network-on-failure. The *only* thing that
+  ever picks the other configured network is a real GPS geofence match
+  (`findNearbyKnownLocation()`'s `outWifiIdx`, while on cellular — see §8).
+  If the preferred network is unreachable, cellular takes over via the
+  existing separate fallback path in the main connect loop
+  (`telelogger.ino` ~2630-2649).
+- **WiFi in standby: always off**, unconditionally
+  (`WiFi.disconnect(true); WiFi.mode(WIFI_OFF)` in `standby()`), regardless
+  of geofence proximity — an idle-but-associated radio is a real parasitic
+  drain on the vehicle's 12V battery.
+- **Cellular**: SIM7670E-LNGV (confirmed hardware, NOT SIM7600E-H). Live
+  telemetry uses `PROTOCOL_UDP`. A separate, WiFi-and-cellular-both-capable
+  `CellHTTP`/`WifiHTTP` path exists only for the pull-OTA check
+  (`performPullOtaCheck()`), using `AT+CCH*` (not `AT+HTTP*`, confirmed
+  broken on this chip) for the cellular case.
+
+## 7. Wire/CSV element format
+
+Every PID travels as `<hex-pid><delimiter><value>[;<value>…]`:
+- Wire (live, `:` delimiter): `10:13244940,11:220926,A:49.079,B:19.287,…*<checksum>`
+- CSV (SD file, `,` delimiter): `10,13244940\n11,220926\n0A,49.079\n…`
+`PID_GPS_TIME = 0x10` (HHMMSS.ms), `PID_GPS_DATE = 0x11` (DDMMYY) — both
+defined in `FreematicsBase.h`, both now sent (§5/§2) as of the 2026-09-22
+fix. `0x0` (PID_TIMESTAMP-adjacent — the literal key `0x0`) marks a new
+record boundary in `FreematicsProtocolDecoder.java`'s parser.
+
+## 8. Geofence-WiFi known-locations (2026-09-22 feature)
+
+```cpp
+struct KnownLocation { float lat, lon, radiusM; uint8_t wifiIdx; };
+KnownLocation knownLocations[MAX_KNOWN_LOCATIONS];   // NVS-persisted
+uint8_t knownLocationCount;
+
+syncKnownLocations()          // GET .../ota_pull/<token>/locations.csv
+  → parses "lat,lon,radius,ssid" lines from ota_server.py (which proxies
+    Traccar's tc_business_addresses, filtered to non-empty ssid)
+  → keeps only entries whose ssid matches THIS device's own wifiSSID/
+    wifiSSID2 (never a new/unknown network)
+  → called on every successful WiFi connect (rate-limited by
+    LOC_SYNC_MIN_INTERVAL, config.h) — NOT while on cellular.
+
+findNearbyKnownLocation(lat, lon, uint8_t* outWifiIdx)
+  → haversine distance to every knownLocations[] entry; true + outWifiIdx
+    set on the first radius match.
+  → the ONLY caller (2026-09-22 final design) is the cellular WiFi-retry
+    block (telelogger.ino ~2699-2727): sets wifiPreferredIdx = outWifiIdx,
+    then wifiRetryDue = true, gating the periodic wifiConnect() attempt
+    purely on real position data — no blind timer anywhere in this path.
+  → standby() does NOT call this (see §6) — WiFi-off-in-standby is
+    unconditional, geofence proximity does not change that decision.
+```
+
+## 9. Odometer / distance PIDs sent (relevant to Traccar-side calibration)
+
+`case 0x1a6` (whole km, UDS/PID-normalised or GPS-distance fallback) is the
+only *absolute* odometer PID this firmware sends — see
+`Traccar_ARCHITECTURE_FREEMATICS.md` §"Odometer calibration" for how the
+server turns this (or, when unavailable, GPS-integrated `KEY_TOTAL_DISTANCE`)
+into a real-world-calibrated value.
+
+## 10. Known open items (as of 2026-09-22, see project memory for detail)
+
+- Cellular OTA with real firmware download-and-flash: diagnostic-only
+  (`testCellularOtaMeta()`) confirmed working; the real streaming-flash path
+  is explicitly deferred to a separate bench session.
+- `publish_ota_config.json` currently renamed `.disabled` (safety default
+  during heavy build/flash work) — re-enable only when ready to resume
+  normal auto-publish-on-build.
