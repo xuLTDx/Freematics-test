@@ -3059,6 +3059,27 @@ void standby()
   }
 #endif
 
+#if ENABLE_WIFI
+  // Geofence-WiFi (2026-09-22): one-time check against the last known GPS fix
+  // (gd still points at it here, before GPS is torn down below) - the car is
+  // stationary through the whole of standby(), so there's no need to keep GPS
+  // on or re-check periodically. Near a known location: leave WiFi as-is (no
+  // battery cost, already close to a good network for the next wake). Far
+  // from any: turn WiFi off now to protect the vehicle battery during standby;
+  // the existing wifiConnect()/reconnect logic in the main loop brings it back
+  // once standby ends, same as any other cold start.
+  if (state.check(STATE_WIFI_CONNECTED) && knownLocationCount > 0) {
+    float lastLat = gpsLat();
+    float lastLng = gpsLng();
+    if ((lastLat || lastLng) && !findNearbyKnownLocation(lastLat, lastLng, 0)) {
+      Serial.println("[WIFI] Not near known location, WiFi OFF for standby");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
+    }
+  }
+#endif
+
 #if !GNSS_ALWAYS_ON && GNSS == GNSS_STANDALONE
   if (state.check(STATE_GPS_READY)) {
     Serial.println("[GNSS] OFF");
