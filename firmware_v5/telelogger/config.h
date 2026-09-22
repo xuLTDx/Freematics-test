@@ -165,17 +165,6 @@
 #define DATA_INTERVAL_TABLE {1000, 2000, 5000} /* ms */
 #define PING_BACK_INTERVAL 900 /* seconds */
 #define SIGNAL_CHECK_INTERVAL 10 /* seconds */
-// How often to retry a WiFi connect while already successfully running on
-// cellular (see the wifiConnect() call inside the SIGNAL_CHECK_INTERVAL
-// block in telelogger.ino). Deliberately infrequent, NOT tied to
-// SIGNAL_CHECK_INTERVAL: each attempt now pauses/resumes the BT controller
-// (ble_pause()/ble_resume(), required so WiFi.setSleep(false) doesn't abort
-// via the WiFi/BT coexistence check - see ClientWIFI::begin()'s comment in
-// FreematicsNetwork.cpp) and runs a WiFi radio scan/join handshake, both of
-// which cost real battery on this car-12V-powered device. 5 minutes is
-// infrequent enough to avoid meaningfully draining the battery while parked,
-// but still notices "back in WiFi range" within a reasonable time.
-#define WIFI_CELLULAR_RECHECK_INTERVAL 300 /* seconds */
 
 // Minimum time between geofence-WiFi known-locations syncs (syncKnownLocations()
 // in telelogger.ino), even though the design trigger is "every successful WiFi

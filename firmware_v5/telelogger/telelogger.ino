@@ -2745,31 +2745,33 @@ void telemetry(void* inst)
         lastRssiTime = millis();
 
 #if ENABLE_WIFI
-        // Problem 2 fix (2026-09-21): retry WiFi periodically even while
-        // already successfully connected via cellular, so the device can
-        // hand back over to WiFi once back in range, without waiting for a
-        // full outage/reboot. This call still goes through wifiConnect() ->
+        // Geofence-gated WiFi retry while on cellular (2026-09-21 problem-2 fix,
+        // corrected 2026-09-22 to match the original stated design exactly:
+        // "po celu dobu na cell sa zbytocne wifi neskusa az ked sa vojde do
+        // okruhu business adresy" - the whole time on cellular, WiFi is NOT
+        // retried at all except when actually near a known business-address
+        // location. No blind time-based fallback: turning WiFi on when
+        // nothing is known to be in range serves no purpose and only costs
+        // battery (BT-pause + WiFi join handshake on this car-12V-powered
+        // device) - if there's no geofence data or no GPS fix to judge
+        // proximity with, the correct answer is simply "not due", not "guess
+        // via a timer". This call still goes through wifiConnect() ->
         // teleClient.wifi.begin() -> ClientWIFI::begin(), the same
-        // ble_pause()-wrapped path as every other WiFi (re)connect attempt -
-        // no parallel/bypassing path. Deliberately gated at
-        // WIFI_CELLULAR_RECHECK_INTERVAL (minutes), NOT this block's own
-        // SIGNAL_CHECK_INTERVAL (10s) cadence: each attempt now pauses/
-        // resumes the BT controller and runs a WiFi join handshake, both of
-        // which cost real battery on this car-12V-powered device - retrying
-        // every 10s would defeat the whole point of the BT-pause work being
-        // "occasional", not continuous. Only "no candidate network configured
-        // or connected" needed at all - the actual network scanning/join
-        // attempt itself only ever tries wifiSSID/wifiSSID2 (wifiConnect()
-        // never scans for open/unknown networks).
-        static uint32_t lastWifiCellRecheckTime = 0;
+        // ble_pause()-wrapped path as every other WiFi (re)connect attempt.
         bool wifiRetryDue = true;
         if (state.check(STATE_CELL_CONNECTED)) {
-          wifiRetryDue = millis() - lastWifiCellRecheckTime > (uint32_t)WIFI_CELLULAR_RECHECK_INTERVAL * 1000UL;
+          wifiRetryDue = false;
+          if (knownLocationCount > 0) {
+            float lat = gpsLat();
+            float lng = gpsLng();
+            if (lat || lng) {
+              wifiRetryDue = findNearbyKnownLocation(lat, lng, 0);
+            }
+          }
         }
         // (else: not on cellular either - e.g. transiently between
         // connections - keep the fast retry cadence so we don't sit idle.)
         if ((wifiSSID[0] || wifiSSID2[0]) && !state.check(STATE_WIFI_CONNECTED) && !teleClient.wifi.connected() && wifiRetryDue) {
-          if (state.check(STATE_CELL_CONNECTED)) lastWifiCellRecheckTime = millis();
           wifiConnect();
         }
 #endif
