@@ -1503,6 +1503,16 @@ bool processGPS(CBuffer* buffer)
 
   if (buffer) {
     buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
+    // Date (2026-09-22): PID_GPS_DATE was never sent, only PID_GPS_TIME. The
+    // server (FreematicsProtocolDecoder) defaults a position's date to "today"
+    // whenever no date field is present in the packet - fine for live traffic,
+    // but any record that sits in the SD/RAM backlog and gets transmitted on a
+    // later calendar day keeps its original GPS time with the WRONG (transmit)
+    // date stitched on, landing the fixTime on a completely different moment
+    // than when it was recorded - confirmed 2026-09-22 with backlog records
+    // from Sep 21 replayed the next morning that decoded into that afternoon's
+    // live drive window and corrupted the trip/stop reports.
+    buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &gd->date, sizeof(uint32_t));
     buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
     buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
     buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
