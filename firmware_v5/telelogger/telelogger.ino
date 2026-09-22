@@ -904,8 +904,14 @@ static void testCellularOtaMeta()
   }
   Serial.println("[CELL-OTA-TEST] send() OK, waiting for response...");
 
+  // 2026-09-22: HTTP_CONN_TIMEOUT (5s) was too short here too, same
+  // "SIMCom's documented Max Response Time is much longer than we assumed"
+  // reasoning as CCHOPEN_TIMEOUT_SIM7670 (open() first succeeded with a real
+  // 786ms handshake once that timeout was fixed, but receive() then still
+  // failed at 5s) - reuse the same 60s ceiling rather than inventing a
+  // third magic timeout constant.
   int bytes = 0;
-  char* body = otaCellClient.receive(&bytes, HTTP_CONN_TIMEOUT);
+  char* body = otaCellClient.receive(&bytes, CCHOPEN_TIMEOUT_SIM7670);
   if (!body) {
     Serial.println("[CELL-OTA-TEST] receive() FAILED (no response)");
     otaCellClient.close();

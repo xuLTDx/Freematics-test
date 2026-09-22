@@ -939,11 +939,29 @@ void CellSIMCOM::inbound()
     //   We always use session 0 (AT+CCHOPEN=0 / AT+CCHRECV=0), so matching
     //   "+CCHRECV: 0," / "+CCHRECV:0," is unambiguous and does not conflict
     //   with "+CCHRECV: DATA,0,<len>" responses (which start with "DATA").
+    // SIM7670 CCH (CCHRECVMODE=0, the default - never switched to
+    // notify-only mode=1 for this chip family): the modem autonomously
+    // pushes "+CCHRECV: DATA,<session>,<len>\r\n<payload>" WITHOUT a
+    // separate "+CCHRECV: 0,<len>" notify URC ever appearing - confirmed
+    // live 2026-09-22 that the pattern above alone left m_incoming
+    // permanently 0 even though the real response (a 144-byte HTTP/1.1 200
+    // reply) was already sitting in m_buffer. The one existing safety net
+    // for this exact gap (see CellHTTP::receive()'s own comment) is
+    // "m_state happens to become HTTP_DISCONNECTED too, from a
+    // +CCH_PEER_CLOSED: URC in the same buffer" - which only holds if the
+    // peer closes the connection right after responding. It does not hold
+    // for a deliberately kept-alive HTTP/1.1 session (this device's own
+    // OTA server keeps the connection open for TLS session reuse - see
+    // performPullOtaCheck()'s comment), so the gap was never actually
+    // exercised until now. Recognize the DATA-push form here too, matching
+    // exactly what receive() already knows how to parse from it - the
+    // absence of this line was the whole bug, not a new capability.
     // All must set m_incoming so that CellHTTP::receive() proceeds without a
     // full timeout waiting for a URC that was already buffered.
     if (strstr(m_buffer, "+IPD") || strstr(m_buffer, "RECV EVENT") ||
         strstr(m_buffer, "+CHTTPSRECV: EVENT") ||
-        strstr(m_buffer, "+CCHRECV: 0,") || strstr(m_buffer, "+CCHRECV:0,")) {
+        strstr(m_buffer, "+CCHRECV: 0,") || strstr(m_buffer, "+CCHRECV:0,") ||
+        strstr(m_buffer, "+CCHRECV: DATA,") || strstr(m_buffer, "+CCHRECV:DATA,")) {
       if (cellNetDebug) Serial.println("[CELL] Incoming data");
       m_incoming = 1;
     }
