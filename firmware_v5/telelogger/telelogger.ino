@@ -3070,23 +3070,22 @@ void standby()
 #endif
 
 #if ENABLE_WIFI
-  // Geofence-WiFi (2026-09-22): one-time check against the last known GPS fix
-  // (gd still points at it here, before GPS is torn down below) - the car is
-  // stationary through the whole of standby(), so there's no need to keep GPS
-  // on or re-check periodically. Near a known location: leave WiFi as-is (no
-  // battery cost, already close to a good network for the next wake). Far
-  // from any: turn WiFi off now to protect the vehicle battery during standby;
-  // the existing wifiConnect()/reconnect logic in the main loop brings it back
-  // once standby ends, same as any other cold start.
-  if (state.check(STATE_WIFI_CONNECTED) && knownLocationCount > 0) {
-    float lastLat = gpsLat();
-    float lastLng = gpsLng();
-    if ((lastLat || lastLng) && !findNearbyKnownLocation(lastLat, lastLng, 0)) {
-      Serial.println("[WIFI] Not near known location, WiFi OFF for standby");
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
-    }
+  // WiFi-off-in-standby (2026-09-22, corrected same day): WiFi always goes off
+  // for standby, full stop - proximity to a known location does NOT change
+  // this. An idle-but-associated WiFi radio is a meaningful parasitic drain
+  // on the vehicle's 12V battery over a long park (measured difference on
+  // this class of hardware: on the order of 29 days vs 9 months of standing
+  // time before the battery is dead) - keeping WiFi up "because a good
+  // network is nearby" defeats the entire point of standby power-saving.
+  // The existing wifiConnect()/reconnect logic in the main loop brings WiFi
+  // back once standby ends, same as any other cold start; findNearbyKnownLocation()
+  // remains available for other uses (e.g. connect-priority on wake) but is
+  // deliberately NOT consulted here.
+  if (state.check(STATE_WIFI_CONNECTED)) {
+    Serial.println("[WIFI] OFF for standby");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
   }
 #endif
 
