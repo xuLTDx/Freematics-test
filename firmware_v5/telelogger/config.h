@@ -177,6 +177,17 @@
 // but still notices "back in WiFi range" within a reasonable time.
 #define WIFI_CELLULAR_RECHECK_INTERVAL 300 /* seconds */
 
+// Minimum time between geofence-WiFi known-locations syncs (syncKnownLocations()
+// in telelogger.ino), even though the design trigger is "every successful WiFi
+// connection". Without this, a flapping WiFi connection (in/out of range while
+// driving) would open a fresh TLS session to ota_server.py on every single
+// reconnect - the same heap-fragmentation-from-repeated-TLS-teardown risk
+// documented at length at the pull-OTA check call site (WifiHTTP::open()'s
+// same-host-reuse vs different-host-teardown/rebuild distinction). Locations
+// data changes rarely (manual edits in the business-addresses UI), so staying
+// under this long enough is never actually stale in practice.
+#define LOC_SYNC_MIN_INTERVAL 1800 /* seconds */
+
 /**************************************
 * Data storage configurations
 **************************************/

@@ -511,6 +511,17 @@ bool CellSIMCOM::begin(CFreematics* device)
   return false;
 }
 
+bool CellSIMCOM::attach(CFreematics* device, CELL_TYPE type)
+{
+  if (!getBuffer()) {
+    Serial.println("[CELL] OOM: buffer allocation failed");
+    return false;
+  }
+  m_device = device;
+  m_type = type;
+  return true;
+}
+
 void CellSIMCOM::end()
 {
   setGPS(false);
@@ -1040,6 +1051,13 @@ char* CellUDP::receive(int* pbytes, unsigned int timeout)
 void CellHTTP::init()
 {
   if (m_type == CELL_SIM7670) {
+    // TEMP 2026-09-22 diagnostic: CLAC moved here, BEFORE any CSSLCFG call,
+    // to test whether CSSLCFG is what puts the AT channel into a state
+    // where CLAC/HTTPINIT then fail - see open()'s removed diagnostic.
+    sendCommand("AT+CLAC\r", 3000);
+    Serial.println("[CELL] AT+CLAC (pre-CSSLCFG) raw buffer:");
+    Serial.println(m_buffer);
+    Serial.println("[CELL] AT+CLAC (pre-CSSLCFG) raw buffer END");
     sendCommand("AT+CSSLCFG=\"sslversion\",0,4\r");
     sendCommand("AT+CSSLCFG=\"authmode\",0,0\r");
   } else if (m_type == CELL_SIM7600) {
@@ -1200,8 +1218,49 @@ bool CellHTTP::open(const char* host, uint16_t port)
       }
     }
   } else if (m_type == CELL_SIM7670) {
-    sendCommand("AT+HTTPINIT\r");
+    // TEMP 2026-09-22 diagnostic: AT+HTTPINIT unconditionally fails with
+    // plain ERROR on this exact modem/firmware (SIM7670E-LNGV V1.9.05) -
+    // dump the modem's own real supported-command list rather than guess
+    // further against unreadable scanned-PDF documentation. Remove once
+    // the real HTTP(S) AT command family for this firmware is confirmed.
+    sendCommand("AT+CLAC\r", 3000);
+    Serial.println("[CELL] AT+CLAC raw buffer:");
+    Serial.println(m_buffer);
+    Serial.println("[CELL] AT+CLAC raw buffer END");
+    // AT+HTTPINIT fails with plain ERROR ("already initialized") if the HTTP
+    // AT-command service is still open from an earlier session - confirmed
+    // live 2026-09-22 via a raw AT-traffic capture (VERBOSE_XBEE=1): the
+    // modem itself is not reset when the ESP32 is (separate MCU, power not
+    // cycled together), so a session left open by an earlier attempt (this
+    // device, or any prior use of the HTTP service) persists across ESP32
+    // resets/reflashes. The previous code never checked HTTPINIT's result at
+    // all, so every subsequent AT+HTTPPARA/AT+HTTPACTION call in send()
+    // silently proceeded against a never-initialized session and failed in
+    // turn. AT+HTTPTERM first, mirroring the CELL_SIM7600 branch's own
+    // AT+CCHSTOP-before-AT+CCHSTART pattern in init() above - its result is
+    // ignored (returns ERROR harmlessly when nothing was open, same as
+    // AT+CCHSTOP), then retry HTTPINIT once and actually check the result
+    // this time so a still-failing init is reported rather than masked.
+    sendCommand("AT+HTTPTERM\r");
+    // Confirmed live 2026-09-22: HTTPINIT still returned ERROR immediately
+    // after a successful HTTPTERM (not just "stale session from a prior
+    // attempt" - that theory alone didn't explain it). The SIM7600 CCHSTART
+    // path elsewhere in this file has documented precedent for SIMCom
+    // firmware needing a settle delay between stopping and restarting an AT
+    // service ("some SIM7600E-H firmware versions re-initialise the SSL
+    // context at CCHSTART time") - applying the same idea here as the next
+    // thing to try, since official SIMCom HTTP(S) AT documentation for this
+    // modem (A7600/A76XX application notes) was only available as scanned
+    // image PDFs with no OCR tooling in this environment to actually read.
+    delay(1000);
+    if (!sendCommand("AT+HTTPINIT\r")) {
+      Serial.println("[CELL] HTTPINIT failed");
+      m_state = HTTP_ERROR;
+      return false;
+    }
     sendCommand("AT+HTTPPARA=\"SSLCFG\",0\r");
+    m_state = HTTP_CONNECTED;
+    m_host = host;
     return true;
   } else if (m_type == CELL_SIM7600) {
     // AT+CCHOPEN uses SSL context 0 or 1 configured by init() (authmode=0,
@@ -1437,15 +1496,49 @@ bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const c
     }
   } else if (m_type == CELL_SIM7670) {
     sprintf(m_buffer, "AT+HTTPPARA=\"URL\",\"https://%s:%u%s\"\r", host, port, path);
-    if (sendCommand(m_buffer, 1000)) {
-      if (payload) {
-        sprintf(m_buffer, "AT+HTTPDATA=%u,1000\r", payloadSize);
-        sendCommand(m_buffer, 1000, "DOWNLOAD\r");
-        m_device->xbWrite(payload, payloadSize);
-        sendCommand("AT+HTTPACTION=1\r");
-      } else {
-        sendCommand("AT+HTTPACTION=0\r");
+    if (!sendCommand(m_buffer, 1000)) {
+      Serial.print("[CELL] HTTPPARA URL failed:");
+      Serial.println(m_buffer);
+      m_state = HTTP_ERROR;
+      return false;
+    }
+    bool actionOk;
+    if (payload) {
+      sprintf(m_buffer, "AT+HTTPDATA=%u,1000\r", payloadSize);
+      sendCommand(m_buffer, 1000, "DOWNLOAD\r");
+      m_device->xbWrite(payload, payloadSize);
+      actionOk = sendCommand("AT+HTTPACTION=1\r");
+    } else {
+      actionOk = sendCommand("AT+HTTPACTION=0\r");
+    }
+    // AT+HTTPACTION's own OK/ERROR only confirms the request was accepted
+    // for later async processing - it is NOT the fetch result. Check it
+    // anyway (confirmed live 2026-09-22: it can fail outright with ERROR,
+    // e.g. when open()'s AT+HTTPINIT never actually succeeded - see its own
+    // comment - in which case waiting for a completion URC that will never
+    // arrive just burns the full HTTP_TLS_HANDSHAKE_TIMEOUT for nothing).
+    if (!actionOk) {
+      Serial.println("[CELL] HTTPACTION rejected");
+      m_state = HTTP_ERROR;
+      return false;
+    }
+    // Real completion is signalled later by an unsolicited
+    // "+HTTPACTION: <method>,<statuscode>,<datalen>" URC, which can take
+    // several seconds (TLS handshake + the server's own response time) -
+    // without waiting for it here, the immediately-following receive() call
+    // (AT+HTTPHEAD/AT+HTTPREAD) runs before the fetch has finished and
+    // returns nothing. Wait for it here, using the same handshake-scale
+    // timeout as the SIM7600 CCHOPEN path, and capture the status code from
+    // it as a fallback in case HTTPHEAD's own parse fails.
+    if (sendCommand(0, HTTP_TLS_HANDSHAKE_TIMEOUT, "+HTTPACTION:")) {
+      char *p = strstr(m_buffer, "+HTTPACTION:");
+      if (p && (p = strchr(p, ','))) {
+        m_code = atoi(++p);
       }
+    } else {
+      Serial.println("[CELL] HTTPACTION completion URC timed out");
+      m_state = HTTP_ERROR;
+      return false;
     }
     return true;
   } else if (m_type == CELL_SIM7600) {

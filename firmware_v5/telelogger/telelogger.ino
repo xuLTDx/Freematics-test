@@ -415,6 +415,141 @@ uint16_t otaPort = 6001;   // OTA_PORT NVS key (u16) - matches freematics-ota's 
 // Interval between pull-OTA checks in seconds.  0 = disabled (default).
 uint16_t otaCheckIntervalS = 0;  // OTA_INTERVAL NVS key (u16)
 
+// ---------------------------------------------------------------------------
+// Geofence-based WiFi known locations (2026-09-22)
+// ---------------------------------------------------------------------------
+// A small table of Business Addresses (Traccar's tc_business_addresses,
+// shared with the Kniha jazd trip-purpose feature - see BusinessAddress.java)
+// that have a known WiFi network attached. Lets the device later recognize
+// "I'm near a place I can reach over WiFi" from GPS alone (not wired into
+// standby/connect logic yet - that's a separate, deferred step; this is just
+// the data plumbing: fetch, parse, store).
+//
+// Fetched from ota_server.py's locations.csv proxy (see that file's module
+// docstring, and BusinessAddress.java's ssid field comment, for why it's a
+// proxy through the existing per-device OTA token rather than a direct
+// Traccar login on the device) by syncKnownLocations() below.
+//
+// Deliberately stores wifiIdx (which of the device's own two configured
+// networks this location's SSID matches), not the SSID string itself -
+// syncKnownLocations() already filters to entries whose ssid equals wifiSSID
+// or wifiSSID2, since the device only ever has a password for those two
+// (WPWD=/NVS); a location naming any other SSID could never be connected to
+// anyway, so keeping it out of the table just wastes a slot.
+#define MAX_KNOWN_LOCATIONS 8
+struct KnownLocation {
+  float lat;
+  float lon;
+  float radiusM;    // meters, copied from the Business Address's own radius
+  uint8_t wifiIdx;  // 0 = wifiSSID/wifiPassword, 1 = wifiSSID2/wifiPassword2
+};
+static KnownLocation knownLocations[MAX_KNOWN_LOCATIONS];
+static uint8_t knownLocationCount = 0;
+
+#if ENABLE_WIFI
+// Persists the current knownLocations[]/knownLocationCount to NVS (LOC_N +
+// LOCS keys) so a reboot doesn't lose the table until the next sync - see
+// loadConfig()'s matching load side.
+static void saveKnownLocationsToNvs()
+{
+  nvs_set_u8(nvs, "LOC_N", knownLocationCount);
+  nvs_set_blob(nvs, "LOCS", knownLocations, knownLocationCount * sizeof(KnownLocation));
+  nvs_commit(nvs);
+}
+
+// Fetches ota_server.py's locations.csv feed and replaces the in-RAM
+// knownLocations[] table wholesale - a full refresh, not an incremental
+// merge, so a radius change or a removed/added address on the Traccar side
+// is picked up automatically on the very next sync with no separate
+// delete-handling logic needed (this was the explicit design question -
+// "co ak sa okruh zmeni v traccar, a co ak tam pribudne dalsia adresa" -
+// answered by always replacing the whole table, not patching it).
+//
+// Reuses otaWifiClient/otaHost/otaPort/otaToken: the same trust boundary,
+// server and (when the host matches) already-open TLS session as pull-OTA
+// checks. Gated on otaToken being provisioned, exactly like
+// performPullOtaCheck() - a device with pull-OTA never configured has no
+// reason to hit this endpoint either, and ota_server.py's per-device token
+// check would reject it anyway.
+//
+// Deliberately plain CSV, not JSON (see ota_server.py's module docstring
+// for why): "lat,lon,radius,ssid" one per line, no header, no quoting -
+// parsed the same hand-rolled way as performPullOtaCheck() parses
+// meta.json's flat fields (no JSON library in this codebase).
+//
+// Must only be called from the main loop() task, never from a WiFi event
+// callback (onWifiEvent() runs on the small-stack Arduino event task - a
+// TLS handshake plus this function's local buffer does not belong there).
+static void syncKnownLocations()
+{
+  if (!otaToken[0] || !otaHost[0]) return;
+  if (!WiFi.isConnected()) return;
+
+  char path[80];
+  snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/locations.csv", otaToken);
+
+  if (!otaWifiClient.open(otaHost, otaPort)) {
+    Serial.println("[LOC-SYNC] Cannot connect");
+    return;
+  }
+  if (!otaWifiClient.send(METHOD_GET, path)) {
+    Serial.println("[LOC-SYNC] send failed");
+    return;
+  }
+
+  char buf[1024];
+  int bytes = 0;
+  char* body = otaWifiClient.receive(buf, sizeof(buf) - 1, &bytes);
+  if (!body || otaWifiClient.code() != 200) {
+    Serial.printf("[LOC-SYNC] HTTP %u\n", (unsigned)otaWifiClient.code());
+    return;
+  }
+  buf[bytes < (int)sizeof(buf) - 1 ? bytes : (int)sizeof(buf) - 1] = '\0';
+  // Do NOT close the connection here - same TLS-session-reuse reasoning as
+  // performPullOtaCheck()'s meta.json fetch (see its comment).
+
+  uint8_t newCount = 0;
+  char* line = strtok(body, "\n");
+  while (line && newCount < MAX_KNOWN_LOCATIONS) {
+    // "lat,lon,radius,ssid"
+    char* latStr = line;
+    char* lonStr = strchr(latStr, ',');
+    if (!lonStr) { line = strtok(nullptr, "\n"); continue; }
+    *lonStr++ = 0;
+    char* radStr = strchr(lonStr, ',');
+    if (!radStr) { line = strtok(nullptr, "\n"); continue; }
+    *radStr++ = 0;
+    char* ssidStr = strchr(radStr, ',');
+    if (!ssidStr) { line = strtok(nullptr, "\n"); continue; }
+    *ssidStr++ = 0;
+    char* cr = strchr(ssidStr, '\r');  // defensive - server sends bare \n
+    if (cr) *cr = 0;
+
+    uint8_t wifiIdx;
+    if (wifiSSID[0] && !strcmp(ssidStr, wifiSSID)) {
+      wifiIdx = 0;
+    } else if (wifiSSID2[0] && !strcmp(ssidStr, wifiSSID2)) {
+      wifiIdx = 1;
+    } else {
+      // Not one of this device's configured networks - no password for it,
+      // so it could never actually be connected to. Skip.
+      line = strtok(nullptr, "\n");
+      continue;
+    }
+
+    knownLocations[newCount].lat = (float)atof(latStr);
+    knownLocations[newCount].lon = (float)atof(lonStr);
+    knownLocations[newCount].radiusM = (float)atof(radStr);
+    knownLocations[newCount].wifiIdx = wifiIdx;
+    newCount++;
+    line = strtok(nullptr, "\n");
+  }
+  knownLocationCount = newCount;
+  saveKnownLocationsToNvs();
+  Serial.printf("[LOC-SYNC] %u known location(s)\n", (unsigned)knownLocationCount);
+}
+#endif  // ENABLE_WIFI
+
 // live data
 String netop;
 String ip;
@@ -598,6 +733,157 @@ public:
 };
 
 FreematicsESP32 sys;
+
+// ---------------------------------------------------------------------------
+// TEMPORARY bench test (2026-09-22) - saved plan's point 1: does pull-OTA's
+// meta.json check work at all over cellular? CellHTTP already exists in the
+// library (built/hardened for TeleClientHTTP mode - see CHANGELOG.md's
+// CCHOPEN/CCHSTART fixes) but has never been wired into anything in THIS
+// build (TeleClientUDP - teleClient.cell is CellUDP, not CellHTTP). This
+// fetches meta.json only (no firmware download, no flash, no meta.json
+// "available" handling) via a SEPARATE CellHTTP object attached to the SAME
+// physical modem as the live teleClient.cell (CellUDP) session, via
+// CellSIMCOM::attach() (NOT begin() - see its comment in FreematicsNetwork.h
+// for why begin()'s power-toggle/purge/handshake are each unsafe to repeat
+// on a live modem).
+//
+// Known, accepted risk (verified by reading xbReceive()/CellHTTP::open()/
+// send() in FreematicsNetwork.cpp, not assumed): there is exactly ONE
+// physical UART and ONE driver-level RX ring buffer shared by both objects,
+// with no per-session demultiplexing at all - CellHTTP::open()/send() call
+// m_device->xbPurge() as part of their own (already proven, unmodified) AT
+// sequence on the SIM7600 path, and every sendCommand() on either object
+// drains whatever is currently queued in that one shared buffer regardless
+// of which logical session it belongs to. The modem's radio can genuinely
+// run multiple simultaneous data sessions (that part is real), but the
+// serial control link between the ESP32 and the modem - where every AT
+// command and its response travels - is one shared wire, not something
+// this library virtualizes per-object. While this test runs, an incoming
+// UDP datagram for teleClient.cell's live session (a server ACK, or even
+// another OTA_READY push) could be silently dropped. Consequence is bounded
+// and recoverable (Traccar re-delivers a queued command on the device's
+// next packet), not a session/registration loss - this is a deliberate,
+// informed bench-test tradeoff, not an oversight. Remove once cellular OTA
+// is either wired into performPullOtaCheck() for real (needing a proper
+// answer to this shared-UART question first) or shelved.
+//
+// 2026-09-22 live test found the actual modem on this device is a
+// SIM7670E-LN, not SIM7600 - CellHTTP::init()/open()/send()/receive() each
+// branch on m_type per modem family, and attach() (below) MUST be given the
+// real type (via teleClient.cell.type(), already detected by its own
+// begin()) or it silently runs the wrong AT-command dialect - confirmed
+// live: attach() without a type argument defaults to CELL_SIM7600's
+// AT+CCHOPEN family, which this SIM7670E-LN modem does not implement the
+// same way, and open() failed outright.
+//
+// Called once per boot, right after cellular first connects - see its call
+// site near "[CELL] In service" further down. Deliberately NOT gated on
+// WiFi state - the whole point is testing this independent of it.
+static void testCellularOtaMeta()
+{
+  if (!otaToken[0] || !otaHost[0]) {
+    Serial.println("[CELL-OTA-TEST] OTA_TOKEN/OTA_HOST not provisioned, skipping");
+    return;
+  }
+
+  // TEMP 2026-09-22 diagnostic: AT+CLAC via the ALREADY-working teleClient.cell
+  // (CellUDP, live and begin()'d since boot) - decisive test of whether
+  // AT+CLAC/AT+HTTPINIT failing is caused by anything about the new
+  // otaCellClient/attach() object, or is a genuine modem/firmware response
+  // regardless of which object sends it.
+  teleClient.cell.rawAT("AT+CLAC\r", 3000);
+  Serial.println("[CELL-OTA-TEST] AT+CLAC via teleClient.cell raw buffer:");
+  Serial.println(teleClient.cell.rawBuffer());
+  Serial.println("[CELL-OTA-TEST] AT+CLAC via teleClient.cell raw buffer END");
+
+  static CellHTTP otaCellClient;
+  // 2026-09-22 finding: this device's real modem (SIM7670E-LNGV, firmware
+  // V1.9.05) has AT+HTTPINIT/AT+CLAC confirmed non-functional (plain ERROR,
+  // reproduced via teleClient.cell directly above - not an artifact of this
+  // test's own code). Forcing CELL_SIM7600 (AT+CCH* raw-SSL-socket family)
+  // was also tried live: partial support found - AT+CSSLCFG="sslversion"/
+  // "authmode" succeed, but "ignorertctime"/"alpnprotocol"/"ciphersuite" all
+  // return ERROR (unrecognized parameter names on this firmware), so
+  // AT+CCHSTART then fails too. AT+CCHOPEN itself DOES return a real,
+  // structured "+CCHOPEN: <session>,<errcode>" response (not blank ERROR)
+  // when tried anyway - meaning the AT+CCH* command family is genuinely
+  // partially present on this modem, just with a different supported-
+  // parameter set than SIM7600E-H's firmware. Reverted to the real detected
+  // type here rather than leaving the CELL_SIM7600 force in place, since
+  // that was a one-off experiment, not a working configuration - the actual
+  // fix (which CSSLCFG parameters this firmware needs) is still unknown,
+  // needs real SIMCom A76XX/SIM7670-LNGV documentation this session
+  // couldn't read (scanned-image PDFs, no OCR tool available) or a lot more
+  // live AT-parameter trial and error neither this session nor the user
+  // wanted to keep doing blindly.
+  Serial.printf("[CELL-OTA-TEST] Attaching to shared modem (type=%s)...\n", teleClient.cell.deviceName());
+  if (!otaCellClient.attach(&sys, teleClient.cell.type())) {
+    Serial.println("[CELL-OTA-TEST] attach() failed (OOM)");
+    return;
+  }
+  // TEMP 2026-09-22 diagnostic: one-time purge right before this object's
+  // very first command, to test whether stale leftover bytes already
+  // sitting in the shared UART driver's RX ring buffer (e.g. from
+  // teleClient.cell's own recent traffic) are being misread as the
+  // response to THIS object's first AT command - every AT+CLAC/AT+HTTPINIT
+  // attempt so far has failed with a bare ERROR that arrives suspiciously
+  // fast, consistent with reading already-buffered stale bytes rather than
+  // a genuine modem round-trip. attach() deliberately does NOT do this
+  // itself (see its own comment - a purge is exactly the kind of
+  // other-session-disrupting operation begin() does that attach() exists to
+  // avoid), so it's tested here, once, explicitly, only for this bench test.
+  sys.xbPurge();
+  Serial.println("[CELL-OTA-TEST] Purged shared UART buffer");
+
+  Serial.println("[CELL-OTA-TEST] init() - SSL context setup...");
+  otaCellClient.init();
+
+  Serial.printf("[CELL-OTA-TEST] open() %s:%u...\n", otaHost, (unsigned)otaPort);
+  if (!otaCellClient.open(otaHost, otaPort)) {
+    Serial.println("[CELL-OTA-TEST] open() FAILED");
+    return;
+  }
+  Serial.println("[CELL-OTA-TEST] open() OK");
+
+  // Same build-string encoding as performPullOtaCheck()'s real meta.json
+  // request, for a faithful test of the actual production path (not just
+  // "does TLS work") - see that function's comment for why spaces are
+  // percent-encoded.
+  char metaPath[448];
+  {
+    char buildEnc[48];
+    int bi = 0;
+    for (const char* p = __DATE__ " " __TIME__; *p && bi < (int)sizeof(buildEnc) - 4; p++) {
+      if (*p == ' ') {
+        buildEnc[bi++] = '%'; buildEnc[bi++] = '2'; buildEnc[bi++] = '0';
+      } else {
+        buildEnc[bi++] = *p;
+      }
+    }
+    buildEnc[bi] = 0;
+    snprintf(metaPath, sizeof(metaPath),
+             "/api/freematics/ota_pull/%s/meta.json?build=%s&variant=%s",
+             otaToken, buildEnc, FIRMWARE_VERSION);
+  }
+
+  if (!otaCellClient.send(METHOD_GET, otaHost, otaPort, metaPath)) {
+    Serial.println("[CELL-OTA-TEST] send() FAILED");
+    otaCellClient.close();
+    return;
+  }
+  Serial.println("[CELL-OTA-TEST] send() OK, waiting for response...");
+
+  int bytes = 0;
+  char* body = otaCellClient.receive(&bytes, HTTP_CONN_TIMEOUT);
+  if (!body) {
+    Serial.println("[CELL-OTA-TEST] receive() FAILED (no response)");
+    otaCellClient.close();
+    return;
+  }
+  Serial.printf("[CELL-OTA-TEST] SUCCESS: HTTP %u, %d bytes\n", (unsigned)otaCellClient.code(), bytes);
+  Serial.println(body);
+  otaCellClient.close();
+}
 
 class OBD : public COBD
 {
@@ -1091,6 +1377,26 @@ static double haversineKm(float lat1, float lng1, float lat2, float lng2)
              sin(dLng / 2) * sin(dLng / 2);
   double c = 2 * atan2(sqrt(a), sqrt(1 - a));
   return R * c;
+}
+
+// Geofence-WiFi (2026-09-22): true if (lat,lon) falls within any synced
+// knownLocations[] entry's radius, with *outWifiIdx set to which of the
+// device's own two configured networks (wifiSSID/wifiSSID2) to try there.
+// NOT called from anywhere yet - the data plumbing (syncKnownLocations(),
+// near the OTA config globals) lands first; wiring this into the actual
+// standby/wake decision is a separate, deferred step (see the saved plan:
+// after cellular OTA-pull is confirmed and WiFi-off-in-standby exists to
+// wake from in the first place).
+static bool findNearbyKnownLocation(float lat, float lon, uint8_t* outWifiIdx)
+{
+  for (uint8_t i = 0; i < knownLocationCount; i++) {
+    double distM = haversineKm(lat, lon, knownLocations[i].lat, knownLocations[i].lon) * 1000.0;
+    if (distM <= knownLocations[i].radiusM) {
+      if (outWifiIdx) *outWifiIdx = knownLocations[i].wifiIdx;
+      return true;
+    }
+  }
+  return false;
 }
 
 bool processGPS(CBuffer* buffer)
@@ -2258,6 +2564,31 @@ void telemetry(void* inst)
           if (teleClient.connect()) {
             state.set(STATE_WIFI_CONNECTED | STATE_NET_READY);
             if (enableBeep) beep(50);
+            // Geofence-WiFi known-locations sync (2026-09-22): "on every
+            // successful connection" per the design, rate-limited to
+            // LOC_SYNC_MIN_INTERVAL so a flapping WiFi connection (in/out of
+            // range while driving) can't open a fresh TLS session to
+            // ota_server.py on every single reconnect - see
+            // syncKnownLocations()'s own comment and LOC_SYNC_MIN_INTERVAL's
+            // definition in config.h for the heap-fragmentation reasoning.
+            // Deliberately a separate, independent call from the pull-OTA
+            // check further down - not nested inside it, not sharing any of
+            // its heap-sensitive sequencing (meta.json -> firmware.bin ->
+            // ota_confirm).
+            {
+              // synced=false on the first WiFi connection this boot forces
+              // an immediate sync (matching the NVS-cached table against
+              // whatever wifiSSID/wifiSSID2 actually are right now) rather
+              // than waiting out a full LOC_SYNC_MIN_INTERVAL from a
+              // millis()-since-boot baseline of 0.
+              static uint32_t lastLocSyncTime = 0;
+              static bool synced = false;
+              if (!synced || millis() - lastLocSyncTime > (uint32_t)LOC_SYNC_MIN_INTERVAL * 1000UL) {
+                lastLocSyncTime = millis();
+                synced = true;
+                syncKnownLocations();
+              }
+            }
             // Reset sentinels so the first WiFi packet always re-transmits the
             // LED/beep state and connection type to HA.  Without this, the
             // sentinels retain their values from the previous cellular session
@@ -2305,6 +2636,16 @@ void telemetry(void* inst)
         Serial.println("[CELL] In service");
         state.set(STATE_NET_READY);
         if (enableBeep) beep(50);
+        // TEMPORARY bench test (2026-09-22, saved plan point 1) - see
+        // testCellularOtaMeta()'s own comment for the full design/risk
+        // story. Runs once per boot, right after cellular first comes up.
+        {
+          static bool tested = false;
+          if (!tested) {
+            tested = true;
+            testCellularOtaMeta();
+          }
+        }
         // Reset sentinels so the first cellular packet always re-transmits the
         // LED/beep state and connection type to HA.  Without this, the sentinels
         // retain their values from the previous WiFi session and HA would keep
@@ -2957,6 +3298,26 @@ void loadConfig()
   uint16_t nvsOtaInterval = 0;
   nvs_get_u16(nvs, "OTA_INTERVAL", &nvsOtaInterval);
   otaCheckIntervalS = nvsOtaInterval;
+
+  // Geofence-WiFi known locations (2026-09-22), cached from the last
+  // successful syncKnownLocations() so a reboot right after arriving near a
+  // location doesn't lose the table until the next sync. See its own
+  // definition (near the OTA config globals) for the full design story.
+  // A length/count mismatch (blob missing, or a size left over from a
+  // firmware build with a different MAX_KNOWN_LOCATIONS/struct layout)
+  // fails safe to an empty table rather than risking garbage entries.
+  {
+    uint8_t n = 0;
+    nvs_get_u8(nvs, "LOC_N", &n);
+    if (n > MAX_KNOWN_LOCATIONS) n = MAX_KNOWN_LOCATIONS;
+    size_t blobLen = n * sizeof(KnownLocation);
+    if (n > 0 && nvs_get_blob(nvs, "LOCS", knownLocations, &blobLen) == ESP_OK
+        && blobLen == n * sizeof(KnownLocation)) {
+      knownLocationCount = n;
+    } else {
+      knownLocationCount = 0;
+    }
+  }
 
   // NVS settings version (NVS_VER key).  Written by the HA integration when
   // generating the NVS partition image.  Logged at boot so the user can verify

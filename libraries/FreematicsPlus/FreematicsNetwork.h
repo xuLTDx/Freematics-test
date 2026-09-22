@@ -177,6 +177,52 @@ class CellSIMCOM
 {
 public:
     virtual bool begin(CFreematics* device);
+    // Attaches to an ALREADY-running modem that another CellSIMCOM-derived
+    // object (sharing the same physical UART/CFreematics device) has
+    // already brought up via begin() - unlike begin(), does NOT toggle the
+    // power-control pin, does NOT purge the shared UART's pending RX bytes,
+    // and does NOT run the model/IMEI detection handshake (ATE0/ATI or the
+    // SIMCOMATI fallback). Only sets m_device (and lazily allocates this
+    // object's own m_buffer via getBuffer(), same as begin()).
+    //
+    // Use this for a second object that needs to issue its own AT commands
+    // on the shared UART (e.g. telelogger.ino's one-off CellHTTP OTA check)
+    // without disturbing a live session already running via a different
+    // object (e.g. CellUDP telemetry) on the same modem. begin()'s three
+    // side effects are each individually unsafe to repeat on a live modem:
+    // xbTogglePower() pulses the power-control pin (harmless at begin()'s
+    // 200 ms on an already-running modem in practice, but unverified/
+    // unnecessary risk to take again), xbPurge() discards whatever the
+    // OTHER object's in-flight AT exchange has already put in the shared
+    // UART driver's RX ring buffer, and the handshake's own AT commands
+    // compete with the other object's for that same buffer - see
+    // FreematicsNetwork.cpp's xbReceive()/sendCommand() for why: there is
+    // exactly one physical UART and one driver-level RX ring buffer, with
+    // no per-session demultiplexing, so whichever object happens to call
+    // xbReceive() next drains whatever is currently queued regardless of
+    // which logical session it belongs to.
+    //
+    // Does NOT eliminate that shared-buffer risk for the attached object's
+    // own subsequent AT commands (there is no protocol-level session
+    // multiplexing in this driver) - it only avoids ADDING begin()'s three
+    // extra rounds of it on top.
+    //
+    // `type` MUST be the modem type an earlier begin() on a sibling object
+    // already detected (see its type() getter below) - attach() does not
+    // run begin()'s own detection handshake, so m_type would otherwise stay
+    // at its default (CELL_SIM7600) regardless of the real modem, silently
+    // running the wrong AT-command dialect for open()/send()/receive()
+    // (confirmed live: a SIM7670E-LN modem, left at the CELL_SIM7600
+    // default, exercised the CCHOPEN/CCH* command family the modem does not
+    // implement the same way, and open() failed).
+    bool attach(CFreematics* device, CELL_TYPE type);
+    // TEMP 2026-09-22 diagnostic: raw AT passthrough, to test a command
+    // directly through an ALREADY-working, already-begin()'d object (e.g.
+    // teleClient.cell) and rule software-session/attach() effects in or out
+    // vs a genuine modem/firmware-level response. Remove once the SIM7670
+    // AT+HTTPINIT/AT+CLAC ERROR root cause is found.
+    bool rawAT(const char* cmd, unsigned int timeout = 1000) { return sendCommand(cmd, timeout); }
+    char* rawBuffer() { return m_buffer; }
     virtual void end();
     virtual bool setup(const char* apn, const char* username = 0, const char* password = 0, unsigned int timeout = 60000);
     virtual bool setGPS(bool on);
@@ -188,6 +234,9 @@ public:
     virtual bool getLocation(GPS_DATA** pgd);
     bool check(unsigned int timeout = 0);
     char* getBuffer();
+    // The modem type begin() (or a sibling object's begin()) detected -
+    // needed by attach() callers to pass the correct type through.
+    CELL_TYPE type() { return m_type; }
     const char* deviceName() { return m_model; }
     char IMEI[16] = {0};
 protected:
