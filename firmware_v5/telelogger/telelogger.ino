@@ -445,6 +445,12 @@ struct KnownLocation {
 };
 static KnownLocation knownLocations[MAX_KNOWN_LOCATIONS];
 static uint8_t knownLocationCount = 0;
+// Shared between the optimistic immediate-on-connect sync attempt and the
+// periodic SIGNAL_CHECK_INTERVAL retry further down in telemetry() - see
+// both call sites' comments. File-scoped (not function-local) specifically
+// so both places can see whether a sync has genuinely succeeded yet.
+static uint32_t s_lastLocSyncTime = 0;
+static bool s_locSynced = false;
 
 #if ENABLE_WIFI
 // Persists the current knownLocations[]/knownLocationCount to NVS (LOC_N +
@@ -480,21 +486,45 @@ static void saveKnownLocationsToNvs()
 // Must only be called from the main loop() task, never from a WiFi event
 // callback (onWifiEvent() runs on the small-stack Arduino event task - a
 // TLS handshake plus this function's local buffer does not belong there).
-static void syncKnownLocations()
+// Returns true only on a genuine successful sync (HTTP 200, body parsed) -
+// callers use this to decide whether to retry soon (e.g. a transient
+// connect failure right at the moment WiFi just came up, before the IP
+// stack/DNS have fully settled - confirmed live 2026-09-22: the very first
+// sync attempt after boot got "Cannot connect" while the exact same
+// otaWifiClient/otaHost/otaPort combination performPullOtaCheck() uses
+// (which runs later, not at the instant of connection) works fine) rather
+// than waiting the full LOC_SYNC_MIN_INTERVAL.
+static bool syncKnownLocations()
 {
-  if (!otaToken[0] || !otaHost[0]) return;
-  if (!WiFi.isConnected()) return;
+  if (!otaToken[0] || !otaHost[0]) return false;
+  if (!WiFi.isConnected()) return false;
 
-  char path[80];
+  // 2026-09-22: was char path[80] - too small. "/api/freematics/ota_pull/"
+  // (26) + otaToken (up to 67, see its declaration) + "/locations.csv" (14)
+  // + null needs up to 108 bytes; snprintf silently truncated the token/
+  // suffix to fit 80, producing a malformed path the server's path parser
+  // rejected with 404 - confirmed live (first WiFi sync attempt after
+  // deploying this feature got exactly that 404).
+  char path[128];
   snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/locations.csv", otaToken);
 
   if (!otaWifiClient.open(otaHost, otaPort)) {
-    Serial.println("[LOC-SYNC] Cannot connect");
-    return;
+    // TEMP 2026-09-22 diagnostic: "Cannot connect" reproduced 3x in a row
+    // (immediate attempt + two periodic retries, several seconds apart,
+    // well after telemetry was flowing normally) with no "[WIFI] Low heap"
+    // print from WifiHTTP::open()'s own guards - so it's a genuine
+    // client.connect() failure, not heap fragmentation. Narrow down further:
+    // WiFi link state and whether DNS resolution of otaHost itself works
+    // from this code path.
+    IPAddress resolved;
+    bool dnsOk = WiFi.hostByName(otaHost, resolved);
+    Serial.printf("[LOC-SYNC] Cannot connect - WiFi.status=%d dnsOk=%d resolved=%s\n",
+                  (int)WiFi.status(), (int)dnsOk, dnsOk ? resolved.toString().c_str() : "-");
+    return false;
   }
   if (!otaWifiClient.send(METHOD_GET, path)) {
     Serial.println("[LOC-SYNC] send failed");
-    return;
+    return false;
   }
 
   char buf[1024];
@@ -502,7 +532,7 @@ static void syncKnownLocations()
   char* body = otaWifiClient.receive(buf, sizeof(buf) - 1, &bytes);
   if (!body || otaWifiClient.code() != 200) {
     Serial.printf("[LOC-SYNC] HTTP %u\n", (unsigned)otaWifiClient.code());
-    return;
+    return false;
   }
   buf[bytes < (int)sizeof(buf) - 1 ? bytes : (int)sizeof(buf) - 1] = '\0';
   // Do NOT close the connection here - same TLS-session-reuse reasoning as
@@ -547,6 +577,7 @@ static void syncKnownLocations()
   knownLocationCount = newCount;
   saveKnownLocationsToNvs();
   Serial.printf("[LOC-SYNC] %u known location(s)\n", (unsigned)knownLocationCount);
+  return true;
 }
 #endif  // ENABLE_WIFI
 
@@ -2575,18 +2606,22 @@ void telemetry(void* inst)
             // check further down - not nested inside it, not sharing any of
             // its heap-sensitive sequencing (meta.json -> firmware.bin ->
             // ota_confirm).
-            {
-              // synced=false on the first WiFi connection this boot forces
-              // an immediate sync (matching the NVS-cached table against
-              // whatever wifiSSID/wifiSSID2 actually are right now) rather
-              // than waiting out a full LOC_SYNC_MIN_INTERVAL from a
-              // millis()-since-boot baseline of 0.
-              static uint32_t lastLocSyncTime = 0;
-              static bool synced = false;
-              if (!synced || millis() - lastLocSyncTime > (uint32_t)LOC_SYNC_MIN_INTERVAL * 1000UL) {
-                lastLocSyncTime = millis();
-                synced = true;
-                syncKnownLocations();
+            //
+            // This is only the OPTIMISTIC immediate attempt - confirmed live
+            // 2026-09-22 that it reliably fails ("Cannot connect") this
+            // early, most likely the IP stack/DNS resolver not being fully
+            // settled the instant WiFi reports connected (performPullOtaCheck()
+            // uses the same otaWifiClient/otaHost successfully, but only ever
+            // runs well after this point, not at the instant of connection).
+            // s_locSynced only becomes true on genuine success, so a real
+            // retry happens every SIGNAL_CHECK_INTERVAL via the periodic
+            // block further down (search s_locSynced) until one actually
+            // succeeds - this call is just a cheap "maybe it's already fine"
+            // try, not the only chance.
+            if (!s_locSynced || millis() - s_lastLocSyncTime > (uint32_t)LOC_SYNC_MIN_INTERVAL * 1000UL) {
+              if (syncKnownLocations()) {
+                s_lastLocSyncTime = millis();
+                s_locSynced = true;
               }
             }
             // Reset sentinels so the first WiFi packet always re-transmits the
@@ -2660,6 +2695,23 @@ void telemetry(void* inst)
 
       if (millis() - lastRssiTime > SIGNAL_CHECK_INTERVAL * 1000) {
 #if ENABLE_WIFI
+        // Geofence-WiFi sync retry (2026-09-22): the optimistic immediate
+        // attempt at the moment WiFi connects (search s_locSynced above)
+        // reliably fails that early on this hardware - retry here every
+        // SIGNAL_CHECK_INTERVAL (10s) as long as it still hasn't succeeded
+        // this session, instead of only on the next connection-state
+        // transition (which may never come again if WiFi just stays up).
+        // Once s_locSynced is true, this is a no-op until the connection
+        // actually drops and reconnects (state.set(STATE_WIFI_CONNECTED...)
+        // above does NOT reset s_locSynced - a real address/SSID edit is
+        // still only picked up every LOC_SYNC_MIN_INTERVAL, by design).
+        if (state.check(STATE_WIFI_CONNECTED) &&
+            (!s_locSynced || millis() - s_lastLocSyncTime > (uint32_t)LOC_SYNC_MIN_INTERVAL * 1000UL)) {
+          if (syncKnownLocations()) {
+            s_lastLocSyncTime = millis();
+            s_locSynced = true;
+          }
+        }
         if (state.check(STATE_WIFI_CONNECTED))
         {
           rssi = teleClient.wifi.RSSI();

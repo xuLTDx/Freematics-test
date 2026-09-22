@@ -1282,7 +1282,7 @@ bool CellHTTP::open(const char* host, uint16_t port)
     sprintf(m_buffer, "AT+CCHOPEN=0,\"%s\",%u,2\r", host, port);
     uint32_t cchOpenStart = millis();
     m_state = HTTP_CONNECTED;
-    if (sendCommand(m_buffer, HTTP_TLS_HANDSHAKE_TIMEOUT, "+CCHOPEN:")) {
+    if (sendCommand(m_buffer, CCHOPEN_TIMEOUT_SIM7670, "+CCHOPEN:")) {
       // +CCHOPEN: <session>,<err> - err values per the Application Note:
       // 0=success, 13=DNS error, 14=connect-socket error, 15=handshake
       // error, 17=no network, 19=certs not set.

@@ -24,6 +24,20 @@
 // TLS handshake over cellular can take longer than a data exchange; allow
 // up to 15 seconds before declaring the connection attempt failed.
 #define HTTP_TLS_HANDSHAKE_TIMEOUT 15000
+// 2026-09-22: SIM7670/SIM7672-family AT+CCHOPEN's documented Max Response
+// Time is 120000ms (SIMCom SSL Application Note V1.00 - same figure as
+// AT+CCHSTART/CCHSSLCFG/CCHSEND/CCHRECV/CCHCLOSE), and AT+CSSLCFG's
+// "negotiatetime" (TLS handshake timeout) parameter defaults to 300s -
+// confirmed live that HTTP_TLS_HANDSHAKE_TIMEOUT's 15s was simply too short
+// on this chip family (CCHOPEN produced zero response at all within 15s,
+// not an error - it was still legitimately waiting). Not raising the
+// shared HTTP_TLS_HANDSHAKE_TIMEOUT itself, since that value is already
+// proven correct in production for CELL_SIM7600's own CCHOPEN wait - this
+// is a separate, SIM7670-specific ceiling instead. 60s, not the full
+// documented 120s, as a middle ground: long enough for a genuinely slow
+// cellular TLS handshake, short enough that a truly failed attempt doesn't
+// block the caller for two full minutes.
+#define CCHOPEN_TIMEOUT_SIM7670 60000
 // Minimum expected duration (ms) for a TLS 1.2 handshake over a cellular
 // link (TCP 3-way + TLS exchange with a remote server).  +CCHOPEN:0,0
 // arriving faster than this is suspicious and may indicate a plain TCP
