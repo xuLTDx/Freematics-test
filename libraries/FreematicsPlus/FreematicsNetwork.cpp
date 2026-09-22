@@ -1051,15 +1051,43 @@ char* CellUDP::receive(int* pbytes, unsigned int timeout)
 void CellHTTP::init()
 {
   if (m_type == CELL_SIM7670) {
-    // TEMP 2026-09-22 diagnostic: CLAC moved here, BEFORE any CSSLCFG call,
-    // to test whether CSSLCFG is what puts the AT channel into a state
-    // where CLAC/HTTPINIT then fail - see open()'s removed diagnostic.
-    sendCommand("AT+CLAC\r", 3000);
-    Serial.println("[CELL] AT+CLAC (pre-CSSLCFG) raw buffer:");
-    Serial.println(m_buffer);
-    Serial.println("[CELL] AT+CLAC (pre-CSSLCFG) raw buffer END");
+    // 2026-09-22: this device's real modem (SIM7670E-LNGV V1.9.05) confirmed
+    // live that AT+HTTPINIT/the whole AT+HTTP* family (and even AT+CLAC)
+    // return plain ERROR unconditionally - not a driver bug, reproduced via
+    // the already-working teleClient.cell object too. Background research
+    // (SIMCom's SIM7672X/SIM7652X SSL + HTTP(S) Application Notes, V1.00 -
+    // same Qualcomm-baseband AT stack as SIM7670E, distinct from the
+    // MediaTek-based A76XX/SIM7600 line; corroborated by LilyGO's own
+    // TinyGSM-fork SIM7672 client, which implements TLS via AT+CCH* only
+    // and never touches AT+HTTP* at all) confirms AT+HTTPINIT is broken in
+    // practice across many independent real-world SIM7670G/E deployments
+    // with no known fix, while AT+CCH* (the "raw SSL socket" family, same
+    // one SIM7600E-H uses below) genuinely works on this chip family - just
+    // with a DIFFERENT AT+CSSLCFG parameter set and command order than
+    // SIM7600. Switched this branch from AT+HTTP* to AT+CCH* entirely.
+    //
+    // Confirmed valid AT+CSSLCFG parameters for this chip family (per the
+    // Application Note): "sslversion", "authmode", "ignorelocaltime",
+    // "negotiatetime", "cacert", "clientcert", "clientkey", "enableSNI".
+    // NOT valid on this family (all confirmed live returning ERROR, and
+    // absent from the official parameter list): "ignorertctime" (SIM7600's
+    // name for a similar setting - different string here), "alpnprotocol",
+    // "ciphersuite" (SIM7600/A76XX-only extensions).
     sendCommand("AT+CSSLCFG=\"sslversion\",0,4\r");
     sendCommand("AT+CSSLCFG=\"authmode\",0,0\r");
+    // Tolerant stop before start, same reasoning as CELL_SIM7600's
+    // AT+CCHSTOP-before-AT+CCHSTART below - harmless ERROR if nothing was
+    // running, avoids a stuck-from-earlier-session start failure otherwise.
+    sendCommand("AT+CCHSTOP\r");
+    // AT+CCHSET=1 enables +CCHSEND completion result reporting - per the
+    // Application Note's example sequence, this MUST be called before
+    // AT+CCHSTART, not after.
+    sendCommand("AT+CCHSET=1\r");
+    if (!sendCommand("AT+CCHSTART\r")) {
+      Serial.print("[CELL] CCHSTART failed:");
+      Serial.println(m_buffer);
+      m_state = HTTP_ERROR;
+    }
   } else if (m_type == CELL_SIM7600) {
     // Use AT+CCH (raw SSL client socket) instead of the AT+CHTTPS HTTPS stack.
     // Root cause of +CHTTPS_PEER_CLOSED on Cloudflare / nabu.casa:
@@ -1218,50 +1246,66 @@ bool CellHTTP::open(const char* host, uint16_t port)
       }
     }
   } else if (m_type == CELL_SIM7670) {
-    // TEMP 2026-09-22 diagnostic: AT+HTTPINIT unconditionally fails with
-    // plain ERROR on this exact modem/firmware (SIM7670E-LNGV V1.9.05) -
-    // dump the modem's own real supported-command list rather than guess
-    // further against unreadable scanned-PDF documentation. Remove once
-    // the real HTTP(S) AT command family for this firmware is confirmed.
-    sendCommand("AT+CLAC\r", 3000);
-    Serial.println("[CELL] AT+CLAC raw buffer:");
-    Serial.println(m_buffer);
-    Serial.println("[CELL] AT+CLAC raw buffer END");
-    // AT+HTTPINIT fails with plain ERROR ("already initialized") if the HTTP
-    // AT-command service is still open from an earlier session - confirmed
-    // live 2026-09-22 via a raw AT-traffic capture (VERBOSE_XBEE=1): the
-    // modem itself is not reset when the ESP32 is (separate MCU, power not
-    // cycled together), so a session left open by an earlier attempt (this
-    // device, or any prior use of the HTTP service) persists across ESP32
-    // resets/reflashes. The previous code never checked HTTPINIT's result at
-    // all, so every subsequent AT+HTTPPARA/AT+HTTPACTION call in send()
-    // silently proceeded against a never-initialized session and failed in
-    // turn. AT+HTTPTERM first, mirroring the CELL_SIM7600 branch's own
-    // AT+CCHSTOP-before-AT+CCHSTART pattern in init() above - its result is
-    // ignored (returns ERROR harmlessly when nothing was open, same as
-    // AT+CCHSTOP), then retry HTTPINIT once and actually check the result
-    // this time so a still-failing init is reported rather than masked.
-    sendCommand("AT+HTTPTERM\r");
-    // Confirmed live 2026-09-22: HTTPINIT still returned ERROR immediately
-    // after a successful HTTPTERM (not just "stale session from a prior
-    // attempt" - that theory alone didn't explain it). The SIM7600 CCHSTART
-    // path elsewhere in this file has documented precedent for SIMCom
-    // firmware needing a settle delay between stopping and restarting an AT
-    // service ("some SIM7600E-H firmware versions re-initialise the SSL
-    // context at CCHSTART time") - applying the same idea here as the next
-    // thing to try, since official SIMCom HTTP(S) AT documentation for this
-    // modem (A7600/A76XX application notes) was only available as scanned
-    // image PDFs with no OCR tooling in this environment to actually read.
-    delay(1000);
-    if (!sendCommand("AT+HTTPINIT\r")) {
-      Serial.println("[CELL] HTTPINIT failed");
-      m_state = HTTP_ERROR;
-      return false;
-    }
-    sendCommand("AT+HTTPPARA=\"SSLCFG\",0\r");
+    // 2026-09-22: AT+CCH* path (see init()'s comment for the full story of
+    // why, replacing the previously-here AT+HTTP*-based implementation,
+    // which is confirmed non-functional on this chip family).
+    memset(m_buffer, 0, RECV_BUF_SIZE);
+    Serial.printf("[CELL] Connecting to %s:%u\n", host, port);
+    m_device->xbPurge();
+    // 2026-09-22: AT+CCHOPEN got zero response at all (not even an error)
+    // within the full 15s handshake timeout on the first attempt - "enableSNI"
+    // is a confirmed-valid AT+CSSLCFG parameter for this chip family (per the
+    // Application Note's parameter list) not yet tried; without SNI the TLS
+    // ClientHello omits the hostname, which can leave some TLS stacks/servers
+    // silently stuck rather than cleanly erroring. ssl_ctx 0, session-scoped
+    // like the other CSSLCFG calls in init().
+    sprintf(m_buffer, "AT+CSSLCFG=\"enableSNI\",0,1\r");
+    sendCommand(m_buffer);
+    // AT+CCHSSLCFG=<session>,<ssl_ctx_id> binds an SSL context to this CCH
+    // session - per the Application Note, this is cleared on a CCHOPEN
+    // failure or CCHCLOSE, so it must be re-applied on every connection,
+    // AFTER CCHSTART (done once in init()) but BEFORE CCHOPEN.
+    sendCommand("AT+CCHSSLCFG=0,0\r");
+    // AT+CCHOPEN on this chip family takes 4 params (session,host,port,
+    // client_type) - NOT the 5-param form with an explicit ssl_ctx_id that
+    // SIM7600E-H needs below (this family binds the SSL context via
+    // CCHSSLCFG instead). client_type=2 = SSL/TLS client, same meaning as
+    // the SIM7600 branch.
+    // 2026-09-22: confirmed live this chip family does NOT send a separate
+    // immediate "OK" for AT+CCHOPEN before the async "+CCHOPEN: <session>,
+    // <err>" result (unlike SIM7600E-H below, where an early OK just
+    // confirms syntax acceptance before the real result URC) - a first-stage
+    // sendCommand(m_buffer, 1000) here timed out waiting for an OK that
+    // never came, even though the connection attempt was proceeding fine.
+    // Send once and wait directly for "+CCHOPEN:" with the full handshake
+    // timeout instead of a separate short acknowledgement step.
+    sprintf(m_buffer, "AT+CCHOPEN=0,\"%s\",%u,2\r", host, port);
+    uint32_t cchOpenStart = millis();
     m_state = HTTP_CONNECTED;
-    m_host = host;
-    return true;
+    if (sendCommand(m_buffer, HTTP_TLS_HANDSHAKE_TIMEOUT, "+CCHOPEN:")) {
+      // +CCHOPEN: <session>,<err> - err values per the Application Note:
+      // 0=success, 13=DNS error, 14=connect-socket error, 15=handshake
+      // error, 17=no network, 19=certs not set.
+      char *p = strstr(m_buffer, "+CCHOPEN:");
+      if (p) {
+        char *comma = strchr(p, ',');
+        int err = comma ? atoi(comma + 1) : -1;
+        if (err == 0) {
+          Serial.printf("[CELL] TLS handshake: %ums\n", (unsigned)(millis() - cchOpenStart));
+          m_host = host;
+          sendCommand(0, 500);  // drain UART; inbound() watches for +CCHCLOSE/+CCH_PEER_CLOSED
+          if (m_state != HTTP_CONNECTED) {
+            Serial.println("[CELL] Session closed immediately after TLS");
+            return false;
+          }
+          return true;
+        }
+        Serial.print("[CELL] TLS error:");
+        Serial.println(err);
+      }
+    }
+    m_state = HTTP_ERROR;
+    return false;
   } else if (m_type == CELL_SIM7600) {
     // AT+CCHOPEN uses SSL context 0 or 1 configured by init() (authmode=0,
     // sslversion=3, ignorertctime=1, alpnprotocol="http/1.1").
@@ -1440,10 +1484,9 @@ bool CellHTTP::close()
     return sendCommand("AT+SHDISC\r");
   } else if (m_type == CELL_SIM5360) {
     return sendCommand("AT+CHTTPSCLSE\r", 1000, "+CHTTPSCLSE:");
-  } else if (m_type == CELL_SIM7670) {
-    return sendCommand("AT+HTTPTERM\r");
   } else {
-    // SIM7600: close raw SSL session
+    // SIM7600 and SIM7670 (2026-09-22: switched from AT+HTTPTERM to the
+    // shared AT+CCH* close, see open()'s comment): close raw SSL session.
     return sendCommand("AT+CCHCLOSE=0\r", 1000, "+CCHCLOSE:");
   }
 }
@@ -1494,54 +1537,14 @@ bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const c
         }
       }
     }
-  } else if (m_type == CELL_SIM7670) {
-    sprintf(m_buffer, "AT+HTTPPARA=\"URL\",\"https://%s:%u%s\"\r", host, port, path);
-    if (!sendCommand(m_buffer, 1000)) {
-      Serial.print("[CELL] HTTPPARA URL failed:");
-      Serial.println(m_buffer);
-      m_state = HTTP_ERROR;
-      return false;
-    }
-    bool actionOk;
-    if (payload) {
-      sprintf(m_buffer, "AT+HTTPDATA=%u,1000\r", payloadSize);
-      sendCommand(m_buffer, 1000, "DOWNLOAD\r");
-      m_device->xbWrite(payload, payloadSize);
-      actionOk = sendCommand("AT+HTTPACTION=1\r");
-    } else {
-      actionOk = sendCommand("AT+HTTPACTION=0\r");
-    }
-    // AT+HTTPACTION's own OK/ERROR only confirms the request was accepted
-    // for later async processing - it is NOT the fetch result. Check it
-    // anyway (confirmed live 2026-09-22: it can fail outright with ERROR,
-    // e.g. when open()'s AT+HTTPINIT never actually succeeded - see its own
-    // comment - in which case waiting for a completion URC that will never
-    // arrive just burns the full HTTP_TLS_HANDSHAKE_TIMEOUT for nothing).
-    if (!actionOk) {
-      Serial.println("[CELL] HTTPACTION rejected");
-      m_state = HTTP_ERROR;
-      return false;
-    }
-    // Real completion is signalled later by an unsolicited
-    // "+HTTPACTION: <method>,<statuscode>,<datalen>" URC, which can take
-    // several seconds (TLS handshake + the server's own response time) -
-    // without waiting for it here, the immediately-following receive() call
-    // (AT+HTTPHEAD/AT+HTTPREAD) runs before the fetch has finished and
-    // returns nothing. Wait for it here, using the same handshake-scale
-    // timeout as the SIM7600 CCHOPEN path, and capture the status code from
-    // it as a fallback in case HTTPHEAD's own parse fails.
-    if (sendCommand(0, HTTP_TLS_HANDSHAKE_TIMEOUT, "+HTTPACTION:")) {
-      char *p = strstr(m_buffer, "+HTTPACTION:");
-      if (p && (p = strchr(p, ','))) {
-        m_code = atoi(++p);
-      }
-    } else {
-      Serial.println("[CELL] HTTPACTION completion URC timed out");
-      m_state = HTTP_ERROR;
-      return false;
-    }
-    return true;
-  } else if (m_type == CELL_SIM7600) {
+  } else if (m_type == CELL_SIM7600 || m_type == CELL_SIM7670) {
+    // 2026-09-22: SIM7670 merged into this shared AT+CCH* branch (was
+    // previously a separate AT+HTTP*-based implementation here - confirmed
+    // non-functional on this chip family, see open()'s comment). AT+CCHSEND/
+    // AT+CCHRECV syntax and URC format are the same across both chip
+    // families (only AT+CSSLCFG's parameter set and AT+CCHOPEN's param
+    // count differ, both handled in open()/init()).
+    //
     // Drain any pending URCs before sending — catches a +CCHCLOSE that
     // arrived in the UART buffer between open() and now.
     sendCommand(0, 50);
@@ -1643,27 +1646,11 @@ char* CellHTTP::receive(int* pbytes, unsigned int timeout)
         return p;
       }
     }
-  } else if (m_type == CELL_SIM7670) {
-    if (sendCommand("AT+HTTPHEAD\r", timeout, "+HTTPHEAD:")) {
-      char *p = strstr(m_buffer, "HTTP/1.");
-      if (p) m_code = atoi(p + 9);
-    }
-    sprintf(m_buffer, "AT+HTTPREAD=0,%u\r", RECV_BUF_SIZE - 32);
-    sendCommand(m_buffer);
-    char *p = strstr(m_buffer, "+HTTPREAD:");
-    if (p) {
-      m_state = HTTP_CONNECTED;
-      int bytes = atoi(p + 11);
-      if (pbytes) *pbytes = bytes;
-      p = strchr(p, '\n');
-      if (p) {
-        p++;
-        if (bytes < RECV_BUF_SIZE - 32) *(p + bytes) = 0;
-        return p;
-      }
-    }
-  } else if (m_type == CELL_SIM7600) {
-    // SIM7600: use AT+CCH raw SSL socket receive
+  } else if (m_type == CELL_SIM7600 || m_type == CELL_SIM7670) {
+    // 2026-09-22: SIM7670 merged into this shared AT+CCH* receive (was a
+    // separate AT+HTTP*-based implementation here - see send()'s and
+    // open()'s comments for why).
+    // SIM7600/SIM7670: use AT+CCH raw SSL socket receive
     int received = 0;
     char* payload = 0;
     bool keepalive;
