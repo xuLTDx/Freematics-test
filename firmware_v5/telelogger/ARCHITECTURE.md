@@ -32,37 +32,32 @@ Two concurrent logical "tasks" matter here:
 
 ## 2. Data flow, one sample from sensor to server
 
+The mechanism that matters here isn't "GPS → buffer → send" — it's that
+**one filled `CBuffer` fans out to two independent, unconditional writers**.
+Neither one waits for or depends on the other:
+
+```mermaid
+flowchart TD
+    S["processGPS() / OBD poll<br/><span style='font-size:11px'>gd-&gt;lat/lng/time/date, obdData[]…</span>"]
+    B["CBuffer buffer = bufman.getFree()<br/><span style='font-size:11px'>buffer-&gt;add(pid, type, &amp;value, …)<br/>binary ELEMENT_HEAD+payload — not text yet</span>"]
+    F["buffer.state = FILLED"]
+    SD["buffer-&gt;serialize(logger)<br/><span style='font-size:11px'>FileLogger::dispatch()</span>"]
+    NET["buffer-&gt;serialize(store)<br/><span style='font-size:11px'>CStorageRAM::dispatch()</span>"]
+    FILE[("/DATA/&lt;fileid&gt;.CSV<br/>&quot;pid,val&quot; per line")]
+    WIRE["wire packet in RAM<br/>&quot;devid#pid:val,…*CKSUM&quot;"]
+    TX["teleClient.transmit()<br/>WifiUDP / CellUDP"]
+    TRACCAR[["Traccar :6000"]]
+
+    S --> B --> F
+    F -->|"always, if STORAGE_READY<br/>(telelogger.ino:2150-2159)"| SD --> FILE
+    F -->|"only if a network session is up<br/>(telelogger.ino:2879-2888, telemetry() task)"| NET --> WIRE --> TX --> TRACCAR
 ```
-processGPS()/OBD poll          (telelogger.ino, e.g. ~1420-1480)
-   │ gd->lat/lng/time/date, obdData[]…
-   ▼
-CBuffer* buffer = bufman.getFree()
-buffer->add(PID_x, TYPE, &value, …)         [teleclient.h/.cpp CBuffer::add()]
-   │  (raw binary: ELEMENT_HEAD{pid,type,count} + payload, packed
-   │   sequentially into a fixed BUFFER_LENGTH byte array — NOT text yet)
-   ▼
-buffer->state = BUFFER_STATE_FILLED
-   │
-   ├──────────────────────────────┬───────────────────────────────┐
-   ▼ (telelogger.ino:2150-2159,   ▼ (telelogger.ino:2879-2888,     │
-   │  runs EVERY sample,          │  telemetry() task, runs        │
-   │  unconditionally whenever    │  whenever network is up)       │
-   │  STATE_STORAGE_READY)        │                                 │
-   buffer->serialize(logger)      buffer->serialize(store)          │
-   [CBuffer::serialize() walks    [same function, same buffer -     │
-    every add()-ed element,       different CStorage subclass]      │
-    calls store.log(pid,val,…)]                                     │
-   │                              │                                 │
-   ▼                              ▼                                 │
-FileLogger::dispatch()            CStorageRAM::dispatch()           │
- → SD.write(), CSV text           → builds "<devid>#pid:val,…*CKSUM"│
-   "<pid>,<val>\n" per line          wire packet in RAM              │
-   into /DATA/<fileid>.CSV        │                                 │
-                                   ▼                                 │
-                          teleClient.transmit(packet)                │
-                          → WifiUDP/CellUDP (or HTTP variant)        │
-                          → over the network to Traccar               │
-```
+
+**The two branches never coordinate.** The SD branch runs on every sample
+regardless of network state; the network branch runs only when a session
+happens to be up at that instant. A sample that misses the network branch
+is not lost — it already went to SD, and reaches Traccar later via
+`catchUpMissedFiles()` (§5).
 
 **Key point (this is what "how is the SD buffer used" actually means):**
 the SD file is **not** a fallback that only activates when offline — it is
@@ -269,7 +264,24 @@ syncKnownLocations()          // GET .../ota_pull/<token>/locations.csv
   → called on every successful WiFi connect (rate-limited by
     LOC_SYNC_MIN_INTERVAL, config.h) — NOT while on cellular.
 
-findNearbyKnownLocation(lat, lon, uint8_t* outWifiIdx)
+**The closed loop this drives** — confirmed correct against the actual code,
+state by state, not just described:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> WiFi_home: cold start<br/>tries wifiPreferredIdx only
+    WiFi_home --> Cellular: leaves range<br/>(existing disconnect detection)
+    Cellular --> WiFi_business: findNearbyKnownLocation()<br/>sets wifiPreferredIdx = outWifiIdx<br/>every 10s while in radius
+    WiFi_business --> Cellular: leaves radius
+    WiFi_home --> Standby: car off
+    WiFi_business --> Standby: car off
+    Cellular --> Standby: car off
+    Standby --> WiFi_home: car restarts —<br/>WiFi unconditionally OFF<br/>during Standby, no exception
+    Standby --> Standby: WiFi stays OFF<br/>(battery: ~29 days vs ~9 months)
+```
+
+`findNearbyKnownLocation(lat, lon, uint8_t* outWifiIdx)`
   → haversine distance to every knownLocations[] entry; true + outWifiIdx
     set on the first radius match.
   → the ONLY caller (2026-09-22 final design) is the cellular WiFi-retry
