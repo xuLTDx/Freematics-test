@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <NimBLEDevice.h>
 #include "ble_spp_server_nimble.h"
 
@@ -42,6 +43,31 @@ static char     g_advName[32]        = {0};
 static bool     g_bleInitialized     = false; // ble_init() has run at least once
 static bool     g_blePaused          = false;
 static uint32_t g_blePauseStartMs    = 0;
+
+// 2026-09-22: real mutex serializing ble_pause()/ble_resume(), added after a
+// SECOND boot-loop of the exact same class as the original 2026-09-21 race
+// (see ble_resume()'s own comment below). The 2026-09-21 fix only narrowed
+// the race window (clear g_blePaused before the slow re-init work) - it did
+// not close it, since two tasks can still genuinely execute the check-then-
+// clear on different CPU cores at the same instant. A THIRD independent
+// caller was added the night of 2026-09-22 (a periodic watchdog, see
+// telelogger.ino's SIGNAL_CHECK_INTERVAL block) specifically to catch a
+// resume that got missed - but every additional concurrent caller only
+// raises the odds of hitting that same narrow window, which is exactly what
+// then happened (confirmed via a live serial capture: BLE worked briefly
+// after a fresh boot, then went permanently unreachable, with the device's
+// own uptime counter showing a low value consistent with a fresh crash-
+// reboot, not a long-running session). A FreeRTOS mutex (not a
+// portENTER_CRITICAL spinlock - the re-init work below yields/blocks, which
+// a spinlock must never be held across) makes the caller count irrelevant:
+// whichever task gets there first runs pause/resume to completion before
+// any other caller's check can even begin.
+// Created once, synchronously, inside ble_init() (single-threaded, runs
+// from setup() before the telemetry task or any WiFi event callback could
+// possibly call pause/resume) - deliberately NOT lazily created on first
+// use, which would itself be a race if two tasks called pause/resume for
+// the first time concurrently.
+static SemaphoreHandle_t g_blePauseMutex = nullptr;
 
 // ---------------------------------------------------------------------------
 // Server-level connect/disconnect: original's ESP_GATTS_CONNECT_EVT /
@@ -172,6 +198,10 @@ void ble_init(const char* adv_name)
         }
     }
 
+    if (!g_blePauseMutex) {
+        g_blePauseMutex = xSemaphoreCreateMutex();
+    }
+
     BLEDevice::init(name);
     bleCreateGattServerAndAdvertise(name);
     g_bleInitialized = true;
@@ -265,35 +295,49 @@ void ble_init(const char* adv_name)
 // question for the phone app / BLE stack on that end, untestable from here.
 void ble_pause()
 {
-    if (!g_bleInitialized || g_blePaused) return;
+    if (!g_bleInitialized) return;
+    // Mutex (2026-09-22, see its own declaration comment above) - serializes
+    // this against ble_resume() and against itself, closing the race the
+    // 2026-09-21 flag-order fix only narrowed. portMAX_DELAY: this can only
+    // block behind another pause/resume call, which always completes.
+    if (g_blePauseMutex) xSemaphoreTake(g_blePauseMutex, portMAX_DELAY);
+    if (g_blePaused) {
+        if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
+        return;
+    }
     Serial.println("[BLE] pausing BT controller for WiFi (re)connect");
     NimBLEDevice::deinit(true /* clearAll - see comment above for why */);
     g_server = nullptr;
     g_statusChar = nullptr;
     g_blePauseStartMs = millis();
     g_blePaused = true;
+    if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
 }
 
 void ble_resume()
 {
-    if (!g_bleInitialized || !g_blePaused) return;
-    // Set the flag FIRST, before doing any of the actual re-init work below.
-    // ble_resume() is called from two different call sites that can run on
-    // different FreeRTOS tasks (ClientWIFI::setup()'s success path on the
-    // main loop task, and onWifiEvent()'s ARDUINO_EVENT_WIFI_STA_GOT_IP
-    // handler on the WiFi event task) for the SAME connection event.
-    // Confirmed live 2026-09-21: both can pass the `!g_blePaused` guard
-    // above before either one reaches the old `g_blePaused = false` at the
-    // end, so BOTH re-entered NimBLEDevice::init() - the second call hit an
-    // already-initialized BT controller (ESP_ERR_INVALID_STATE ->
-    // ESP_ERROR_CHECK abort) and boot-looped the device. Clearing the flag
-    // up front closes (most of) that race: the second caller now sees
-    // g_blePaused already false and returns immediately instead of
-    // re-entering init.
+    if (!g_bleInitialized) return;
+    // Mutex-protected (2026-09-22): this used to just clear g_blePaused
+    // before the slow re-init work as a race mitigation (2026-09-21) - that
+    // narrowed but did NOT close the window between two tasks' `if
+    // (!g_blePaused)` check and the clear, confirmed hit a second time the
+    // night of 2026-09-22 after a third concurrent caller (a periodic
+    // watchdog) was added, with the identical ESP_ERR_INVALID_STATE-abort
+    // signature as the original 2026-09-21 boot loop. The mutex makes the
+    // number of callers irrelevant - only one can ever be inside the
+    // check-and-clear-and-reinit section at a time, so a second (or third)
+    // caller simply blocks until the first is done, sees g_blePaused
+    // already false, and returns immediately - no re-entrant init possible.
+    if (g_blePauseMutex) xSemaphoreTake(g_blePauseMutex, portMAX_DELAY);
+    if (!g_blePaused) {
+        if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
+        return;
+    }
     g_blePaused = false;
     Serial.println("[BLE] resuming BT controller after WiFi (re)connect");
     BLEDevice::init(g_advName);
     bleCreateGattServerAndAdvertise(g_advName);
+    if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
 }
 
 bool ble_isPausedTooLong(uint32_t maxPauseMs)
