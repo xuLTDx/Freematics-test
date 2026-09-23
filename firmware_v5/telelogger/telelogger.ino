@@ -165,6 +165,21 @@ TeleClientHTTP teleClient;
 WifiHTTP otaWifiClient;
 #endif
 
+// 2026-09-23: cellular counterpart to otaWifiClient, promoted from
+// testCellularOtaMeta()'s local static (which proved the meta.json fetch
+// works, 2026-09-22 commit 1415be7) to file scope so performPullOtaCheck()
+// can use the SAME object for the real download path - one shared CellHTTP
+// instance rather than two, since testCellularOtaMeta()'s own comment
+// already documents that this modem's control UART is a single shared
+// resource with teleClient.cell; a second independent object would only
+// widen that same risk, not reduce it.
+static CellHTTP otaCellClient;
+static bool s_otaCellAttached = false;
+// ensureOtaCellAttached() is defined further down, right before
+// testCellularOtaMeta() - it needs `sys`/`teleClient`, both declared later
+// in this file (Arduino .ino files don't forward-declare global variables
+// the way they do functions).
+
 // config data
 char apn[32];
 char simPin[16] = SIM_CARD_PIN;
@@ -696,6 +711,33 @@ static uint32_t s_cachedSdFreeMb  = 0;
 // File-scope static so both functions share one allocation.
 static uint8_t s_otaChunkBuf[PULL_OTA_CHUNK_SIZE];
 
+// 2026-09-23: shared cellular body-download helper, used by both the
+// NVS-only path and the main firmware.bin path in performPullOtaCheck()
+// below. Assumes the caller already did open()+send()+receiveHeaders() (or
+// the meta.json receive()) on otaCellClient and is now positioned to read
+// the body. Drains exactly expectedSize bytes via CellHTTP::receiveBodyBytes()
+// (AT+CCHRECV chunked streaming, extended 2026-09-23 from SIM7600-only to
+// also cover this device's real SIM7670E-LN modem - see FreematicsNetwork.cpp)
+// into the given open File, PULL_OTA_CHUNK_SIZE at a time, optionally
+// updating a running SHA256 context per chunk. Returns total bytes written -
+// equal to expectedSize only on full success; the caller compares the two
+// the same way the existing WiFi loops already do.
+static size_t cellDownloadBody(File& file, size_t expectedSize, mbedtls_sha256_context* sha256Ctx)
+{
+  size_t written = 0;
+  while (written < expectedSize) {
+    int toRead = (int)(expectedSize - written);
+    if (toRead > (int)PULL_OTA_CHUNK_SIZE) toRead = (int)PULL_OTA_CHUNK_SIZE;
+    int n = otaCellClient.receiveBodyBytes((char*)s_otaChunkBuf, toRead, CCHOPEN_TIMEOUT_SIM7670);
+    if (n <= 0) break;
+    size_t nw = file.write(s_otaChunkBuf, (size_t)n);
+    if (nw != (size_t)n) break;
+    written += (size_t)n;
+    if (sha256Ctx) mbedtls_sha256_update_ret(sha256Ctx, s_otaChunkBuf, (size_t)n);
+  }
+  return written;
+}
+
 bool serverSetup(IPAddress& ip);
 void serverProcess(int timeout);
 void processMEMS(CBuffer* buffer);
@@ -718,6 +760,24 @@ public:
 };
 
 FreematicsESP32 sys;
+
+// One-time attach() of otaCellClient (declared near otaWifiClient above) to
+// the live modem (NOT begin() - see CellSIMCOM::attach()'s own comment for
+// why begin()'s power-toggle/purge/handshake are each unsafe to repeat on a
+// modem teleClient.cell already has live). Safe to call from any OTA
+// check - it no-ops after the first successful attach. Needs `sys`/
+// `teleClient`, so it's defined here rather than next to otaCellClient's
+// own declaration further up.
+static bool ensureOtaCellAttached()
+{
+  if (s_otaCellAttached) return true;
+  if (!otaCellClient.attach(&sys, teleClient.cell.type())) {
+    Serial.println("[OTA-PULL] cell attach() failed (OOM)");
+    return false;
+  }
+  s_otaCellAttached = true;
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // TEMPORARY bench test (2026-09-22) - saved plan's point 1: does pull-OTA's
@@ -771,39 +831,29 @@ static void testCellularOtaMeta()
     return;
   }
 
-  // TEMP 2026-09-22 diagnostic: AT+CLAC via the ALREADY-working teleClient.cell
-  // (CellUDP, live and begin()'d since boot) - decisive test of whether
-  // AT+CLAC/AT+HTTPINIT failing is caused by anything about the new
-  // otaCellClient/attach() object, or is a genuine modem/firmware response
-  // regardless of which object sends it.
-  teleClient.cell.rawAT("AT+CLAC\r", 3000);
-  Serial.println("[CELL-OTA-TEST] AT+CLAC via teleClient.cell raw buffer:");
-  Serial.println(teleClient.cell.rawBuffer());
-  Serial.println("[CELL-OTA-TEST] AT+CLAC via teleClient.cell raw buffer END");
 
-  static CellHTTP otaCellClient;
-  // 2026-09-22 finding: this device's real modem (SIM7670E-LNGV, firmware
-  // V1.9.05) has AT+HTTPINIT/AT+CLAC confirmed non-functional (plain ERROR,
-  // reproduced via teleClient.cell directly above - not an artifact of this
-  // test's own code). Forcing CELL_SIM7600 (AT+CCH* raw-SSL-socket family)
-  // was also tried live: partial support found - AT+CSSLCFG="sslversion"/
-  // "authmode" succeed, but "ignorertctime"/"alpnprotocol"/"ciphersuite" all
-  // return ERROR (unrecognized parameter names on this firmware), so
-  // AT+CCHSTART then fails too. AT+CCHOPEN itself DOES return a real,
-  // structured "+CCHOPEN: <session>,<errcode>" response (not blank ERROR)
-  // when tried anyway - meaning the AT+CCH* command family is genuinely
-  // partially present on this modem, just with a different supported-
-  // parameter set than SIM7600E-H's firmware. Reverted to the real detected
-  // type here rather than leaving the CELL_SIM7600 force in place, since
-  // that was a one-off experiment, not a working configuration - the actual
-  // fix (which CSSLCFG parameters this firmware needs) is still unknown,
-  // needs real SIMCom A76XX/SIM7670-LNGV documentation this session
-  // couldn't read (scanned-image PDFs, no OCR tool available) or a lot more
-  // live AT-parameter trial and error neither this session nor the user
-  // wanted to keep doing blindly.
+  // 2026-09-23 finding: AT+CCHSTART can genuinely fail with a bare ERROR at
+  // the modem level (reproduced even via the already-working teleClient.cell
+  // object, with AT+CGACT?/AT+CSSLCFG confirmed fine) if the modem's CCH
+  // service gets wedged - confirmed live that a full AT+CFUN=1,1 modem
+  // software reset clears it (a plain ESP32 reflash/reset does NOT reset the
+  // modem chip itself; begin()'s xbTogglePower(200) pulse also does not
+  // reliably force a real reboot when the modem is already responsive).
+  // Expected to be rare in normal operation (CCHSTART only runs once per
+  // boot - see CellHTTP::init()'s m_cchStarted guard); this was hit today
+  // only after dozens of rapid manual CCHSTART/CCHSTOP test cycles. Not
+  // worth an automatic in-flight recovery here (AT+CFUN=1,1 takes ~15s and
+  // drops the live GPRS/telemetry connection) - if this recurs in the field,
+  // it self-clears on the next real power cycle.
+
+  // 2026-09-22 finding (now resolved, see commit 1415be7): this device's
+  // real modem (SIM7670E-LNGV) needed the AT+CCH* family with its OWN
+  // AT+CSSLCFG parameter set (not SIM7600E-H's) plus AT+CCHSET/
+  // AT+CCHSSLCFG steps and CellSIMCOM::inbound() recognising the
+  // "+CCHRECV: DATA,..." push format - all fixed, this path is now a real,
+  // working meta.json fetch, not just an experiment.
   Serial.printf("[CELL-OTA-TEST] Attaching to shared modem (type=%s)...\n", teleClient.cell.deviceName());
-  if (!otaCellClient.attach(&sys, teleClient.cell.type())) {
-    Serial.println("[CELL-OTA-TEST] attach() failed (OOM)");
+  if (!ensureOtaCellAttached()) {
     return;
   }
   // TEMP 2026-09-22 diagnostic: one-time purge right before this object's
@@ -858,21 +908,31 @@ static void testCellularOtaMeta()
   }
   Serial.println("[CELL-OTA-TEST] send() OK, waiting for response...");
 
-  // 2026-09-22: HTTP_CONN_TIMEOUT (5s) was too short here too, same
-  // "SIMCom's documented Max Response Time is much longer than we assumed"
-  // reasoning as CCHOPEN_TIMEOUT_SIM7670 (open() first succeeded with a real
-  // 786ms handshake once that timeout was fixed, but receive() then still
-  // failed at 5s) - reuse the same 60s ceiling rather than inventing a
-  // third magic timeout constant.
-  int bytes = 0;
-  char* body = otaCellClient.receive(&bytes, CCHOPEN_TIMEOUT_SIM7670);
-  if (!body) {
-    Serial.println("[CELL-OTA-TEST] receive() FAILED (no response)");
+  // 2026-09-23: the simple receive() only does ONE AT+CCHRECV read - proven
+  // live to return just the HTTP header block when the server's headers and
+  // JSON body arrive as two separate +CCHRECV pushes, silently missing the
+  // body. Use receiveHeaders()+receiveBodyBytes() (same pair the firmware
+  // download uses) so this diagnostic actually reflects what
+  // performPullOtaCheck() does now.
+  int diagContentLength = 0;
+  int diagHttpCode = otaCellClient.receiveHeaders(&diagContentLength, CCHOPEN_TIMEOUT_SIM7670);
+  if (diagHttpCode <= 0) {
+    Serial.println("[CELL-OTA-TEST] receiveHeaders() FAILED (no response)");
     otaCellClient.close();
     return;
   }
-  Serial.printf("[CELL-OTA-TEST] SUCCESS: HTTP %u, %d bytes\n", (unsigned)otaCellClient.code(), bytes);
-  Serial.println(body);
+  static char diagBody[512];
+  int diagWant = diagContentLength > 0 && diagContentLength < (int)sizeof(diagBody) - 1
+                   ? diagContentLength : (int)sizeof(diagBody) - 1;
+  int diagBytes = 0;
+  while (diagBytes < diagWant) {
+    int n = otaCellClient.receiveBodyBytes(diagBody + diagBytes, diagWant - diagBytes, CCHOPEN_TIMEOUT_SIM7670);
+    if (n <= 0) break;
+    diagBytes += n;
+  }
+  diagBody[diagBytes] = '\0';
+  Serial.printf("[CELL-OTA-TEST] SUCCESS: HTTP %d, %d bytes\n", diagHttpCode, diagBytes);
+  Serial.println(diagBody);
   otaCellClient.close();
 }
 
@@ -2861,10 +2921,14 @@ void telemetry(void* inst)
 #endif
       }
 
-      // Periodic pull-OTA check: runs only when WiFi is connected and
-      // OTA_TOKEN + OTA_INTERVAL are provisioned.  OTA is WiFi-only; the
-      // SIM7600E-H cellular modem cannot reliably connect to the OTA endpoint
-      // (TLS error 15 against *.ui.nabu.casa / Cloudflare).  The check is
+      // Periodic pull-OTA check: runs when either WiFi or cellular is
+      // connected and OTA_TOKEN + OTA_INTERVAL are provisioned. 2026-09-23:
+      // was WiFi-only under the belief that "the cellular modem cannot
+      // reliably connect to the OTA endpoint" - that was true of the wrong
+      // modem name (SIM7600E-H) and is now stale: this device's real modem
+      // (SIM7670E-LN) has a confirmed-working meta.json fetch over cellular
+      // (commit 1415be7) and performPullOtaCheck() now has a real cellular
+      // download path too (see its own comment). The check is
       // placed here (before the empty-buffer continue) so it fires even when
       // OBD2/GPS are inactive and no telemetry data is being collected.
       // Rate-limited by otaCheckIntervalS; 0 means disabled.
@@ -2880,7 +2944,7 @@ void telemetry(void* inst)
       // purely as the existing OTA-provisioned/enabled gate (0 = OTA
       // disabled entirely), no longer as a timer period.
       if (otaToken[0] && otaCheckIntervalS > 0 &&
-          state.check(STATE_WIFI_CONNECTED)) {
+          (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED))) {
         bool checkNow = s_ota_check_now;
         if (checkNow) {
           s_ota_check_now = false;
@@ -3951,12 +4015,16 @@ bool performPullOtaCheck()
 {
   if (!otaToken[0] || !otaHost[0]) return false;
 
-  // OTA is only supported over WiFi.  Cellular is not supported because
-  // TLS on SIM7600E-H modems cannot reliably connect to the OTA endpoint
-  // (TLS error 15 against Cloudflare / Nabu Casa Remote UI domains).
-#if ENABLE_WIFI
-  if (!WiFi.isConnected()) return false;
-#else
+  // 2026-09-23: OTA now works over either transport - see the useCell
+  // branches below (meta.json fetch, firmware download) for the real
+  // cellular implementation. Prefer WiFi when both happen to be up
+  // (matches this codebase's existing WiFi-preferred precedence elsewhere).
+  // This whole function only compiles under the outer #if ENABLE_WIFI
+  // (see above), so WiFi.isConnected() is always safe to call here.
+  bool useCell = !WiFi.isConnected() && state.check(STATE_CELL_CONNECTED);
+  if (!WiFi.isConnected() && !useCell) return false;
+  if (useCell && !ensureOtaCellAttached()) return false;
+#if 0
   return false;  // No WiFi compiled in Ã¢â‚¬â€ OTA unavailable
 #endif
 
@@ -4012,6 +4080,73 @@ bool performPullOtaCheck()
   int metaBytes = 0;
   char* metaBody = nullptr;
 
+  if (useCell) {
+    // 2026-09-23: cellular meta.json fetch - same call sequence
+    // testCellularOtaMeta() already proved works live (commit 1415be7:
+    // attach/init/open/send/receive over AT+CCH* on this SIM7670E-LN modem).
+    otaCellClient.init();
+    if (!otaCellClient.open(otaHost, otaPort)) {
+      Serial.printf("[OTA-PULL] Cell connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_CONNECT");
+#endif
+      return false;
+    }
+    if (!otaCellClient.send(METHOD_GET, otaHost, otaPort, metaPath)) {
+      Serial.println("[OTA-PULL] Cell META send failed");
+      otaCellClient.close();
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_META_SEND");
+#endif
+      return false;
+    }
+    // 2026-09-23: the simple receive() only issues ONE AT+CCHRECV read and
+    // returns whatever came back in that single chunk. Confirmed live this
+    // fails here: the server sends HTTP headers and the JSON body as two
+    // separate socket writes (end_headers() then wfile.write(body) in
+    // ota_server.py), which arrive at the modem as two separate +CCHRECV
+    // pushes - receive() returned only the ~145-byte header block, with
+    // "available":true never appearing because the 114-byte body was still
+    // sitting unread in the modem. Use the same receiveHeaders()+
+    // receiveBodyBytes() streaming pair the firmware download already relies
+    // on for exactly this reason, looping until Content-Length is satisfied.
+    int metaContentLength = 0;
+    int metaHttpCode = otaCellClient.receiveHeaders(&metaContentLength, CCHOPEN_TIMEOUT_SIM7670);
+    if (metaHttpCode != 200) {
+      Serial.printf("[OTA-PULL] Cell META HTTP %d\n", metaHttpCode);
+      otaCellClient.close();
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) {
+        char _ota_diag[48];
+        snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=CELL_META_HTTP%d", metaHttpCode);
+        logger.logEvent(_ota_diag);
+      }
+#endif
+      return false;
+    }
+    int metaWant = metaContentLength > 0 && metaContentLength < (int)sizeof(metaBuf) - 1
+                     ? metaContentLength : (int)sizeof(metaBuf) - 1;
+    metaBytes = 0;
+    while (metaBytes < metaWant) {
+      int n = otaCellClient.receiveBodyBytes(metaBuf + metaBytes, metaWant - metaBytes, CCHOPEN_TIMEOUT_SIM7670);
+      if (n <= 0) break;
+      metaBytes += n;
+    }
+    metaBuf[metaBytes] = '\0';
+    metaBody = metaBuf;
+    // 2026-09-23: unlike the WiFi path below (which deliberately keeps its
+    // TLS session alive for reuse - a real perf win there), close this one
+    // immediately rather than leaving it dangling until some later return
+    // point. Confirmed live this session: leaving a CCH session open
+    // (or not properly closed) across repeated performPullOtaCheck() calls
+    // makes the NEXT call's AT+CCHSTART fail outright ("[CELL] CCHSTART
+    // failed") even though CellHTTP::init()'s own CCHSTOP-before-CCHSTART
+    // is meant to be tolerant of that - whatever state CCHOPEN leaves
+    // behind, a plain CCHSTOP doesn't fully reset it. The firmware download
+    // step below does its own fresh otaCellClient.open() regardless, so
+    // nothing downstream depends on this connection staying up.
+    otaCellClient.close();
+  } else {
 #if ENABLE_WIFI
   // WifiHTTP::open() handles all session-reuse and heap-guard logic:
   //   Ã¢â‚¬Â¢ Same host as telemetry: reuse the existing TLS session (zero cost).
@@ -4057,6 +4192,7 @@ bool performPullOtaCheck()
   // immediately before client.connect(), preventing heap fragmentation by other
   // tasks from grabbing the freed TLS block between the two calls.
 #endif  // ENABLE_WIFI
+  }  // else (WiFi meta.json fetch)
 
   // ---- Parse metadata JSON ------------------------------------------------
 
@@ -4106,7 +4242,34 @@ bool performPullOtaCheck()
     }
     Serial.println("[OTA-PULL] NVS-only update: downloading settings binary");
     if (SD.exists(OTA_NVS_PATH)) SD.remove(OTA_NVS_PATH);
-    if (nvsPath[0]) {
+    if (nvsPath[0] && useCell) {
+      // 2026-09-23: cellular NVS-only download, same shape as the WiFi path
+      // below but via cellDownloadBody() (see its own comment).
+      if (otaCellClient.open(otaHost, otaPort) &&
+          otaCellClient.send(METHOD_GET, otaHost, otaPort, nvsPath)) {
+        int _nvsCL = 0;
+        int _nvsHC = otaCellClient.receiveHeaders(&_nvsCL);
+        if (_nvsHC == 200 && _nvsCL > 0) {
+          File _nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
+          if (_nvsFile) {
+            size_t _nvsWr = cellDownloadBody(_nvsFile, (size_t)_nvsCL, nullptr);
+            _nvsFile.close();
+            if (_nvsWr != (size_t)_nvsCL) {
+              Serial.println("[OTA-PULL] Cell NVS download incomplete - settings unchanged");
+              SD.remove(OTA_NVS_PATH);
+            } else {
+              Serial.printf("[OTA-PULL] NVS staged (cell): %u bytes\n", (unsigned)_nvsWr);
+            }
+          }
+        } else {
+          Serial.printf("[OTA-PULL] Cell NVS HTTP %d - settings unchanged\n", _nvsHC);
+        }
+        otaCellClient.close();
+      } else {
+        Serial.println("[OTA-PULL] Cell NVS connect/send failed - settings unchanged");
+        otaCellClient.close();
+      }
+    } else if (nvsPath[0]) {
 #if ENABLE_WIFI
       if (otaWifiClient.open(otaHost, otaPort) &&
           otaWifiClient.send(METHOD_GET, nvsPath)) {
@@ -4270,6 +4433,69 @@ bool performPullOtaCheck()
     }
 
 
+    if (useCell) {
+      // 2026-09-23: cellular firmware download - real streaming via
+      // CellHTTP::receiveHeaders()+cellDownloadBody() (AT+CCHRECV chunked
+      // reads), not a stub. Same integrity contract as the WiFi path: exact
+      // byte-count match required, SHA256 verified below, any failure here
+      // just leaves dlOk=false/written<fwSize so the shared post-loop check
+      // further down removes the staging file and retries next interval.
+      if (!otaCellClient.open(otaHost, otaPort)) {
+        Serial.printf("[OTA-PULL] Cell FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
+        fwFile.close();
+        SD.remove(OTA_PENDING_PATH);
+        if (doSha256) mbedtls_sha256_free(&sha256Ctx);
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_CONNECT");
+#endif
+        return false;
+      }
+      if (!otaCellClient.send(METHOD_GET, otaHost, otaPort, fwPath)) {
+        Serial.println("[OTA-PULL] Cell FW send failed");
+        otaCellClient.close();
+        fwFile.close();
+        SD.remove(OTA_PENDING_PATH);
+        if (doSha256) mbedtls_sha256_free(&sha256Ctx);
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_SEND");
+#endif
+        return false;
+      }
+      int contentLength = 0;
+      int httpCode = otaCellClient.receiveHeaders(&contentLength);
+      if (httpCode != 200) {
+        Serial.printf("[OTA-PULL] Cell FW HTTP %d\n", httpCode);
+        otaCellClient.close();
+        fwFile.close();
+        SD.remove(OTA_PENDING_PATH);
+        if (doSha256) mbedtls_sha256_free(&sha256Ctx);
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) {
+          char _ota_diag[48];
+          snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=CELL_FW_HTTP%d", httpCode);
+          logger.logEvent(_ota_diag);
+        }
+#endif
+        return false;
+      }
+      if (contentLength > 0 && (size_t)contentLength != fwSize) {
+        Serial.printf("[OTA-PULL] FW size mismatch: meta=%u header=%d\n",
+                      (unsigned)fwSize, contentLength);
+        fwSize = (size_t)contentLength;
+      }
+      written = cellDownloadBody(fwFile, fwSize, doSha256 ? &sha256Ctx : nullptr);
+      if (written != fwSize) {
+        Serial.printf("[OTA-PULL] Cell recv incomplete at %u / %u bytes\n", (unsigned)written, (unsigned)fwSize);
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_RECV");
+#endif
+        dlOk = false;
+      } else {
+        Serial.printf("[OTA-PULL] %u / %u bytes (100%%) in %u ms\n",
+                      (unsigned)written, (unsigned)fwSize, (unsigned)(millis() - dlStart));
+      }
+      otaCellClient.close();
+    } else {
 #if ENABLE_WIFI
     if (!otaWifiClient.open(otaHost, otaPort)) {
       Serial.printf("[OTA-PULL] FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
@@ -4367,9 +4593,10 @@ bool performPullOtaCheck()
                       100.0f * written / fwSize, (unsigned)(millis() - dlStart));
       }
     }
-    fwFile.close();
     otaWifiClient.close();
 #endif  // ENABLE_WIFI
+    }  // else (WiFi firmware download)
+    fwFile.close();
 
     if (!dlOk || written != fwSize) {
       Serial.printf("[OTA-PULL] Download incomplete (%u / %u bytes) Ã¢â‚¬â€ staging file removed\n",

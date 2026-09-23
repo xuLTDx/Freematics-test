@@ -308,6 +308,17 @@ private:
     // Both are reset to 0 at the start of each receiveHeaders() call.
     int m_streamBodyLen = 0;
     int m_streamBodyPos = 0;
+    // 2026-09-23: AT+CCHSTART opens the whole CCH SSL *service*, not a
+    // per-connection session (AT+CCHOPEN/AT+CCHCLOSE are the per-connection
+    // pair, already called each connection by open()/close()). init() used
+    // to unconditionally CCHSTOP+CCHSET+CCHSTART on every call, which tears
+    // down and immediately restarts a service that was still genuinely
+    // running from a prior init() (close() never stops it) - confirmed live
+    // this fails intermittently with "CCHSTART failed: ERROR" when the
+    // restart follows too soon after the stop, even on what looked like a
+    // "fresh" call. Track whether CCHSTART already succeeded once and skip
+    // the stop/restart sequence on later init() calls.
+    bool m_cchStarted = false;
 };
 
 #endif

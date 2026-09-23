@@ -994,6 +994,12 @@ bool CellUDP::open(const char* host, uint16_t port)
     }
     return true;
   } else {
+    // 2026-09-23: buffer access mode (see CellUDP::receive()'s own comment
+    // for why) must be set BEFORE the socket is opened, per SIMCom's
+    // example sequence (SIM7500/7600/7800 TCPIP AT Command Manual V1.00,
+    // section 6.3.2: NETOPEN -> CIPRXGET=1 -> CIPOPEN). Harmless to resend
+    // on every open() call - the mode itself is idempotent.
+    sendCommand("AT+CIPRXGET=1\r");
     sprintf(m_buffer, "AT+CIPOPEN=0,\"UDP\",\"%s\",%u,8000\r", udpIP.c_str(), udpPort);
     if (!sendCommand(m_buffer, 3000)) {
       Serial.println(m_buffer);
@@ -1047,22 +1053,39 @@ char* CellUDP::receive(int* pbytes, unsigned int timeout)
       }
     }
   } else {
-    if (!m_incoming && timeout) sendCommand(0, timeout, "+IPD");
-    if (m_incoming) {
-      m_incoming = 0;
-      char *p = strstr(m_buffer, "+IPD");
-      if (p) {
-        *p = '-'; // mark this datagram as checked
-        int len = atoi(p + 4);
-        if (pbytes) *pbytes = len;
-        p = strchr(p, '\n');
-        if (p) {
-          if (strlen(++p) > len) *(p + len) = 0;
-          return p;
+    // 2026-09-23: switched from direct-push (+IPD URC) to buffer access
+    // mode (AT+CIPRXGET=1, set once in open() above) - direct push relies
+    // on catching a narrow URC window on the shared UART exactly when the
+    // module happens to push it; over cellular's higher round-trip latency
+    // (vs. a real OS UDP socket, which just buffers packets until read)
+    // this reliably missed server-pushed data: confirmed live, Traccar's
+    // OTA_READY command never arrived after 20+ minutes/multiple retries
+    // over cellular, while the identical push worked over WiFi within
+    // seconds. In buffer mode the MODULE holds received data until
+    // explicitly retrieved via AT+CIPRXGET=2, so polling timing no longer
+    // matters - see SIMCom's SIM7500/SIM7600/SIM7800 TCPIP AT Command
+    // Manual V1.00, sections 2.5 and 6.3.2 (this device's real modem,
+    // SIM7670E-LN, shares the same AT+CIP*/AT+CIPRXGET stack). Always
+    // polls now regardless of m_incoming/timeout - "+IP ERROR: No data" is
+    // the normal, expected response when nothing is buffered, not a fault.
+    sendCommand("AT+CIPRXGET=2,0,1500\r", timeout);
+    char *p = strstr(m_buffer, "+CIPRXGET: 2,");
+    if (p) {
+      // Response: +CIPRXGET: <mode>,<link_num>,<read_len>,<rest_len>\r\n<data>
+      char *q = strchr(p, ',');       // after <mode>
+      if (q) q = strchr(q + 1, ',');  // after <link_num>, now at ",<read_len>..."
+      if (q) {
+        int len = atoi(q + 1);
+        char *nl = strchr(q, '\n');
+        if (nl && len > 0) {
+          char *data = nl + 1;
+          if ((int)strlen(data) > len) data[len] = 0;
+          if (pbytes) *pbytes = len;
+          return data;
         }
       }
     }
-  }  
+  }
   return 0;
 }
 
@@ -1093,18 +1116,45 @@ void CellHTTP::init()
     // "ciphersuite" (SIM7600/A76XX-only extensions).
     sendCommand("AT+CSSLCFG=\"sslversion\",0,4\r");
     sendCommand("AT+CSSLCFG=\"authmode\",0,0\r");
-    // Tolerant stop before start, same reasoning as CELL_SIM7600's
-    // AT+CCHSTOP-before-AT+CCHSTART below - harmless ERROR if nothing was
-    // running, avoids a stuck-from-earlier-session start failure otherwise.
-    sendCommand("AT+CCHSTOP\r");
-    // AT+CCHSET=1 enables +CCHSEND completion result reporting - per the
-    // Application Note's example sequence, this MUST be called before
-    // AT+CCHSTART, not after.
-    sendCommand("AT+CCHSET=1\r");
-    if (!sendCommand("AT+CCHSTART\r")) {
-      Serial.print("[CELL] CCHSTART failed:");
-      Serial.println(m_buffer);
-      m_state = HTTP_ERROR;
+    // AT+CCHSTART opens the CCH SSL *service* for the whole boot session,
+    // not a per-connection socket (that's AT+CCHOPEN/AT+CCHCLOSE, done each
+    // connection by open()/close()). Only do the stop/restart dance the
+    // first time init() runs after attach() - re-issuing CCHSTOP on a
+    // service that's already genuinely running and immediately restarting
+    // it with no settle time fails intermittently ("CCHSTART failed:
+    // ERROR"), confirmed live. Once started, later init() calls just reuse
+    // the already-running service.
+    if (!m_cchStarted) {
+      // 2026-09-23: confirmed live that CCHSTART can fail with a bare ERROR
+      // even on this object's very first-ever attempt of the boot, right
+      // after teleClient.cell (a separate CellUDP object) finishes its own
+      // AT traffic on the SAME shared UART/RX ring buffer (no per-session
+      // demultiplexing - see CellSIMCOM::attach()'s own comment). Consistent
+      // with stale/interleaved bytes from the other object's traffic being
+      // misread as this command's response, not a genuine modem rejection.
+      // Retry once with an explicit purge + settle delay before giving up,
+      // same "tolerant" spirit as the CCHSTOP-before-CCHSTART call below.
+      for (int attempt = 0; attempt < 2 && !m_cchStarted; attempt++) {
+        if (attempt > 0) {
+          m_device->xbPurge();
+          delay(300);
+        }
+        sendCommand("AT+CCHSTOP\r");
+        // AT+CCHSET=1 enables +CCHSEND completion result reporting - per the
+        // Application Note's example sequence, this MUST be called before
+        // AT+CCHSTART, not after.
+        sendCommand("AT+CCHSET=1\r");
+        if (sendCommand("AT+CCHSTART\r")) {
+          m_cchStarted = true;
+        } else if (attempt == 0) {
+          Serial.print("[CELL] CCHSTART failed, retrying once:");
+          Serial.println(m_buffer);
+        } else {
+          Serial.print("[CELL] CCHSTART failed:");
+          Serial.println(m_buffer);
+          m_state = HTTP_ERROR;
+        }
+      }
     }
   } else if (m_type == CELL_SIM7600) {
     // Use AT+CCH (raw SSL client socket) instead of the AT+CHTTPS HTTPS stack.
@@ -1842,7 +1892,12 @@ int CellHTTP::receiveHeaders(int* contentLength, unsigned int timeout)
   m_streamBodyPos = 0;
   if (contentLength) *contentLength = 0;
 
-  if (m_type != CELL_SIM7600) return -1;
+  // 2026-09-23: extended from SIM7600-only to also cover SIM7670 - shares
+  // the exact same "+CCHRECV: DATA,<session>,<len>" AT+CCH* response format
+  // (already confirmed for the simpler receive() a few functions below,
+  // 2026-09-22 commit 1415be7 - this streaming variant just never got the
+  // same extension when it was written).
+  if (m_type != CELL_SIM7600 && m_type != CELL_SIM7670) return -1;
 
   // Wait for an incoming-data notification or a peer-close event.
   if (m_state != HTTP_DISCONNECTED) {
@@ -1949,32 +2004,51 @@ int CellHTTP::receiveBodyBytes(char* buf, int maxLen, unsigned int timeout)
     return n;
   }
 
-  if (m_type != CELL_SIM7600) return -1;
+  // 2026-09-23: same SIM7670 extension as receiveHeaders() above.
+  if (m_type != CELL_SIM7600 && m_type != CELL_SIM7670) return -1;
   if (m_state != HTTP_CONNECTED && m_state != HTTP_DISCONNECTED) return -1;
-
-  // Wait for more data or a peer-close event.
-  if (m_state != HTTP_DISCONNECTED) {
-    if (!m_incoming && timeout) sendCommand(0, timeout, "+CCHRECV:");
-    if (!m_incoming && m_state != HTTP_DISCONNECTED) return -1;  // timed out
-  }
-  m_incoming = 0;
-
-  // Check if the data was auto-pushed (CCHRECVMODE=0).
-  char* p = strstr(m_buffer, "+CCHRECV: DATA,");
-  if (!p) p = strstr(m_buffer, "+CCHRECV:DATA,");
 
   const int toRead = RECV_BUF_SIZE - AT_CCHRECV_OVERHEAD;
 
-  if (!p) {
-    sprintf(m_buffer, "AT+CCHRECV=0,%d\r", toRead);
-    sendCommand(m_buffer, timeout);
-    p = strstr(m_buffer, "\r\n+CCHRECV: DATA");
-    if (!p) p = strstr(m_buffer, "\r\n+CCHRECV:DATA");
+  // 2026-09-23: SIMCom's own SSL Application Note (section 2.2.15,
+  // AT+CCHRECV) states AT+CCHRECV "will be not allowed when there is no
+  // data in the cache" - it can genuinely come back empty simply because
+  // the server hasn't delivered the next chunk to the modem YET, not
+  // because the transfer is actually over. Confirmed live: a real 1.3MB
+  // firmware download received its first 16384-byte chunk fine, then
+  // stalled forever on the very next call because an empty response here
+  // was treated as end-of-stream. Poll for up to `timeout` ms, short-
+  // sleeping between attempts, before concluding there's truly no more
+  // data - the same "empty response is normal, not a fault" handling
+  // already proven for CIPRXGET in CellUDP::receive().
+  char* p = 0;
+  unsigned long pollStart = millis();
+  for (;;) {
+    // Wait for more data or a peer-close event.
+    if (m_state != HTTP_DISCONNECTED) {
+      if (!m_incoming) sendCommand(0, 300, "+CCHRECV:");
+    }
+    // Check if the data was auto-pushed (CCHRECVMODE=0).
+    p = strstr(m_buffer, "+CCHRECV: DATA,");
+    if (!p) p = strstr(m_buffer, "+CCHRECV:DATA,");
     if (!p) {
-      // No data in modem buffer; signal end-of-stream.
-      if (strstr(m_buffer, "+CCH_PEER_CLOSED:")) m_state = HTTP_DISCONNECTED;
+      sprintf(m_buffer, "AT+CCHRECV=0,%d\r", toRead);
+      sendCommand(m_buffer, 2000);
+      p = strstr(m_buffer, "\r\n+CCHRECV: DATA");
+      if (!p) p = strstr(m_buffer, "\r\n+CCHRECV:DATA");
+    }
+    m_incoming = 0;
+    if (p) break;
+    if (strstr(m_buffer, "+CCH_PEER_CLOSED:")) {
+      // Peer genuinely closed - no more data will ever arrive.
+      m_state = HTTP_DISCONNECTED;
       return 0;
     }
+    if (timeout == 0 || millis() - pollStart >= timeout) {
+      Serial.println("[CELL] receiveBodyBytes: timed out waiting for next chunk");
+      return 0;  // genuinely timed out
+    }
+    delay(250);
   }
 
   // Parse "+CCHRECV: DATA,<session>,<len>\r\n<data>"
