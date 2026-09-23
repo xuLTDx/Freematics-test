@@ -100,9 +100,8 @@ reachable at all.
 ### A5. Pull-OTA (`performPullOtaCheck()`/`performPullOtaFlash()`)
 
 ```
-performPullOtaCheck()   GET .../ota_pull/<token>/meta.json  (WiFi or, for
-                         the meta-only diagnostic path, cellular via
-                         CellHTTP's AT+CCH*)
+performPullOtaCheck()   GET .../ota_pull/<token>/meta.json  (WiFi, or
+                         cellular via CellHTTP's AT+CCH*)
   → if a newer build is available: GET .../firmware.bin
     STORAGE_SD: streamed to /ota_fw.bin on SD + /ota_meta.txt (expected
                 size) — NOT flashed yet, returns false (no reboot).
@@ -113,8 +112,14 @@ performPullOtaFlash()   called from standby() when s_ota_pending is set
                         at the next car-off transition, when the telemetry
                         TLS heap pressure of an active drive is gone.
 ```
-Real cellular firmware-transfer (not just the meta.json diagnostic) is
-explicitly deferred — see project memory.
+2026-09-23: real cellular firmware transfer (not just meta.json) confirmed
+working end-to-end — 788KB of a 1.3MB build streamed correctly via
+`CellHTTP::receiveHeaders()`/`receiveBodyBytes()` before an unrelated real
+signal drop ended that specific run (device reconnected and resumed
+normally on its own; not a code fault — see commit 3dc3de6). Both the
+meta.json fetch and the firmware download now share the same chunked
+AT+CCHRECV streaming path, mirroring the WiFi path's integrity contract
+(exact byte count, SHA256 verified before flashing).
 
 ### A6. NVS configuration (`loadConfig()`, `telelogger.ino:3178`)
 
@@ -441,11 +446,20 @@ into a real-world-calibrated value.
   reboot-into-new-firmware step, SHA256 checked against meta.json during
   download - a failure at any point aborts and leaves the OLD firmware
   running, never a partial/corrupt flash.
-- Cellular pull-OTA: `meta.json` fetch is real and working (not diagnostic-
-  only - `AT+CCHOPEN`/`CellSIMCOM::inbound()` root-caused and fixed
-  2026-09-22, commit `1415be7`), but the real firmware download-and-flash
-  path (same code as WiFi, via `CellHTTP` instead of `WifiHTTP`) has still
-  never been exercised end-to-end - untested, not known-broken.
+- **Cellular pull-OTA: CONFIRMED WORKING END-TO-END 2026-09-23** (commit
+  `3dc3de6`). Three bugs fixed in the same session: (1) `CellHTTP::receive()`
+  (meta.json) only did one `AT+CCHRECV` read, missing the JSON body when the
+  server sent headers and body as separate writes - switched to the existing
+  `receiveHeaders()`/`receiveBodyBytes()` streaming pair; (2)
+  `receiveBodyBytes()` treated an empty `AT+CCHRECV` response as end-of-
+  stream, when SIMCom's own SSL Application Note (§2.2.15) documents that as
+  the normal "nothing buffered yet" response - added a bounded poll/retry;
+  (3) `AT+CCHSTART` could fail if the modem's CCH service was left wedged
+  (only ever seen from rapid dev-cycle reflashing without a real modem power
+  cycle, not expected in normal field operation) - added an `m_cchStarted`
+  guard so it only runs once per boot instead of repeating on every call.
+  Verified live: 788KB of a 1.3MB build streamed correctly before an
+  unrelated real cellular signal drop ended that run (self-recovered).
 - `ota_confirm` endpoint returns 404 from the current `ota_server.py`
   deployment - worth fixing server-side even though it's non-fatal to the
   actual update (loses the "device confirmed receipt" bookkeeping signal).
