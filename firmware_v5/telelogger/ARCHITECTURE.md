@@ -432,3 +432,23 @@ into a real-world-calibrated value.
 - `publish_ota_config.json` currently renamed `.disabled` (safety default
   during heavy build/flash work) — re-enable only when ready to resume
   normal auto-publish-on-build.
+- **Freematics Controller App does not reliably show live data (2026-09-23,
+  UNRESOLVED).** BLE link stays connected and the firmware keeps responding
+  to commands (`[BLE] BATT/TEMP/FS/UPTIME` lines never stop in serial logs),
+  but the app UI often shows nothing. Confirmed NOT caused by: WiFi/BT radio
+  coexistence (reproduced with WiFi fully off), cellular RF interference
+  (reproduced with cellular fully off too), or the NimBLE-vs-Bluedroid GATT
+  backend itself (a clean stock-upstream Bluedroid build works instantly and
+  reliably; restoring Bluedroid into this fork does NOT fix it). Strong
+  suspect, not yet confirmed: this fork's live heap under full load (WiFi+
+  cellular+HTTPD+OBD+catchup all active) is dramatically lower with Bluedroid
+  (`HEAP:free=14336 maxblock=5108`) than with NimBLE (`HEAP:free=70992
+  maxblock=65524`) — low heap could silently fail BLE notify allocations.
+  Since stock-upstream firmware (much leaner, none of this fork's other
+  subsystems) has no such issue, the bug is most likely in something THIS
+  FORK added interacting with BLE (heap pressure from the combined feature
+  set, or the `processBLE()` call-site timing which was changed from a
+  single long wait to 100ms slices interleaved with `serverProcess()` — see
+  `telelogger.ino` around the main `dataInterval` wait loop), not the BLE
+  backend choice itself. Workaround in the meantime: local HTTPD API
+  (`/api/live`, `/api/control?cmd=...`) over WiFi, independent of BLE.
