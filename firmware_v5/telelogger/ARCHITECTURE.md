@@ -426,12 +426,29 @@ into a real-world-calibrated value.
 
 ## B10. Known open items (as of 2026-09-22, see project memory for detail)
 
-- Cellular OTA with real firmware download-and-flash: diagnostic-only
-  (`testCellularOtaMeta()`) confirmed working; the real streaming-flash path
-  is explicitly deferred to a separate bench session.
-- `publish_ota_config.json` currently renamed `.disabled` (safety default
-  during heavy build/flash work) — re-enable only when ready to resume
-  normal auto-publish-on-build.
+- **WiFi pull-OTA real firmware download-and-flash: CONFIRMED WORKING
+  END-TO-END 2026-09-23**, live on the real device (ZKUCA42T). Full
+  `publish_ota.py` → `ota_push_watcher.py` (`OTA_READY`) →
+  `performPullOtaCheck()` → SD staging → reboot → `performPullOtaFlash()` →
+  reboot into new firmware cycle observed start to finish via serial log:
+  download 1330448/1330448 bytes, `SHA256 OK`, flash 100%, boot banner
+  changed from the old build timestamp to the new one. The `ota_confirm`
+  HTTP callback returned 404 (server-side endpoint missing/mismatched) but
+  this is explicitly non-fatal by design (see `telelogger.ino` around
+  `[OTA-PULL] Confirm`) and did not block the real update. Integrity checks
+  confirmed by reading the code directly: exact byte-count match required
+  before `Update.begin()`, `Update.end()`'s own image validation gates the
+  reboot-into-new-firmware step, SHA256 checked against meta.json during
+  download - a failure at any point aborts and leaves the OLD firmware
+  running, never a partial/corrupt flash.
+- Cellular pull-OTA: `meta.json` fetch is real and working (not diagnostic-
+  only - `AT+CCHOPEN`/`CellSIMCOM::inbound()` root-caused and fixed
+  2026-09-22, commit `1415be7`), but the real firmware download-and-flash
+  path (same code as WiFi, via `CellHTTP` instead of `WifiHTTP`) has still
+  never been exercised end-to-end - untested, not known-broken.
+- `ota_confirm` endpoint returns 404 from the current `ota_server.py`
+  deployment - worth fixing server-side even though it's non-fatal to the
+  actual update (loses the "device confirmed receipt" bookkeeping signal).
 - **Freematics Controller App does not reliably show live data (2026-09-23,
   UNRESOLVED).** BLE link stays connected and the firmware keeps responding
   to commands (`[BLE] BATT/TEMP/FS/UPTIME` lines never stop in serial logs),
