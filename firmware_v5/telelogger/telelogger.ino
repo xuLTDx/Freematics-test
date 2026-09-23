@@ -17,6 +17,7 @@
 
 #include <Arduino.h>
 #include <Update.h>
+#include <SPIFFS.h>
 #include <ctype.h>
 #include <math.h>
 #include <string.h>
@@ -941,6 +942,42 @@ bool teleLoginState()
   return teleClient.login;
 }
 
+// 2026-09-23: httpd-task-safe accessors mirroring processBLE()'s NET_OP/
+// NET_IP/NET_PACKET/NET_DATA/NET_RATE/RSSI commands, so the same info is
+// available over the web API (handlerControl in dataserver.cpp), not just
+// BLE - same pattern as getStateBits()/teleLoginState() above.
+const char* httpNetOp()
+{
+#if ENABLE_WIFI
+  if (state.check(STATE_WIFI_CONNECTED)) return wifiSSID[0] ? wifiSSID : "-";
+#endif
+  return netop.length() ? netop.c_str() : "-";
+}
+const char* httpNetIp()
+{
+  return ip.length() ? ip.c_str() : "-";
+}
+uint32_t httpNetPacketCount()
+{
+  return teleClient.txCount;
+}
+uint32_t httpNetByteCount()
+{
+  return teleClient.txBytes;
+}
+uint32_t httpNetRateKBh()
+{
+  return teleClient.startTime ? (uint32_t)((uint64_t)(teleClient.txBytes + teleClient.rxBytes) * 3600 / (millis() - teleClient.startTime)) : 0;
+}
+int httpRssi()
+{
+  return rssi;
+}
+const char* httpApn()
+{
+  return apn[0] ? apn : "DEFAULT";
+}
+
 // More live-diagnostic getters for dataserver.cpp's /api/info - added
 // 2026-09-15 per request: "nech clovek vidi ze nieco ide, statusy, ip, gps
 // satelity pozicia, logovanie, kolko odoslalo dat akou cestou" (a status
@@ -1188,6 +1225,51 @@ void processExtInputs(CBuffer* buffer)
   HTTP API
 *******************************************************************************/
 #if ENABLE_HTTPD
+// 2026-09-23: human-readable name for a standard OBD-II Mode 1 PID (the raw
+// byte, NOT the 0x100-offset wire value handlerLiveData() reports), so
+// /api/live is usable directly in a browser without a lookup table on the
+// caller's side. Covers exactly the PIDs actually polled in obdData[] above
+// - falls back to a hex string for anything else so nothing is silently
+// dropped if that table ever changes.
+const char* pidName(uint8_t pid)
+{
+    switch (pid) {
+        case PID_ENGINE_LOAD: return "Engine Load";
+        case PID_COOLANT_TEMP: return "Coolant Temp";
+        case PID_SHORT_TERM_FUEL_TRIM_1: return "Short Term Fuel Trim 1";
+        case PID_LONG_TERM_FUEL_TRIM_1: return "Long Term Fuel Trim 1";
+        case PID_SHORT_TERM_FUEL_TRIM_2: return "Short Term Fuel Trim 2";
+        case PID_LONG_TERM_FUEL_TRIM_2: return "Long Term Fuel Trim 2";
+        case PID_FUEL_PRESSURE: return "Fuel Pressure";
+        case PID_INTAKE_MAP: return "Intake MAP";
+        case PID_RPM: return "Engine RPM";
+        case PID_SPEED: return "Vehicle Speed";
+        case PID_TIMING_ADVANCE: return "Timing Advance";
+        case PID_INTAKE_TEMP: return "Intake Air Temp";
+        case PID_MAF_FLOW: return "MAF Flow";
+        case PID_THROTTLE: return "Throttle Position";
+        case PID_RUNTIME: return "Engine Runtime";
+        case PID_BAROMETRIC: return "Barometric Pressure";
+        case PID_CATALYST_TEMP_B1S1: return "Catalyst Temp B1S1";
+        case PID_CATALYST_TEMP_B2S1: return "Catalyst Temp B2S1";
+        case PID_CONTROL_MODULE_VOLTAGE: return "Control Module Voltage";
+        case PID_ABSOLUTE_ENGINE_LOAD: return "Absolute Engine Load";
+        case PID_RELATIVE_THROTTLE_POS: return "Relative Throttle Pos";
+        case PID_AMBIENT_TEMP: return "Ambient Air Temp";
+        case PID_ACC_PEDAL_POS_D: return "Accel Pedal Pos D";
+        case PID_ACC_PEDAL_POS_E: return "Accel Pedal Pos E";
+        case PID_REL_ACCEL_PEDAL: return "Relative Accel Pedal";
+        case PID_ETHANOL_FUEL: return "Ethanol Fuel %";
+        case PID_ENGINE_OIL_TEMP: return "Engine Oil Temp";
+        case PID_HYBRID_BATTERY_PERCENTAGE: return "Hybrid Battery %";
+        case PID_ENGINE_FUEL_RATE: return "Engine Fuel Rate";
+        case PID_ENGINE_TORQUE_DEMANDED: return "Engine Torque Demanded";
+        case PID_ENGINE_TORQUE_PERCENTAGE: return "Engine Torque %";
+        case PID_ENGINE_REF_TORQUE: return "Engine Reference Torque";
+        default: return "Unknown";
+    }
+}
+
 int handlerLiveData(UrlHandlerParam* param)
 {
     char *buf = param->pucBuffer;
@@ -1195,8 +1277,8 @@ int handlerLiveData(UrlHandlerParam* param)
     int n = snprintf(buf, bufsize, "{\"obd\":{\"vin\":\"%s\",\"battery\":%.1f,\"pid\":[", vin, batteryVoltage);
     uint32_t t = millis();
     for (int i = 0; i < sizeof(obdData) / sizeof(obdData[0]); i++) {
-        n += snprintf(buf + n, bufsize - n, "{\"pid\":%u,\"value\":%d,\"age\":%u},",
-            0x100 | obdData[i].pid, obdData[i].value, (unsigned int)(t - obdData[i].ts));
+        n += snprintf(buf + n, bufsize - n, "{\"pid\":%u,\"name\":\"%s\",\"value\":%d,\"age\":%u},",
+            0x100 | obdData[i].pid, pidName(obdData[i].pid), obdData[i].value, (unsigned int)(t - obdData[i].ts));
     }
     n--;
     n += snprintf(buf + n, bufsize - n, "]}");
@@ -1211,6 +1293,11 @@ int handlerLiveData(UrlHandlerParam* param)
       n += snprintf(buf + n, bufsize - n, ",\"gps\":{\"utc\":\"%s\",\"lat\":%f,\"lng\":%f,\"alt\":%f,\"speed\":%f,\"sat\":%d,\"age\":%u}",
           isoTime, gd->lat, gd->lng, gd->alt, gd->speed, (int)gd->sat, (unsigned int)(millis() - gd->ts));
     }
+    // 2026-09-23: same info as processBLE()'s NET_OP/RSSI/APN?/NET_PACKET/
+    // NET_DATA/NET_RATE commands, folded into /api/live so one request
+    // covers everything the app would otherwise show over BLE.
+    n += snprintf(buf + n, bufsize - n, ",\"net\":{\"op\":\"%s\",\"ip\":\"%s\",\"apn\":\"%s\",\"rssi\":%d,\"packets\":%u,\"bytes\":%u,\"rateKBh\":%u}",
+        httpNetOp(), httpNetIp(), httpApn(), httpRssi(), httpNetPacketCount(), httpNetByteCount(), httpNetRateKBh());
     buf[n++] = '}';
     param->contentLength = n;
     param->contentType=HTTPFILETYPE_JSON;
@@ -3295,6 +3382,9 @@ void loadConfig()
     // Users who want BLE alongside webhooks can set ENABLE_BLE=1 explicitly.
     enableBle = 0;
   }
+  // 2026-09-23 diagnostic-only: print the actual resolved state so we can
+  // see on this real device whether enableBle got silently forced to 0.
+  Serial.printf("[BLE-DIAG] enableBle=%u webhookPath=\"%s\"\n", enableBle, webhookPath);
 #endif
 
   // Enable verbose cellular debug logging at runtime.  NVS key CELL_DEBUG is
@@ -5133,6 +5223,17 @@ if (!state.check(STATE_MEMS_READY)) do {
 
 #if ENABLE_HTTPD
   if (enableHttpd) {
+    // 2026-09-23: mount SPIFFS independently of the log-storage backend, so
+    // the httpd's static file serving (dashboard/index.html, live.html) has
+    // somewhere to read from. Previously SPIFFS.begin() only ran inside
+    // SPIFFSLogger::init() (STORAGE == STORAGE_SPIFFS) - this fork uses
+    // STORAGE_SD for logs, so that code path never ran and SPIFFS was never
+    // mounted, making every static web file 404 regardless of whether it
+    // was actually uploaded to the partition via `pio run -t uploadfs`.
+    if (!SPIFFS.begin()) {
+      Serial.println("[SPIFFS] mount failed, formatting...");
+      SPIFFS.begin(true);
+    }
     IPAddress ip;
     if (serverSetup(ip)) {
       Serial.print("HTTPD:");

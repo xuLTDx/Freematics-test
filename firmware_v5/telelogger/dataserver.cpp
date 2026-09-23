@@ -70,6 +70,15 @@ extern uint32_t wmDoneFileId;  // missed-data catch-up watermark (NVS key WM_FIL
 extern bool s_catchupPending;  // re-run catchUpMissedFiles() next send-loop iteration
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
 extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
+// 2026-09-23: mirrors processBLE()'s NET_OP/NET_IP/NET_PACKET/NET_DATA/
+// NET_RATE/RSSI/APN? commands for the web API (cmd=NET_OP etc below).
+extern const char* httpNetOp();
+extern const char* httpNetIp();
+extern uint32_t httpNetPacketCount();
+extern uint32_t httpNetByteCount();
+extern uint32_t httpNetRateKBh();
+extern int httpRssi();
+extern const char* httpApn();
 // Set to true while an OTA flash is in progress so the telemetry task yields
 // the WiFi radio to the upload (defined in telelogger.ino).
 extern volatile bool s_ota_active;
@@ -550,6 +559,20 @@ int handlerControl(UrlHandlerParam* param)
     } else if (!strcmp(cmd, "ON?")) {
         // Query standby state: returns 0 when paused/standby, 1 when active.
         n = snprintf(buf, bufsize, "%u", httpIsStandby() ? 0 : 1);
+    } else if (!strcmp(cmd, "NET_OP")) {
+        n = snprintf(buf, bufsize, "%s", httpNetOp());
+    } else if (!strcmp(cmd, "NET_IP")) {
+        n = snprintf(buf, bufsize, "%s", httpNetIp());
+    } else if (!strcmp(cmd, "NET_PACKET")) {
+        n = snprintf(buf, bufsize, "%u", httpNetPacketCount());
+    } else if (!strcmp(cmd, "NET_DATA")) {
+        n = snprintf(buf, bufsize, "%u", httpNetByteCount());
+    } else if (!strcmp(cmd, "NET_RATE")) {
+        n = snprintf(buf, bufsize, "%u", httpNetRateKBh());
+    } else if (!strcmp(cmd, "RSSI")) {
+        n = snprintf(buf, bufsize, "%d", httpRssi());
+    } else if (!strcmp(cmd, "APN?")) {
+        n = snprintf(buf, bufsize, "%s", httpApn());
     } else if (!strcmp(cmd, "OTA_CHECK_NOW")) {
         // Makes the periodic pull-OTA check run on its next telemetry-task
         // pass instead of waiting for OTA_INTERVAL. No-op if OTA isn't

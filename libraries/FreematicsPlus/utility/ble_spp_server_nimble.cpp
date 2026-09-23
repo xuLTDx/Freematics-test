@@ -80,11 +80,19 @@ static SemaphoreHandle_t g_blePauseMutex = nullptr;
 // ---------------------------------------------------------------------------
 class SppServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
-        Serial.println("[BLE] client connected");
+        Serial.printf("[BLE] client connected (peers=%u)\n", (unsigned)pServer->getConnectedCount());
     }
+    // 2026-09-23: diagnostic-only addition (no behavior change) - printing
+    // peer count and post-restart advertising state to find out why
+    // advertising sometimes doesn't come back after a mid-session disconnect
+    // (observed a 69s gap with zero reconnect and a calm WiFi link, so it's
+    // neither the ble_pause()/ble_resume() cycle nor WiFi coexistence).
     void onDisconnect(BLEServer* pServer) override {
-        Serial.println("[BLE] client disconnected - restarting advertising");
+        Serial.printf("[BLE] client disconnected (peers=%u) - restarting advertising\n",
+                       (unsigned)pServer->getConnectedCount());
         BLEDevice::startAdvertising();
+        Serial.printf("[BLE] advertising active after restart: %d\n",
+                       (int)NimBLEDevice::getAdvertising()->isAdvertising());
     }
 };
 
