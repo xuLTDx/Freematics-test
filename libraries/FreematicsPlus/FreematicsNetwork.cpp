@@ -1147,11 +1147,18 @@ void CellHTTP::init()
           m_device->xbPurge();
           delay(300);
         }
+        // The modem outlives an ESP32 reset (OTA reboot, watchdog, crash). A
+        // CCH session left open by the previous boot makes CCHSTOP fail and
+        // CCHSET/CCHSTART with it - close it first (harmless ERROR if none).
+        sendCommand("AT+CCHCLOSE=0\r", 1000, "+CCHCLOSE:");
         sendCommand("AT+CCHSTOP\r");
-        // AT+CCHSET=1 enables +CCHSEND completion result reporting - per the
-        // Application Note's example sequence, this MUST be called before
-        // AT+CCHSTART, not after.
-        sendCommand("AT+CCHSET=1\r");
+        // AT+CCHSET=<report_send_result>,<recv_mode> - MUST be called before
+        // AT+CCHSTART (Application Note 2.2.5). recv_mode=1 (cache mode): the
+        // modem holds received data until read with AT+CCHRECV. The default
+        // recv_mode=0 pushes every TCP segment (~1400 B) unsolicited into a
+        // 512 B buffer, and xbReceive() drops lines/stops at 0x00 on binary
+        // data - confirmed live losing bytes mid firmware download.
+        sendCommand("AT+CCHSET=1,1\r");
         if (sendCommand("AT+CCHSTART\r")) {
           m_cchStarted = true;
         } else if (attempt == 0) {
@@ -1703,6 +1710,8 @@ bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const c
   return false;
 }
 
+static char* findHeaderEnd(char* data, int len);
+
 char* CellHTTP::receive(int* pbytes, unsigned int timeout)
 {
   if (m_type == CELL_SIM7070) {
@@ -1722,7 +1731,51 @@ char* CellHTTP::receive(int* pbytes, unsigned int timeout)
         return p;
       }
     }
-  } else if (m_type == CELL_SIM7600 || m_type == CELL_SIM7670) {
+  } else if (m_type == CELL_SIM7670) {
+    // Cache mode (see init()): collect the whole response into m_buffer via
+    // binary-safe AT+CCHRECV reads, stopping once Content-Length is met (or
+    // after a quiet second when there is none).
+    int total = 0;
+    int want = -1;
+    uint32_t t = millis();
+    uint32_t lastData = 0;
+    while (total < RECV_BUF_SIZE - 1 && millis() - t < timeout) {
+      int n = cchRecvRaw(m_buffer + total, RECV_BUF_SIZE - 1 - total, 3000);
+      if (n > 0) {
+        total += n;
+        lastData = millis();
+        if (want < 0) {
+          char* he = findHeaderEnd(m_buffer, total);
+          if (he) {
+            char saved = *he;
+            *he = 0;
+            char* cl = strstr(m_buffer, "Content-Length: ");
+            if (!cl) cl = strstr(m_buffer, "content-length: ");
+            *he = saved;
+            if (cl) want = (int)(he + 4 - m_buffer) + atoi(cl + 16);
+          }
+        }
+        if (want >= 0 && total >= want) break;
+        continue;
+      }
+      if (n < 0 || m_state == HTTP_DISCONNECTED) break;
+      if (total && want < 0 && millis() - lastData > 1000) break;
+      delay(100);
+    }
+    m_buffer[total] = 0;
+    if (!total) {
+      m_state = HTTP_ERROR;
+      return 0;
+    }
+    char* ps = strstr(m_buffer, "/1.1 ");
+    if (!ps) ps = strstr(m_buffer, "/1.0 ");
+    if (ps) m_code = atoi(ps + 5);
+    bool keepalive = strstr(m_buffer, ": close\r\n") == 0;
+    m_state = HTTP_CONNECTED;
+    if (!keepalive) close();
+    if (pbytes) *pbytes = total;
+    return m_buffer;
+  } else if (m_type == CELL_SIM7600) {
     // 2026-09-22: SIM7670 merged into this shared AT+CCH* receive (was a
     // separate AT+HTTP*-based implementation here - see send()'s and
     // open()'s comments for why).
@@ -1894,6 +1947,70 @@ char* CellHTTP::receive(int* pbytes, unsigned int timeout)
 // plus trailing "\r\n+CCHRECV: 0\r\nOK\r\n".  64 bytes is conservative.
 static const int AT_CCHRECV_OVERHEAD = 64;
 
+// Binary-safe replacement for sendCommand()/xbReceive() on AT+CCHRECV: the
+// response framing ("+CCHRECV: DATA,0,<len>\r\n" ... "+CCHRECV: 0,<err>") is
+// read as text lines, but the <len> payload bytes in between are read by
+// count with xbRead() - never scanned with strstr() (stops at 0x00) and never
+// subject to xbReceive()'s drop-oldest-line on a full buffer.
+int CellHTTP::cchRecvRaw(char* buf, int maxLen, unsigned int timeout)
+{
+  if (maxLen > 2048) maxLen = 2048;  // AT+CCHRECV max_recv_len range 0-2048
+  if (maxLen <= 0) return -1;
+  char cmd[32];
+  sprintf(cmd, "AT+CCHRECV=0,%d\r", maxLen);
+  m_device->xbWrite(cmd);
+
+  char line[96];
+  int ll = 0;
+  int total = 0;
+  bool sawData = false;
+  uint32_t t = millis();
+  while (millis() - t < timeout) {
+    char c;
+    if (m_device->xbRead(&c, 1, 50) != 1) continue;
+    if (c != '\n') {
+      if (ll < (int)sizeof(line) - 1) line[ll++] = c;
+      continue;
+    }
+    if (ll && line[ll - 1] == '\r') ll--;
+    line[ll] = 0;
+    ll = 0;
+    if (!strncmp(line, "+CCHRECV: DATA,", 15) || !strncmp(line, "+CCHRECV:DATA,", 14)) {
+      int len = atoi(strrchr(line, ',') + 1);
+      if (len <= 0 || len > maxLen - total) return -1;  // never asked for this much
+      int got = 0;
+      while (got < len && millis() - t < timeout) {
+        int n = m_device->xbRead(buf + total + got, len - got, 200);
+        if (n > 0) got += n;
+      }
+      if (got < len) return -1;
+      total += len;
+      sawData = true;
+    } else if (!strncmp(line, "+CCHRECV: 0,", 12) || !strncmp(line, "+CCHRECV:0,", 11)) {
+      if (sawData) return total;
+      // "+CCHRECV: 0,<err>" then "ERROR": nothing cached yet. Swallow the
+      // trailing ERROR so it isn't left for the next command.
+      char tail[16];
+      m_device->xbRead(tail, sizeof(tail), 100);
+      return 0;
+    } else if (!strcmp(line, "ERROR")) {
+      return sawData ? total : 0;
+    } else if (strstr(line, "+CCH_PEER_CLOSED") || strstr(line, "+CCHCLOSE")) {
+      m_state = HTTP_DISCONNECTED;
+    }
+    // anything else (OK, blank lines, +CCHEVENT/+CIPRXGET URCs) is ignored
+  }
+  return sawData ? total : -1;
+}
+
+static char* findHeaderEnd(char* data, int len)
+{
+  for (int i = 0; i + 3 < len; i++) {
+    if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') return data + i;
+  }
+  return 0;
+}
+
 int CellHTTP::receiveHeaders(int* contentLength, unsigned int timeout)
 {
   m_streamBodyLen = 0;
@@ -1906,6 +2023,49 @@ int CellHTTP::receiveHeaders(int* contentLength, unsigned int timeout)
   // 2026-09-22 commit 1415be7 - this streaming variant just never got the
   // same extension when it was written).
   if (m_type != CELL_SIM7600 && m_type != CELL_SIM7670) return -1;
+
+  if (m_type == CELL_SIM7670) {
+    // Cache mode (see init()): poll AT+CCHRECV until the header block is in.
+    int total = 0;
+    char* hdrEnd = 0;
+    uint32_t t = millis();
+    while (!hdrEnd && total < RECV_BUF_SIZE - 1 && millis() - t < timeout) {
+      int n = cchRecvRaw(m_buffer + total, RECV_BUF_SIZE - 1 - total, 3000);
+      if (n > 0) {
+        total += n;
+        hdrEnd = findHeaderEnd(m_buffer, total);
+      } else if (n < 0 || m_state == HTTP_DISCONNECTED) {
+        break;
+      } else {
+        delay(100);
+      }
+    }
+    if (!hdrEnd) {
+      m_state = HTTP_ERROR;
+      return -1;
+    }
+    *hdrEnd = 0;
+    int code = -1;
+    char* ps = strstr(m_buffer, "HTTP/1.");
+    if (ps) {
+      code = atoi(ps + 9);
+      m_code = (uint16_t)code;
+    }
+    if (contentLength) {
+      char* cl = strstr(m_buffer, "Content-Length: ");
+      if (!cl) cl = strstr(m_buffer, "content-length: ");
+      if (!cl) cl = strstr(m_buffer, "Content-length: ");
+      if (cl) *contentLength = atoi(cl + 16);
+    }
+    int bodyOffset = (int)(hdrEnd + 4 - m_buffer);
+    int bodyLen = total - bodyOffset;
+    if (bodyLen > 0) {
+      memmove(m_buffer, m_buffer + bodyOffset, bodyLen);
+      m_streamBodyLen = bodyLen;
+    }
+    m_state = (code >= 200 && code < 300) ? HTTP_CONNECTED : HTTP_ERROR;
+    return code;
+  }
 
   // Wait for an incoming-data notification or a peer-close event.
   if (m_state != HTTP_DISCONNECTED) {
@@ -2015,6 +2175,22 @@ int CellHTTP::receiveBodyBytes(char* buf, int maxLen, unsigned int timeout)
   // 2026-09-23: same SIM7670 extension as receiveHeaders() above.
   if (m_type != CELL_SIM7600 && m_type != CELL_SIM7670) return -1;
   if (m_state != HTTP_CONNECTED && m_state != HTTP_DISCONNECTED) return -1;
+
+  if (m_type == CELL_SIM7670) {
+    // Cache mode: an empty cache just means the next bytes haven't reached
+    // the modem yet (weak signal) - keep polling until `timeout`.
+    uint32_t t = millis();
+    for (;;) {
+      int n = cchRecvRaw(buf, maxLen, 5000);
+      if (n != 0) return n;  // data, or -1 = garbled read (caller aborts, resume + SHA256 cover it)
+      if (m_state == HTTP_DISCONNECTED) return 0;
+      if (millis() - t >= timeout) {
+        Serial.println("[CELL] receiveBodyBytes: timed out waiting for next chunk");
+        return 0;
+      }
+      delay(100);
+    }
+  }
 
   const int toRead = RECV_BUF_SIZE - AT_CCHRECV_OVERHEAD;
 

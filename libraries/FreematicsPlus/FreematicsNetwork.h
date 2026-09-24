@@ -321,6 +321,10 @@ private:
     // "fresh" call. Track whether CCHSTART already succeeded once and skip
     // the stop/restart sequence on later init() calls.
     bool m_cchStarted = false;
+    // SIM7670 only: one binary-safe AT+CCHRECV read in cache mode (see
+    // init()). Returns bytes placed in buf (>0), 0 if the modem has nothing
+    // cached yet, -1 if the response was garbled/incomplete.
+    int cchRecvRaw(char* buf, int maxLen, unsigned int timeout);
 };
 
 #endif
