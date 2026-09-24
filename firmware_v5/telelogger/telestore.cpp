@@ -165,10 +165,41 @@ int FileLogger::getFileID(File& root)
     }
 }
 
+// A reset in the middle of an SD write sometimes leaves the card (which
+// keeps power - no SD power switch on this board) not answering CMD0 for a
+// while: "NO SD CARD" for the whole session. Confirmed live that MISO is
+// idle (0xFF, not busy, not driven by the OBD co-processor sharing the bus)
+// and that the card does come back given time - three retries within
+// ~1.4 s failed, a later one succeeded. So retry with growing gaps (~6 s
+// total, only on the failing path). The Stop Tran token (0xFD) + 80 clocks
+// per the SD SPI protocol end any half-finished multi-block write first.
+static void sdUnstick()
+{
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, LOW);
+    SPI.transfer(0xFD);
+    for (uint32_t t = millis(); millis() - t < 500; ) {
+        if (SPI.transfer(0xFF) == 0xFF) break;  // busy (DO held low) is over
+    }
+    digitalWrite(PIN_SD_CS, HIGH);
+    for (int i = 0; i < 10; i++) SPI.transfer(0xFF);  // 80 clocks, deselected
+    SPI.endTransaction();
+}
+
 bool SDLogger::init()
 {
     SPI.begin();
-    if (SD.begin(PIN_SD_CS, SPI, SPI_FREQ)) {
+    bool ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ);
+    uint32_t gap = 200;
+    for (int attempt = 1; !ok && attempt <= 6; attempt++, gap *= 2) {
+        Serial.printf("SD:init failed, recovery attempt %d\n", attempt);
+        SD.end();
+        sdUnstick();
+        delay(gap > 3200 ? 3200 : gap);
+        ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ);
+    }
+    if (ok) {
         unsigned int total = SD.totalBytes() >> 20;
         unsigned int used = SD.usedBytes() >> 20;
         Serial.print("SD:");
