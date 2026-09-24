@@ -565,6 +565,16 @@ char isoTime[32] = {0};
 
 // stats data
 uint32_t lastMotionTime = 0;
+// Which signal last refreshed lastMotionTime: 'V' voltage >= ENGINE_OFF_VOLTAGE,
+// 'R' RPM > 0, 'G' GPS speed, '-' none since boot. Logged at standby entry so a
+// drive log shows what kept the device awake (e.g. GPS noise while parked).
+char lastMotionSrc = '-';
+// Survive ESP.restart() after standby wake so the next boot can log how long
+// standby lasted and at what voltage it woke (SD is closed during standby).
+#define WAKE_INFO_MAGIC 0x57414B45UL
+RTC_NOINIT_ATTR uint32_t wakeInfoMagic;
+RTC_NOINIT_ATTR float wakeInfoVolt;
+RTC_NOINIT_ATTR uint32_t wakeInfoStandbySecs;
 uint32_t timeoutsOBD = 0;
 uint32_t timeoutsNet = 0;
 uint32_t lastStatsTime = 0;
@@ -1426,7 +1436,7 @@ void processOBD(CBuffer* buffer)
         obdData[i].value = value;
         // Engine running = not parked, whatever the voltage says (see the
         // standby comment in process()).
-        if (pid == PID_RPM && value > 0) lastMotionTime = millis();
+        if (pid == PID_RPM && value > 0) { lastMotionTime = millis(); lastMotionSrc = 'R'; }
         buffer->add((uint16_t)pid | 0x100, ELEMENT_INT32, &value, sizeof(value));
     } else {
         timeoutsOBD++;
@@ -1887,6 +1897,13 @@ void initialize()
       resetReasonPending = true;
       snprintf(diag, sizeof(diag), "RESET_REASON=%ld", (long)resetReasonCode);
       logger.logEvent(diag);
+      // Set by standby() just before its ESP.restart() on voltage wake.
+      if (wakeInfoMagic == WAKE_INFO_MAGIC) {
+        wakeInfoMagic = 0;
+        snprintf(diag, sizeof(diag), "WAKEUP V=%.2f after=%lus standby",
+            wakeInfoVolt, (unsigned long)wakeInfoStandbySecs);
+        logger.logEvent(diag);
+      }
       snprintf(diag, sizeof(diag), "STATE OBD=%c GPS=%c MEMS=%c",
           state.check(STATE_OBD_READY)  ? '1' : '0',
           state.check(STATE_GPS_READY)  ? '1' : '0',
@@ -2075,6 +2092,18 @@ bool waitMotion(long timeout)
   return false;
 }
 
+// SD record of why/when standby was entered - the post-drive evidence for the
+// ENGINE_OFF_VOLTAGE / standby-timer calibration (logged before standby()
+// closes the SD log).
+static void logStandbyEntry(const char* cause, unsigned int motionless)
+{
+  char msg[112];
+  snprintf(msg, sizeof(msg), "STANDBY cause=%s motionless=%us V=%.2f src=%c kmh=%.1f",
+      cause, motionless, batteryVoltage, lastMotionSrc, gd ? gd->speed * 1.852f : -1.0f);
+  Serial.println(msg);
+  logNetEvent(msg);
+}
+
 /*******************************************************************************
   Collecting and processing data
 *******************************************************************************/
@@ -2096,6 +2125,7 @@ void process()
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OBD ECU_OFF");
 #endif
+        logStandbyEntry("OBD_ERRORS", (millis() - lastMotionTime) / 1000);
         state.clear(STATE_OBD_READY | STATE_WORKING);
         return;
       }
@@ -2168,7 +2198,7 @@ void process()
   // drive data (no historical KEY_BATTERY readings survived tonight's DB
   // wipes). Revisit once a real drive has logged engine-on vs engine-off
   // voltage to Traccar.
-  if (batteryVoltage >= ENGINE_OFF_VOLTAGE) lastMotionTime = millis();
+  if (batteryVoltage >= ENGINE_OFF_VOLTAGE) { lastMotionTime = millis(); lastMotionSrc = 'V'; }
 #endif
 
 #if LOG_EXT_SENSORS
@@ -2194,6 +2224,7 @@ void process()
         if (++movingFixes >= 3) {
           movingFixes = 3;
           lastMotionTime = millis();
+          lastMotionSrc = 'G';
         }
       } else {
         movingFixes = 0;
@@ -2435,6 +2466,7 @@ void process()
         // No response: ECU is offline (ignition cut).  Enter standby now
         // without waiting for the full countdown to expire.
         Serial.println("OBD:ECU offline at standby-timer start - entering standby immediately");
+        logStandbyEntry("ECU_OFF", motionless);
         state.clear(STATE_WORKING);
         return;
       }
@@ -2458,6 +2490,7 @@ void process()
     Serial.print("Stationary for ");
     Serial.print(motionless);
     Serial.println(" secs");
+    logStandbyEntry("TIMER", motionless);
     // trip ended, go into standby
     state.clear(STATE_WORKING);
     return;
@@ -3359,14 +3392,20 @@ void standby()
   // project_freematics_one_hardware_inventory). Mirrors the standby-entry
   // redesign above: same JUMPSTART_VOLTAGE=13.2V threshold as before, now
   // the ONLY wake condition rather than one of three branches.
+  const uint32_t standbyStart = millis();
+  float wakeVolt = 0;
 #if ENABLE_OBD
   do {
     delay(5000);
-  } while (obd.getVoltage() < JUMPSTART_VOLTAGE);
+    wakeVolt = obd.getVoltage();
+  } while (wakeVolt < JUMPSTART_VOLTAGE);
 #else
   delay(5000);
 #endif
   Serial.println("WAKEUP");
+  wakeInfoVolt = wakeVolt;
+  wakeInfoStandbySecs = (millis() - standbyStart) / 1000;
+  wakeInfoMagic = WAKE_INFO_MAGIC;
   sys.resetLink();
 #if RESET_AFTER_WAKEUP
   ESP.restart();
