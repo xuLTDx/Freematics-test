@@ -654,6 +654,12 @@ bool s_catchupPending = true;
 #define OTA_PENDING_PATH "/ota_fw.bin"    // staged firmware binary
 #define OTA_META_PATH    "/ota_meta.txt"  // companion: expected byte count (decimal)
 #define OTA_NVS_PATH     "/ota_nvs.bin"   // staged NVS settings binary (optional)
+// Present only while OTA_PENDING_PATH is an unfinished download: "<size>\n
+// <sha256>\n" of the target it belongs to, so the next check can resume it
+// (HTTP Range) instead of starting over. Deliberately separate from
+// OTA_META_PATH, which keeps its meaning of "complete and SHA256-verified,
+// safe to flash" - the boot-time check flashes on META alone.
+#define OTA_RESUME_PATH  "/ota_resume.txt"
 
 // Set by performPullOtaCheck() when a firmware has been fully downloaded to SD.
 // Cleared by performPullOtaFlash() on success or unrecoverable error.
@@ -701,6 +707,12 @@ static uint32_t s_cachedSdFreeMb  = 0;
 #define PULL_OTA_MIN_FW_SIZE       65536U   // 64 KB
 // Chunk size for SD download and SDÃ¢â€ â€™flash write loops.
 #define PULL_OTA_CHUNK_SIZE        4096U    // 4 KB
+// FAT only records a file's size in its directory entry on flush/close - an
+// abrupt power loss mid-download (confirmed live: reset at 405504 bytes left
+// a 0-byte partial on reboot) would otherwise lose the whole partial for
+// resume purposes. Flushing every 64 KB bounds the loss to at most that much
+// without syncing FAT on every 4 KB chunk.
+#define PULL_OTA_FLUSH_BYTES       65536U   // 64 KB
 // Per-chunk receive timeout when streaming from the network socket.
 #define PULL_OTA_CHUNK_TIMEOUT_MS  30000U   // 30 s
 // Delay after setting s_ota_active to let the telemetry task yield its SSL
@@ -725,6 +737,7 @@ static uint8_t s_otaChunkBuf[PULL_OTA_CHUNK_SIZE];
 static size_t cellDownloadBody(File& file, size_t expectedSize, mbedtls_sha256_context* sha256Ctx)
 {
   size_t written = 0;
+  size_t sinceFlush = 0;
   while (written < expectedSize) {
     int toRead = (int)(expectedSize - written);
     if (toRead > (int)PULL_OTA_CHUNK_SIZE) toRead = (int)PULL_OTA_CHUNK_SIZE;
@@ -734,7 +747,13 @@ static size_t cellDownloadBody(File& file, size_t expectedSize, mbedtls_sha256_c
     if (nw != (size_t)n) break;
     written += (size_t)n;
     if (sha256Ctx) mbedtls_sha256_update_ret(sha256Ctx, s_otaChunkBuf, (size_t)n);
+    sinceFlush += (size_t)n;
+    if (sinceFlush >= PULL_OTA_FLUSH_BYTES) {
+      file.flush();
+      sinceFlush = 0;
+    }
   }
+  file.flush();
   return written;
 }
 
@@ -1921,9 +1940,18 @@ void initialize()
         SD.remove(OTA_PENDING_PATH);
         SD.remove(OTA_META_PATH);
         SD.remove(OTA_NVS_PATH);
+        SD.remove(OTA_RESUME_PATH);
         Serial.println("[OTA-PULL] Stale/incomplete SD staging files removed");
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL STALE_REMOVED");
       }
+    } else if (SD.exists(OTA_PENDING_PATH) && SD.exists(OTA_RESUME_PATH)) {
+      // Unfinished download from before this reboot (ignition off mid-
+      // transfer, signal lost, etc.) - keep it; performPullOtaCheck() resumes
+      // it if it still matches the offered target, or discards it if not.
+      File pf = SD.open(OTA_PENDING_PATH, FILE_READ);
+      Serial.printf("[OTA-PULL] Partial download on SD (%u bytes), kept for resume\n",
+                    pf ? (unsigned)pf.size() : 0U);
+      if (pf) pf.close();
     } else if (SD.exists(OTA_PENDING_PATH)) {
       // Firmware file without companion meta Ã¢â‚¬â€ can't verify, remove it.
       SD.remove(OTA_PENDING_PATH);
@@ -4404,11 +4432,57 @@ bool performPullOtaCheck()
   // --- SD-staging path (default): download to /ota_fw.bin, flash at standby -
   // This leaves active telemetry running; no data is lost.
   if (state.check(STATE_STORAGE_READY)) {
-    // a. Clean up any leftover files.
-    if (SD.exists(OTA_PENDING_PATH)) SD.remove(OTA_PENDING_PATH);
-    if (SD.exists(OTA_META_PATH)) SD.remove(OTA_META_PATH);
+    // 2026-09-23: resume an interrupted download instead of always restarting
+    // from byte 0 - a real cellular link can't be assumed to hold for the
+    // whole transfer of a ~1.3MB firmware (confirmed live: repeated real
+    // signal drops mid-download). Mirrors the same "never redo work already
+    // done" principle catchUpMissedFiles() already applies to telemetry SD
+    // backlog replay. OTA_RESUME_PATH ("<size>\n<sha256>\n") is written up
+    // front and identifies which target the partial OTA_PENDING_PATH belongs
+    // to; OTA_META_PATH is still only written after SHA256 verification (the
+    // boot-time check flashes on it). A resume is only trusted when both
+    // fields match what THIS meta.json check just offered - if a newer
+    // build was published in between, the stale partial is discarded and a
+    // fresh download starts, exactly like before.
+    size_t resumeFrom = 0;
+    if (SD.exists(OTA_RESUME_PATH) && SD.exists(OTA_PENDING_PATH)) {
+      File mf = SD.open(OTA_RESUME_PATH, FILE_READ);
+      if (mf) {
+        char sizeLine[24] = {0}, shaLine[80] = {0};
+        mf.readBytesUntil('\n', sizeLine, sizeof(sizeLine) - 1);
+        mf.readBytesUntil('\n', shaLine, sizeof(shaLine) - 1);
+        mf.close();
+        char* cr = strchr(shaLine, '\r');
+        if (cr) *cr = '\0';
+        if (strtoul(sizeLine, nullptr, 10) == fwSize && fwSha256Hex[0] && !strcmp(shaLine, fwSha256Hex)) {
+          File pf = SD.open(OTA_PENDING_PATH, FILE_READ);
+          if (pf) {
+            size_t existing = pf.size();
+            pf.close();
+            if (existing > 0 && existing < fwSize) resumeFrom = existing;
+          }
+        }
+      }
+    }
 
-    File fwFile = SD.open(OTA_PENDING_PATH, FILE_WRITE);
+    if (SD.exists(OTA_META_PATH)) SD.remove(OTA_META_PATH);
+    if (!resumeFrom) {
+      if (SD.exists(OTA_PENDING_PATH)) SD.remove(OTA_PENDING_PATH);
+      if (SD.exists(OTA_RESUME_PATH)) SD.remove(OTA_RESUME_PATH);
+      // Without a sha256 there's nothing to prove a later partial belongs
+      // to this same target, so such a download is simply never resumed.
+      if (fwSha256Hex[0]) {
+        File rf = SD.open(OTA_RESUME_PATH, FILE_WRITE);
+        if (rf) {
+          rf.printf("%u\n%s\n", (unsigned)fwSize, fwSha256Hex);
+          rf.close();
+        }
+      }
+    } else {
+      Serial.printf("[OTA-PULL] Resuming download from byte %u / %u\n", (unsigned)resumeFrom, (unsigned)fwSize);
+    }
+
+    File fwFile = SD.open(OTA_PENDING_PATH, resumeFrom ? FILE_APPEND : FILE_WRITE);
     if (!fwFile) {
       Serial.println("[OTA-PULL] Cannot create SD staging file");
 #if STORAGE != STORAGE_NONE
@@ -4417,9 +4491,9 @@ bool performPullOtaCheck()
       return false;
     }
 
-    size_t written = 0;
+    size_t written = resumeFrom;
     uint32_t dlStart = millis();
-    size_t lastLogAt = 0;
+    size_t lastLogAt = resumeFrom;
     bool dlOk = true;
 
     // Streaming SHA256 context Ã¢â‚¬â€ updated with every chunk written to SD.
@@ -4430,6 +4504,19 @@ bool performPullOtaCheck()
     if (doSha256) {
       mbedtls_sha256_init(&sha256Ctx);
       mbedtls_sha256_starts_ret(&sha256Ctx, 0);
+      if (resumeFrom) {
+        // Re-hash the bytes already on SD from a previous attempt so the
+        // running context reflects the whole file, not just what's newly
+        // downloaded this round.
+        File rf = SD.open(OTA_PENDING_PATH, FILE_READ);
+        if (rf) {
+          int n;
+          while ((n = rf.read(s_otaChunkBuf, PULL_OTA_CHUNK_SIZE)) > 0) {
+            mbedtls_sha256_update_ret(&sha256Ctx, s_otaChunkBuf, (size_t)n);
+          }
+          rf.close();
+        }
+      }
     }
 
 
@@ -4443,18 +4530,19 @@ bool performPullOtaCheck()
       if (!otaCellClient.open(otaHost, otaPort)) {
         Serial.printf("[OTA-PULL] Cell FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
         fwFile.close();
-        SD.remove(OTA_PENDING_PATH);
+        // Leave the staging file in place (2026-09-23) - a transient
+        // connect failure is exactly the resumable case, see the comment
+        // at the top of this block.
         if (doSha256) mbedtls_sha256_free(&sha256Ctx);
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_CONNECT");
 #endif
         return false;
       }
-      if (!otaCellClient.send(METHOD_GET, otaHost, otaPort, fwPath)) {
+      if (!otaCellClient.send(METHOD_GET, otaHost, otaPort, fwPath, 0, 0, resumeFrom)) {
         Serial.println("[OTA-PULL] Cell FW send failed");
         otaCellClient.close();
         fwFile.close();
-        SD.remove(OTA_PENDING_PATH);
         if (doSha256) mbedtls_sha256_free(&sha256Ctx);
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_SEND");
@@ -4463,11 +4551,10 @@ bool performPullOtaCheck()
       }
       int contentLength = 0;
       int httpCode = otaCellClient.receiveHeaders(&contentLength);
-      if (httpCode != 200) {
+      if (httpCode != 200 && httpCode != 206) {
         Serial.printf("[OTA-PULL] Cell FW HTTP %d\n", httpCode);
         otaCellClient.close();
         fwFile.close();
-        SD.remove(OTA_PENDING_PATH);
         if (doSha256) mbedtls_sha256_free(&sha256Ctx);
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) {
@@ -4478,12 +4565,14 @@ bool performPullOtaCheck()
 #endif
         return false;
       }
-      if (contentLength > 0 && (size_t)contentLength != fwSize) {
-        Serial.printf("[OTA-PULL] FW size mismatch: meta=%u header=%d\n",
-                      (unsigned)fwSize, contentLength);
-        fwSize = (size_t)contentLength;
+      size_t remaining = fwSize - resumeFrom;
+      if (contentLength > 0 && (size_t)contentLength != remaining) {
+        Serial.printf("[OTA-PULL] FW size mismatch: expected remaining=%u header=%d\n",
+                      (unsigned)remaining, contentLength);
+        remaining = (size_t)contentLength;
+        fwSize = resumeFrom + remaining;
       }
-      written = cellDownloadBody(fwFile, fwSize, doSha256 ? &sha256Ctx : nullptr);
+      written = resumeFrom + cellDownloadBody(fwFile, remaining, doSha256 ? &sha256Ctx : nullptr);
       if (written != fwSize) {
         Serial.printf("[OTA-PULL] Cell recv incomplete at %u / %u bytes\n", (unsigned)written, (unsigned)fwSize);
 #if STORAGE != STORAGE_NONE
@@ -4500,18 +4589,17 @@ bool performPullOtaCheck()
     if (!otaWifiClient.open(otaHost, otaPort)) {
       Serial.printf("[OTA-PULL] FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
       fwFile.close();
-      SD.remove(OTA_PENDING_PATH);
+      // Leave the staging file in place (2026-09-23) - resumable next time.
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_CONNECT");
 #endif
       return false;
     }
 
-    if (!otaWifiClient.send(METHOD_GET, fwPath)) {
+    if (!otaWifiClient.send(METHOD_GET, fwPath, 0, 0, resumeFrom)) {
       Serial.println("[OTA-PULL] FW send failed");
       otaWifiClient.close();
       fwFile.close();
-      SD.remove(OTA_PENDING_PATH);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_SEND");
 #endif
@@ -4520,11 +4608,10 @@ bool performPullOtaCheck()
 
     int contentLength = 0;
     int httpCode = otaWifiClient.receiveHeaders(&contentLength);
-    if (httpCode != 200) {
+    if (httpCode != 200 && httpCode != 206) {
       Serial.printf("[OTA-PULL] FW HTTP %d\n", httpCode);
       otaWifiClient.close();
       fwFile.close();
-      SD.remove(OTA_PENDING_PATH);
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) {
         char _ota_diag[48];
@@ -4534,10 +4621,13 @@ bool performPullOtaCheck()
 #endif
       return false;
     }
-    if (contentLength > 0 && (size_t)contentLength != fwSize) {
-      Serial.printf("[OTA-PULL] FW size mismatch: meta=%u header=%d\n",
-                    (unsigned)fwSize, contentLength);
-      fwSize = (size_t)contentLength;
+    {
+      size_t remaining = fwSize - resumeFrom;
+      if (contentLength > 0 && (size_t)contentLength != remaining) {
+        Serial.printf("[OTA-PULL] FW size mismatch: expected remaining=%u header=%d\n",
+                      (unsigned)remaining, contentLength);
+        fwSize = resumeFrom + (size_t)contentLength;
+      }
     }
 
     WiFiClientSecure& rawSock = otaWifiClient.rawClient();
@@ -4586,6 +4676,9 @@ bool performPullOtaCheck()
       }
       written += (size_t)n;
       if (doSha256) mbedtls_sha256_update_ret(&sha256Ctx, s_otaChunkBuf, (size_t)n);
+      if ((written - resumeFrom) / PULL_OTA_FLUSH_BYTES != (written - resumeFrom - (size_t)n) / PULL_OTA_FLUSH_BYTES) {
+        fwFile.flush();
+      }
       if (written - lastLogAt >= (fwSize / 10 ? fwSize / 10 : 1)) {
         lastLogAt = written;
         Serial.printf("[OTA-PULL] %u / %u bytes (%.0f%%) in %u ms\n",
@@ -4599,9 +4692,12 @@ bool performPullOtaCheck()
     fwFile.close();
 
     if (!dlOk || written != fwSize) {
-      Serial.printf("[OTA-PULL] Download incomplete (%u / %u bytes) Ã¢â‚¬â€ staging file removed\n",
+      // 2026-09-23: no longer deletes the staging file here - a transient
+      // network failure mid-download is exactly the resumable case (see the
+      // comment at the top of this block), so the next OTA check interval
+      // picks up from `written` bytes instead of re-downloading from 0.
+      Serial.printf("[OTA-PULL] Download incomplete (%u / %u bytes), kept for resume\n",
                     (unsigned)written, (unsigned)fwSize);
-      SD.remove(OTA_PENDING_PATH);
       if (doSha256) mbedtls_sha256_free(&sha256Ctx);
       return false;
     }
@@ -4627,7 +4723,11 @@ bool performPullOtaCheck()
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SHA256");
 #endif
+        // Genuine corruption (possibly from an earlier resumed segment) -
+        // unlike a transient network failure, this is not safely resumable.
+        // Wipe both staging files so the next attempt starts clean.
         SD.remove(OTA_PENDING_PATH);
+        SD.remove(OTA_RESUME_PATH);
         return false;
       }
       Serial.println("[OTA-PULL] SHA256 OK");
@@ -4679,6 +4779,8 @@ bool performPullOtaCheck()
         metaFile.close();
       }
     }
+    // Download is complete and verified - no longer a resumable partial.
+    SD.remove(OTA_RESUME_PATH);
 
     // ---- Step 3 (optional): Download NVS settings binary -------------------
     if (SD.exists(OTA_NVS_PATH)) SD.remove(OTA_NVS_PATH);

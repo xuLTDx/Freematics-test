@@ -21,7 +21,7 @@ on
 // telelogger.ino can read it from NVS and assign it after loadConfig().
 uint8_t cellNetDebug = 0;
 
-String HTTPClient::genHeader(HTTP_METHOD method, const char* path, const char* payload, int payloadSize)
+String HTTPClient::genHeader(HTTP_METHOD method, const char* path, const char* payload, int payloadSize, size_t rangeStart)
 {
   String header;
   // generate a simplest HTTP header
@@ -59,6 +59,14 @@ String HTTPClient::genHeader(HTTP_METHOD method, const char* path, const char* p
   if (method != METHOD_GET) {
     header += "\r\nContent-Type: application/json\r\nContent-Length: ";
     header += String(payloadSize);
+  }
+  // Resume support (2026-09-23): open-ended Range, for continuing an
+  // interrupted download from a known byte offset instead of restarting -
+  // see ota_server.py's firmware.bin handler for the matching server side.
+  if (rangeStart) {
+    header += "\r\nRange: bytes=";
+    header += String((uint32_t)rangeStart);
+    header += "-";
   }
   header += "\r\n\r\n";
   return header;
@@ -321,9 +329,9 @@ void WifiHTTP::close()
   m_state = HTTP_DISCONNECTED;
 }
 
-bool WifiHTTP::send(HTTP_METHOD method, const char* path, const char* payload, int payloadSize)
+bool WifiHTTP::send(HTTP_METHOD method, const char* path, const char* payload, int payloadSize, size_t rangeStart)
 {
-  String header = genHeader(method, path, payload, payloadSize);
+  String header = genHeader(method, path, payload, payloadSize, rangeStart);
   int len = header.length();
   if (client.write((const uint8_t*)header.c_str(), len) != (size_t)len) {
     m_state = HTTP_DISCONNECTED;
@@ -1577,7 +1585,7 @@ void CellHTTP::inbound()
   }
 }
 
-bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const char* path, const char* payload, int payloadSize)
+bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const char* path, const char* payload, int payloadSize, size_t rangeStart)
 {
   if (m_type == CELL_SIM7070) {
     if (method == METHOD_POST) {
@@ -1621,7 +1629,7 @@ bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const c
       return false;
     }
     // SIM7600 raw SSL socket: send via AT+CCHSEND
-    String header = genHeader(method, path, payload, payloadSize);
+    String header = genHeader(method, path, payload, payloadSize, rangeStart);
     // TX diagnostic: show the outgoing HTTP header up to (and including) the
     // blank-line separator (\r\n\r\n) so we can verify the request line, Host:,
     // and all other headers before the bytes reach the modem.  Fall back to the

@@ -119,7 +119,9 @@ public:
     HTTP_STATES state() { return m_state; }
     uint16_t code() { return m_code; }
 protected:
-    String genHeader(HTTP_METHOD method, const char* path, const char* payload, int payloadSize);
+    // rangeStart > 0 adds an open-ended "Range: bytes=<rangeStart>-" header,
+    // for resuming an interrupted download from that byte offset.
+    String genHeader(HTTP_METHOD method, const char* path, const char* payload, int payloadSize, size_t rangeStart = 0);
     // Generate an HTTP request header with an optional Authorization: Bearer header.
     // When bearerToken is non-null and non-empty it is appended before the
     // terminal CRLF-CRLF so the server can authenticate the request.
@@ -165,7 +167,7 @@ class WifiHTTP : public HTTPClient, public ClientWIFI
 public:
     bool open(const char* host = 0, uint16_t port = 0);
     void close();
-    bool send(HTTP_METHOD method, const char* path, const char* payload = 0, int payloadSize = 0);
+    bool send(HTTP_METHOD method, const char* path, const char* payload = 0, int payloadSize = 0, size_t rangeStart = 0);
     char* receive(char* buffer, int bufsize, int* pbytes = 0, unsigned int timeout = HTTP_CONN_TIMEOUT);
     // Expose the underlying TLS socket so callers can stream a large response
     // body (e.g. a firmware binary) in chunks without buffering it all at once.
@@ -284,7 +286,7 @@ public:
     void init();
     bool open(const char* host = 0, uint16_t port = 0);
     bool close();
-    bool send(HTTP_METHOD method, const char* host, uint16_t port, const char* path, const char* payload = 0, int payloadSize = 0);
+    bool send(HTTP_METHOD method, const char* host, uint16_t port, const char* path, const char* payload = 0, int payloadSize = 0, size_t rangeStart = 0);
     char* receive(int* pbytes = 0, unsigned int timeout = HTTP_CONN_TIMEOUT);
     // Streaming receive for large responses (SIM7600 only).
     // receiveHeaders() reads the first data chunk from the modem socket, parses
