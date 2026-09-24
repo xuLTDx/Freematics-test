@@ -762,6 +762,7 @@ void serverProcess(int timeout);
 void processMEMS(CBuffer* buffer);
 bool processGPS(CBuffer* buffer);
 void processBLE(int timeout);
+extern "C" uint8_t temprature_sens_read();  // ESP32 ROM die-temperature sensor
 // Forward declaration: defined in the Pull-OTA section below; called from
 // telemetry() before its point of definition.
 bool performPullOtaCheck();
@@ -1907,13 +1908,17 @@ void initialize()
   if (state.check(STATE_STORAGE_READY)) {
     if (SD.exists(OTA_META_PATH)) {
       unsigned long expectedSize = 0;
+      char stagedBy[32] = {0};
       {
         File mf = SD.open(OTA_META_PATH, FILE_READ);
         if (mf) {
           char buf[16] = {0};
           mf.readBytesUntil('\n', buf, sizeof(buf) - 1);
+          mf.readBytesUntil('\n', stagedBy, sizeof(stagedBy) - 1);
           mf.close();
           expectedSize = strtoul(buf, nullptr, 10);
+          char* cr = strchr(stagedBy, '\r');
+          if (cr) *cr = 0;
         }
       }
       bool stagingValid = false;
@@ -1922,6 +1927,16 @@ void initialize()
         unsigned long actual = ff ? (unsigned long)ff.size() : 0UL;
         if (ff) ff.close();
         stagingValid = (actual == expectedSize);
+      }
+      // A staged update is only valid for the exact firmware that decided to
+      // download it. If the running firmware changed since (USB flash, manual
+      // rollback), the server's decision is stale - drop it and let the next
+      // check ask the server again, rather than flashing over the new build.
+      if (stagingValid && strcmp(stagedBy, __DATE__ " " __TIME__) != 0) {
+        Serial.printf("[OTA-PULL] Staged firmware was downloaded by build '%s', running '%s' - discarded\n",
+                      stagedBy[0] ? stagedBy : "?", __DATE__ " " __TIME__);
+        logger.logEvent("OTA-PULL STAGED_BY_OTHER_BUILD");
+        stagingValid = false;
       }
       if (stagingValid) {
         Serial.println("[OTA-PULL] Staged firmware found on SD Ã¢â‚¬â€ flashing at boot");
@@ -4738,43 +4753,57 @@ bool performPullOtaCheck()
     // The HA server only updates "OTA letzte ÃƒÅ“bertragung" upon receiving this
     // request, ensuring the status reflects a device-confirmed download rather
     // than merely a completed server-side transmission.
-#if ENABLE_WIFI
-    // After streaming a large firmware binary over TLS, the mbedTLS heap is
-    // often fragmented below TLS_MIN_FREE_HEAP (~34 KB max block after close).
-    // Restart WiFi to coalesce freed TLS/TCP buffers so the confirm request
-    // and any subsequent NVS download can open a fresh TLS session.
-    if (ESP.getMaxAllocHeap() < TLS_MIN_FREE_HEAP) {
-      Serial.printf("[OTA-PULL] Heap fragmented (%u bytes), restarting WiFi\n",
-                    (unsigned)ESP.getMaxAllocHeap());
-      otaWifiClient.end();
-      wifiReconnectCurrent();
-      if (!otaWifiClient.setup(WIFI_JOIN_TIMEOUT)) {
-        Serial.println("[OTA-PULL] WiFi reconnect timeout after heap recovery");
-      }
-    }
+    // Best-effort, over the same transport the download used: lets the
+    // server log that this device verified the build (ota_server.py's
+    // ota_confirm). The OTA proceeds whether or not this succeeds.
     {
-      char _confirmPath[128];
+      char _confirmPath[160];
       snprintf(_confirmPath, sizeof(_confirmPath),
-               "/api/freematics/ota_pull/%s/ota_confirm", otaToken);
-      if (otaWifiClient.open(otaHost, otaPort) &&
-          otaWifiClient.send(METHOD_GET, _confirmPath)) {
+               "/api/freematics/ota_pull/%s/ota_confirm?size=%u&sha256=%.16s",
+               otaToken, (unsigned)fwSize, fwSha256Hex[0] ? fwSha256Hex : "-");
+      int _confirmCode = -1;
+      if (useCell) {
         int _confirmCL = 0;
-        int _confirmCode = otaWifiClient.receiveHeaders(&_confirmCL);
-        Serial.printf("[OTA-PULL] Confirm %s (HTTP %d)\n",
-                      _confirmCode == 200 ? "OK" : "FAILED", _confirmCode);
+        if (otaCellClient.open(otaHost, otaPort) &&
+            otaCellClient.send(METHOD_GET, otaHost, otaPort, _confirmPath)) {
+          _confirmCode = otaCellClient.receiveHeaders(&_confirmCL, CCHOPEN_TIMEOUT_SIM7670);
+        }
+        otaCellClient.close();
       } else {
-        Serial.println("[OTA-PULL] Confirm request failed (non-fatal)");
-      }
-      otaWifiClient.close();
-    }
+#if ENABLE_WIFI
+        // After streaming a large firmware binary over TLS, the mbedTLS heap is
+        // often fragmented below TLS_MIN_FREE_HEAP (~34 KB max block after close).
+        // Restart WiFi to coalesce freed TLS/TCP buffers so the confirm request
+        // and any subsequent NVS download can open a fresh TLS session.
+        if (ESP.getMaxAllocHeap() < TLS_MIN_FREE_HEAP) {
+          Serial.printf("[OTA-PULL] Heap fragmented (%u bytes), restarting WiFi\n",
+                        (unsigned)ESP.getMaxAllocHeap());
+          otaWifiClient.end();
+          wifiReconnectCurrent();
+          if (!otaWifiClient.setup(WIFI_JOIN_TIMEOUT)) {
+            Serial.println("[OTA-PULL] WiFi reconnect timeout after heap recovery");
+          }
+        }
+        int _confirmCL = 0;
+        if (otaWifiClient.open(otaHost, otaPort) &&
+            otaWifiClient.send(METHOD_GET, _confirmPath)) {
+          _confirmCode = otaWifiClient.receiveHeaders(&_confirmCL);
+        }
+        otaWifiClient.close();
 #endif
+      }
+      Serial.printf("[OTA-PULL] Confirm %s (HTTP %d, non-fatal)\n",
+                    _confirmCode == 200 ? "OK" : "FAILED", _confirmCode);
+    }
 
     // Write companion meta file: expected byte count for integrity check.
     {
       File metaFile = SD.open(OTA_META_PATH, FILE_WRITE);
       if (metaFile) {
-        char metaBufOut[16];
-        snprintf(metaBufOut, sizeof(metaBufOut), "%u\n", (unsigned)fwSize);
+        // Line 2 = which build downloaded this - checked at boot, see the
+        // staging check in setup(). performPullOtaFlash() reads line 1 only.
+        char metaBufOut[64];
+        snprintf(metaBufOut, sizeof(metaBufOut), "%u\n%s\n", (unsigned)fwSize, __DATE__ " " __TIME__);
         metaFile.print(metaBufOut);
         metaFile.close();
       }
@@ -4989,9 +5018,10 @@ bool performPullOtaCheck()
   // The HA server only updates "OTA letzte ÃƒÅ“bertragung" upon receiving this
   // request, so the attribute accurately reflects a device-confirmed flash.
   {
-    char _confirmPath[128];
+    char _confirmPath[160];
     snprintf(_confirmPath, sizeof(_confirmPath),
-             "/api/freematics/ota_pull/%s/ota_confirm", otaToken);
+             "/api/freematics/ota_pull/%s/ota_confirm?size=%u&sha256=%.16s",
+             otaToken, (unsigned)written, fwSha256Hex[0] ? fwSha256Hex : "-");
     if (otaWifiClient.open(otaHost, otaPort) &&
         otaWifiClient.send(METHOD_GET, _confirmPath)) {
       int _confirmCL = 0;
@@ -5167,9 +5197,15 @@ void processBLE(int timeout)
   } else if (!strcmp(cmd, "SSID?") || !strcmp(cmd, "WPWD?")) {
     n += snprintf(buf + n, bufsize - n, "-");
 #endif
-#if ENABLE_MEMS
   } else if (!strcmp(cmd, "TEMP")) {
+#if ENABLE_MEMS
     n += snprintf(buf + n, bufsize - n, "%d", (int)deviceTemp);
+#else
+    // No MEMS chip in this build - ESP32's own die sensor, same formula as
+    // the web API's /api/info (dataserver.cpp). Coarse, but a real reading.
+    n += snprintf(buf + n, bufsize - n, "%d", (int)temprature_sens_read() * 165 / 255 - 40);
+#endif
+#if ENABLE_MEMS
   } else if (!strcmp(cmd, "ACC")) {
     n += snprintf(buf + n, bufsize - n, "%.1f/%.1f/%.1f", acc[0], acc[1], acc[2]);
   } else if (!strcmp(cmd, "GYRO")) {
