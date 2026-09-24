@@ -1,116 +1,88 @@
-# Freematics ONE+ – Home Assistant Integration
+# Freematics ONE+ telelogger — Traccar fork
 
-A HACS-compatible Home Assistant integration for the **Freematics ONE+** OBD-II telematics device.  
-The device pushes real-time vehicle telemetry (speed, RPM, GPS, engine sensors, battery voltage, …) directly to Home Assistant via a secure HTTPS webhook — no VPN, port forwarding, or public IP required.
+Firmware for a [Freematics ONE+](https://freematics.com/products/freematics-one-plus/)
+running in a VW Passat B8. It logs OBD, GPS and device data to the SD card, sends it
+live to a self-hosted [Traccar](https://www.traccar.org) server, and updates itself
+over WiFi or cellular from a self-hosted OTA server.
 
-📖 **[Full documentation (EN / DE)](docs/README.md)**
+The firmware lives in [`firmware_v5/telelogger/`](firmware_v5/telelogger/). How it works
+internally, subsystem by subsystem: [`firmware_v5/telelogger/ARCHITECTURE.md`](firmware_v5/telelogger/ARCHITECTURE.md).
 
----
+## What it does
 
-## Quick Start
+- **No data lost to coverage gaps.** Every sample is always written to SD, whether or
+  not a network is up. After an outage, unsent log files are replayed to Traccar in
+  order before any new live data, so trip history and distance stay consistent.
+- **Correct timestamps on late data.** GPS date and time are sent together, so data
+  replayed days later keeps its real date. A lost GPS fix is reported as lost instead
+  of repeating the last position.
+- **Updates over WiFi or cellular (pull-OTA).** When a new build is published, the
+  server asks the device to check (a Traccar command). The device downloads the
+  firmware to SD, verifies SHA256, and only then flashes it. An interrupted download
+  resumes where it stopped (HTTP `Range`), including after a reboot. A failed
+  or corrupt download never gets flashed; the old firmware keeps running.
+- **Two WiFi networks and cellular fallback.** WiFi first, cellular (SIM7670) when out of
+  range. While on cellular, the device retries WiFi only when GPS puts it near a
+  known place that has WiFi. Those places come from Traccar's business
+  addresses. WiFi is always off in standby, to spare the car battery.
+- **Local HTTP API and web page** (port 80, also over the device's own fallback access
+  point): live sensor values (`/api/live`, `live.html`), runtime settings
+  (`/api/control?cmd=KEY=value`), SD log files (`/api/list`, `/api/log`, …).
+- **Bluetooth** configuration service (NimBLE).
 
-1. Install via **HACS** → Custom Repositories → `https://github.com/northpower25/Freematics` (Category: Integration)
-2. Restart Home Assistant
-3. Add the **Freematics ONE+** integration under *Settings → Devices & Services*
-4. Follow the 5-step wizard to configure connectivity and flash method
-5. Flash the bundled firmware to your device (WiFi OTA or Serial USB)
-6. Start driving — sensor entities are created automatically as data arrives
+## Hardware
 
-> `esptool` (needed for Serial USB flashing) is **automatically installed** with this integration. No manual setup required.
+Tested on one device: Freematics ONE+ with ESP32 (16 MB flash, 8 MB PSRAM) and a
+**SIM7670E-LN** cellular modem. The cellular code targets the SIM7670's `AT+CCH*`
+(TLS) and `AT+CIP*` (UDP) commands; other SIMCom modems keep the upstream code paths
+but are untested here.
 
----
+## Build and flash
 
-## Repository Structure
+[PlatformIO](https://platformio.org), from `firmware_v5/telelogger/`:
 
-| Directory | Description |
+```
+pio run -t upload        # build and flash over USB
+pio run -t uploadfs      # web files in dashboard/ (live.html, …)
+```
+
+- **WiFi passwords are never stored in the repo.** `wifi_secrets.py` asks for them at
+  build time; they can also be set on the device later over the HTTP API.
+- **Automatic OTA publishing is optional.** Copy `publish_ota_config.example.json` to
+  `publish_ota_config.json` (git-ignored, holds the OTA token and the server's SSH
+  target).
+  With that file present, **every** `pio run` publishes the build to the OTA server
+  and triggers the device to update, so rename it aside while experimenting.
+- Everything else is runtime configuration stored on the device (NVS): server, WiFi,
+  OTA token and host, standby, OBD options. See `ARCHITECTURE.md` §A6.
+
+## Server side
+
+Kept in separate repositories:
+
+- **Traccar fork**: receives the device's UDP protocol and adds a Slovak trip logbook
+  (*Kniha jázd*), business addresses, and odometer calibration from GPS distance.
+- **freematics-ota**: small HTTPS service that serves firmware to the device
+  (`meta.json`, `firmware.bin` with resume support), tells it when to update, and
+  provides the known-WiFi-locations list.
+
+## Known issues
+
+- The Freematics Controller phone app often shows no live data even though the
+  Bluetooth link is up. Use the HTTP API or `live.html` instead.
+- A reset in the middle of an SD write can leave the SD card unresponsive until the
+  device is power-cycled.
+
+## Repository layout
+
+| Path | |
 |---|---|
-| `custom_components/freematics/` | Home Assistant integration (HACS) |
-| `firmware_v5/telelogger/` | Current Arduino/PlatformIO firmware source (ESP32) |
-| `libraries/` | Arduino libraries for Freematics ONE+ and Esprit |
-| `ESPRIT/` | Arduino library and examples for [Freematics Esprit](https://freematics.com/products/freematics-esprit) |
-| `lovelace/` | Pre-built Lovelace dashboard YAML |
-| `server/` | [Freematics Hub](https://freematics.com/hub/) server source |
-| `docs/` | Full integration documentation |
-| `old/` | Older firmware versions (v2 / v3 / v4) kept for reference |
+| `firmware_v5/telelogger/` | the firmware this README is about |
+| `libraries/FreematicsPlus/` | device, GPS, OBD and network (WiFi/cellular) libraries used by it |
+| everything else | inherited from upstream and not used by this fork |
 
----
+## Credits and license
 
-## Features
-
-- **Zero-config sensor creation** — entities appear automatically when the device sends its first payload
-- **WiFi OTA flashing** — flash firmware directly from Home Assistant over WiFi (no USB required)
-- **Serial USB flashing** — flash via USB; `esptool` bundled with integration
-- **Live telemetry** — speed, RPM, throttle, engine load, coolant temp, GPS, accelerometer, battery voltage, signal strength
-- **Custom Lovelace card** — colour-coded speed display, progress bars, GPS map link
-- **Works with Nabu Casa** — no local network exposure required
-- **WiFi + Cellular fallback** — seamless handover between WiFi and 4G/3G
-
----
-
-## Supported Hardware
-
-- [Freematics ONE+ Model A](https://freematics.com/products/freematics-one-plus/)
-- [Freematics ONE+ Model B](https://freematics.com/products/freematics-one-plus-model-b/)
-- [Freematics ONE+ Model H](https://freematics.com/products/freematics-one-plus-model-h/)
-
----
-
-## License
-
-BSD License — see [LICENSE](LICENSE).
-
----
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for a full list of changes and release notes.
-
----
-
-# Freematics ONE+ – Home Assistant Integration (Deutsch)
-
-Eine HACS-kompatible Home Assistant Integration für das **Freematics ONE+** OBD-II Telematik-Gerät.  
-Das Gerät sendet Echtzeit-Fahrzeugdaten direkt an Home Assistant über einen sicheren HTTPS-Webhook — ohne VPN, Port-Weiterleitung oder öffentliche IP.
-
-📖 **[Vollständige Dokumentation (EN / DE)](docs/README.md)**
-
----
-
-## Schnellstart
-
-1. Installation über **HACS** → Benutzerdefinierte Repositories → `https://github.com/northpower25/Freematics` (Kategorie: Integration)
-2. Home Assistant neu starten
-3. Integration **Freematics ONE+** unter *Einstellungen → Geräte & Dienste* hinzufügen
-4. Den 5-stufigen Assistenten für Verbindung und Flash-Methode durchlaufen
-5. Firmware auf das Gerät flashen (WLAN OTA oder Seriell USB)
-6. Losfahren – Sensor-Entitäten werden automatisch erstellt
-
-> `esptool` (für Seriell-USB-Flashing) wird **automatisch mit dieser Integration installiert**. Keine manuelle Einrichtung erforderlich.
-
----
-
-## Verzeichnisstruktur
-
-| Verzeichnis | Beschreibung |
-|---|---|
-| `custom_components/freematics/` | Home Assistant Integration (HACS) |
-| `firmware_v5/telelogger/` | Aktuelle Firmware-Quellen (Arduino/PlatformIO, ESP32) |
-| `libraries/` | Arduino-Bibliotheken für Freematics ONE+ und Esprit |
-| `ESPRIT/` | Arduino-Bibliothek und Beispiele für [Freematics Esprit](https://freematics.com/products/freematics-esprit) |
-| `lovelace/` | Vorgefertigtes Lovelace-Dashboard (YAML) |
-| `server/` | [Freematics Hub](https://freematics.com/hub/) Server-Quellcode |
-| `docs/` | Vollständige Integrationsdokumentation |
-| `old/` | Ältere Firmware-Versionen (v2 / v3 / v4) zur Referenz |
-
----
-
-## Lizenz
-
-BSD-Lizenz — siehe [LICENSE](LICENSE).
-
----
-
-## Changelog
-
-Alle Änderungen und Release Notes finden sich in [CHANGELOG.md](CHANGELOG.md).
-
+Based on Stanley Huang's [Freematics](https://github.com/stanleyhuangyc/Freematics)
+firmware and libraries, distributed under the BSD license stated in their source file
+headers.

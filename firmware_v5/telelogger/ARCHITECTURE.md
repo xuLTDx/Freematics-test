@@ -112,14 +112,31 @@ performPullOtaFlash()   called from standby() when s_ota_pending is set
                         at the next car-off transition, when the telemetry
                         TLS heap pressure of an active drive is gone.
 ```
-2026-09-23: real cellular firmware transfer (not just meta.json) confirmed
-working end-to-end — 788KB of a 1.3MB build streamed correctly via
-`CellHTTP::receiveHeaders()`/`receiveBodyBytes()` before an unrelated real
-signal drop ended that specific run (device reconnected and resumed
-normally on its own; not a code fault — see commit 3dc3de6). Both the
-meta.json fetch and the firmware download now share the same chunked
-AT+CCHRECV streaming path, mirroring the WiFi path's integrity contract
-(exact byte count, SHA256 verified before flashing).
+**Resume (2026-09-24, `d5244de`).** A failed download no longer deletes
+`/ota_fw.bin`. `/ota_resume.txt` (`<size>\n<sha256>\n`) records which target
+the partial belongs to; the next check sends `Range: bytes=N-` (server
+answers 206), re-hashes the bytes already on SD and appends. A resume is
+only trusted if size+sha256 still match the offered meta.json. `/ota_meta.txt`
+keeps its old meaning — complete and SHA256-verified — because the boot-time
+check flashes on it alone. The download loops `flush()` every 64 KB (FAT
+only records file size on flush/close). Boot keeps a partial that has a
+resume marker.
+
+**Cellular transfer (2026-09-24, `177112c`)** — first SHA256-verified full
+download: 1334208 B in 160 s. The 2026-09-23 "788KB streamed correctly"
+claim was a byte count only and never passed SHA256. What was actually
+wrong, all SIM7670 `CellHTTP`:
+- `AT+CCHSET=1` left recv_mode=0 (push); now `AT+CCHSET=1,1` (cache mode,
+  SIMCom SSL App Note §2.2.5) and data is pulled with `AT+CCHRECV`.
+- `xbReceive()` is not binary-safe (`strstr` stops at 0x00, a near-full
+  buffer drops its oldest line); `cchRecvRaw()` reads the
+  `+CCHRECV: DATA,0,<len>` framing as text and `<len>` bytes by count.
+- On keep-alive the modem never released the stream's last few KB
+  (`AT+CCHRECV?` → `LEN,0,0`); `ota_server.py` sends `Connection: close`
+  on firmware.bin.
+- The modem survives an ESP32 reset; a CCH session left open by the
+  previous boot made CCHSTOP/CCHSET/CCHSTART fail until power-cycled.
+  `init()` sends `AT+CCHCLOSE=0` first.
 
 ### A6. NVS configuration (`loadConfig()`, `telelogger.ino:3178`)
 
@@ -446,20 +463,15 @@ into a real-world-calibrated value.
   reboot-into-new-firmware step, SHA256 checked against meta.json during
   download - a failure at any point aborts and leaves the OLD firmware
   running, never a partial/corrupt flash.
-- **Cellular pull-OTA: CONFIRMED WORKING END-TO-END 2026-09-23** (commit
-  `3dc3de6`). Three bugs fixed in the same session: (1) `CellHTTP::receive()`
-  (meta.json) only did one `AT+CCHRECV` read, missing the JSON body when the
-  server sent headers and body as separate writes - switched to the existing
-  `receiveHeaders()`/`receiveBodyBytes()` streaming pair; (2)
-  `receiveBodyBytes()` treated an empty `AT+CCHRECV` response as end-of-
-  stream, when SIMCom's own SSL Application Note (§2.2.15) documents that as
-  the normal "nothing buffered yet" response - added a bounded poll/retry;
-  (3) `AT+CCHSTART` could fail if the modem's CCH service was left wedged
-  (only ever seen from rapid dev-cycle reflashing without a real modem power
-  cycle, not expected in normal field operation) - added an `m_cchStarted`
-  guard so it only runs once per boot instead of repeating on every call.
-  Verified live: 788KB of a 1.3MB build streamed correctly before an
-  unrelated real cellular signal drop ended that run (self-recovered).
+- **Cellular pull-OTA: SHA256-verified end-to-end 2026-09-24** (`177112c`,
+  details in A5). Resume across signal loss and ESP32 resets verified on
+  both WiFi and cellular (`d5244de`).
+- A reset in the middle of an SD write can leave the SD card unresponsive
+  until a real power cycle (`NO SD CARD` on next boot; `SDLogger::init()`
+  tries `SD.begin()` once). Without SD, logging stops and pull-OTA falls
+  back to flashing directly.
+- A USB flash does not clear SD staging: an older build staged before the
+  USB flash gets flashed over it on the next boot (dev-workflow edge case).
 - `ota_confirm` endpoint returns 404 from the current `ota_server.py`
   deployment - worth fixing server-side even though it's non-fatal to the
   actual update (loses the "device confirmed receipt" bookkeeping signal).
