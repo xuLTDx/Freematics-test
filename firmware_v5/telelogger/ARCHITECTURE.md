@@ -21,7 +21,13 @@ process()              ONE sample cycle: OBD → GPS → MEMS → ext inputs →
                         fills a CBuffer slot (runs from loop(), main core)
 standby()              car-off power state — SD close, GPS off, WiFi off
                         (unconditional), deep-sleep OR JUMPSTART_VOLTAGE
-                        polling loop until the car restarts
+                        polling loop until the car restarts. Voltage via
+                        readSystemVoltage() (ESP32 ADC on TYPE 14) - NOT
+                        obd.getVoltage(): the co-processor is silent after
+                        ATLP. Telemetry task sends a position+battery report
+                        every STANDBY_REPORT_INTERVAL (3 h) while parked.
+                        SD events: STANDBY cause=… at entry, WAKEUP V=… on
+                        the next boot (RTC_NOINIT)
 telemetry(void*)       FreeRTOS task — owns WiFi/cellular, drains CBuffers,
                         writes the SD log, runs catchUpMissedFiles()
 

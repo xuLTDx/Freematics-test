@@ -163,7 +163,13 @@
 // data interval settings
 #define STATIONARY_TIME_TABLE {10, 60, 180} /* seconds */
 #define DATA_INTERVAL_TABLE {1000, 2000, 5000} /* ms */
-#define PING_BACK_INTERVAL 900 /* seconds */
+// Parked (standby) position report for theft tracking: connect, send one
+// position + battery voltage packet, disconnect. Every connect powers the
+// modem up for ~30-60 s, so this is deliberately rare (was an empty EV=PING
+// every 900 s). A thief driving the car wakes the device anyway (voltage).
+#define STANDBY_REPORT_INTERVAL 10800 /* seconds (3 h) */
+// Max wait for a fresh GPS fix before sending the report without position
+#define STANDBY_REPORT_GPS_WAIT 90 /* seconds */
 #define SIGNAL_CHECK_INTERVAL 10 /* seconds */
 
 // Minimum time between geofence-WiFi known-locations syncs (syncKnownLocations()

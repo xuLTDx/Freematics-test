@@ -2092,6 +2092,15 @@ bool waitMotion(long timeout)
   return false;
 }
 
+// Vehicle system voltage. devType > 12 (this device: TYPE 14) measures it
+// on the ESP32's own ADC, independent of the co-processor - which matters in
+// standby, where the co-processor is in ATLP and doesn't answer.
+float readSystemVoltage()
+{
+  if (sys.devType > 12) return (float)(analogRead(A0) * 45) / 4095;
+  return obd.getVoltage();
+}
+
 // SD record of why/when standby was entered - the post-drive evidence for the
 // ENGINE_OFF_VOLTAGE / standby-timer calibration (logged before standby()
 // closes the SD log).
@@ -2173,11 +2182,7 @@ void process()
   }
 #endif
 #if ENABLE_OBD
-  if (sys.devType > 12) {
-    batteryVoltage = (float)(analogRead(A0) * 45) / 4095;
-  } else {
-    batteryVoltage = obd.getVoltage();
-  }
+  batteryVoltage = readSystemVoltage();
   if (batteryVoltage) {
     uint16_t v = batteryVoltage * 100;
     buffer->add(PID_BATTERY_VOLTAGE, ELEMENT_UINT16, &v, sizeof(v));
@@ -2708,6 +2713,55 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
   return true;
 }
 
+// Standby position report (see STANDBY_REPORT_INTERVAL): one regular data
+// packet (timestamp, GPS date/time/lat/lng/speed/sats, battery) so Traccar
+// stores it as a normal position. Runs in the telemetry task while the main
+// task sits in standby()'s voltage loop; the GPS is read-only here (parsed by
+// the GNSS driver in the background, GNSS_ALWAYS_ON) and the voltage comes
+// from standbyVoltage, sampled by standby() - never touch the OBD link here.
+volatile float standbyVoltage = 0;
+
+// Built BEFORE connecting, so the modem isn't powered while waiting for GPS.
+static void buildStandbyReport(CStorageRAM& rb)
+{
+  rb.header(devid);
+  rb.timestamp(millis());
+  bool hasFix = false;
+#if GNSS == GNSS_STANDALONE
+  if (state.check(STATE_GPS_READY)) {
+    // A fix counts only if the GPS time advances while we watch - a stale gd
+    // from before standby would otherwise report an old position as current.
+    uint32_t firstTime = 0;
+    bool seen = false;
+    for (uint32_t t = millis(); millis() - t < STANDBY_REPORT_GPS_WAIT * 1000UL; delay(1000)) {
+      GPS_DATA* g = 0;
+      if (!sys.gpsGetData(&g) || !g) continue;
+      if (!seen) { firstTime = g->time; seen = true; continue; }
+      if (g->time != firstTime && (g->lat || g->lng) && g->date) {
+        uint32_t date = g->date, time = g->time, sat = g->sat;
+        float lat = g->lat, lng = g->lng, kph = g->speed * 1.852f;
+        rb.log(PID_GPS_DATE, &date, 1);
+        rb.log(PID_GPS_TIME, &time, 1);
+        rb.log(PID_GPS_LATITUDE, &lat, 1, "%.6f");
+        rb.log(PID_GPS_LONGITUDE, &lng, 1, "%.6f");
+        rb.log(PID_GPS_SPEED, &kph, 1, "%.1f");
+        if (sat) rb.log(PID_GPS_SAT_COUNT, &sat, 1);
+        hasFix = true;
+        break;
+      }
+    }
+  }
+#endif
+  if (standbyVoltage > 0) {
+    uint32_t v = (uint32_t)(standbyVoltage * 100);
+    rb.log(PID_BATTERY_VOLTAGE, &v, 1);
+  }
+  rb.tailer();
+  Serial.print("[STANDBY] Report ");
+  Serial.print(hasFix ? "with GPS fix: " : "WITHOUT GPS fix: ");
+  Serial.println(rb.buffer());
+}
+
 /*******************************************************************************
   Initializing network, maintaining connection and doing transmissions
 *******************************************************************************/
@@ -2789,25 +2843,31 @@ void telemetry(void* inst)
       uint32_t t = millis();
       do {
         delay(1000);
-      } while (state.check(STATE_STANDBY) && millis() - t < 1000L * PING_BACK_INTERVAL);
+      } while (state.check(STATE_STANDBY) && millis() - t < 1000UL * STANDBY_REPORT_INTERVAL);
       if (state.check(STATE_STANDBY)) {
-        // start ping
+        // standby position report: ping (server session) + one position packet
+        char reportCache[192];
+        CStorageRAM report;
+        report.init(reportCache, sizeof(reportCache));
+        buildStandbyReport(report);
+        bool sent = false;
 #if ENABLE_WIFI
         if (wifiSSID[0] || wifiSSID2[0]) {
           wifiConnect();
         }
         if (teleClient.wifi.setup()) {
-          Serial.println("[WIFI] Ping...");
-          teleClient.ping();
+          Serial.println("[WIFI] Standby report...");
+          sent = teleClient.ping() && teleClient.transmit(report.buffer(), report.length());
         }
         else
 #endif
         {
           if (initCell()) {
-            Serial.println("[CELL] Ping...");
-            teleClient.ping();
+            Serial.println("[CELL] Standby report...");
+            sent = teleClient.ping() && teleClient.transmit(report.buffer(), report.length());
           }
         }
+        Serial.println(sent ? "[STANDBY] Report sent" : "[STANDBY] Report NOT sent");
         teleClient.shutdown();
         state.clear(STATE_CELL_CONNECTED | STATE_WIFI_CONNECTED);
       }
@@ -3397,7 +3457,12 @@ void standby()
 #if ENABLE_OBD
   do {
     delay(5000);
-    wakeVolt = obd.getVoltage();
+    // Same source as the standby-entry decision in process(). Was
+    // obd.getVoltage() (co-processor ATRV), which returns 0 once
+    // enterLowPowerMode() sent ATLP - verified on the bench 2026-09-24: no
+    // reply to ATRV or ATI at all - so the device could never wake.
+    wakeVolt = readSystemVoltage();
+    standbyVoltage = wakeVolt; // for the telemetry task's standby report
   } while (wakeVolt < JUMPSTART_VOLTAGE);
 #else
   delay(5000);
