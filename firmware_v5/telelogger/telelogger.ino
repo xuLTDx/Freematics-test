@@ -1424,6 +1424,9 @@ void processOBD(CBuffer* buffer)
     if (obd.readPID(pid, value)) {
         obdData[i].ts = millis();
         obdData[i].value = value;
+        // Engine running = not parked, whatever the voltage says (see the
+        // standby comment in process()).
+        if (pid == PID_RPM && value > 0) lastMotionTime = millis();
         buffer->add((uint16_t)pid | 0x100, ELEMENT_INT32, &value, sizeof(value));
     } else {
         timeoutsOBD++;
@@ -2177,6 +2180,26 @@ void process()
 #endif
 
   bool success = processGPS(buffer);
+  // Never go to standby while actually moving. Voltage alone isn't safe:
+  // ENGINE_OFF_VOLTAGE is uncalibrated, and VW's smart charging can hold the
+  // bus under it for long stretches of a drive. Measured on ~20k parked
+  // fixes (2026-09-22/23): GPS Doppler speed never exceeded 1.9 km/h. 3
+  // consecutive fixes over 5 km/h are still required, so a lone multipath
+  // spike can't hold the device awake. (Satellite count isn't usable as a
+  // filter: most fixes don't report it.)
+  {
+    static uint8_t movingFixes = 0;
+    if (success && gd) {
+      if (gd->speed * 1.852f > 5.0f) {
+        if (++movingFixes >= 3) {
+          movingFixes = 3;
+          lastMotionTime = millis();
+        }
+      } else {
+        movingFixes = 0;
+      }
+    }
+  }
 #if GNSS_RESET_TIMEOUT
   if (success) {
     lastGPStick = millis();
@@ -2466,6 +2489,9 @@ bool initCell(bool quick = false)
     Serial.println("[CELL] No supported module");
     return false;
   }
+  // begin() may have power-cycled the modem (every reconnect after
+  // cell.end() does) - the OTA client's CCH service must start again.
+  otaCellClient.resetCch();
   if (quick) return true;
   Serial.print("CELL:");
   Serial.println(teleClient.cell.deviceName());
@@ -2656,6 +2682,20 @@ void telemetry(void* inst)
 {
   uint32_t lastRssiTime = 0;
   uint8_t connErrors = 0;
+  // Tear down the current link so the outer loop rebuilds it from scratch.
+  auto dropConnection = [&]() {
+#if ENABLE_WIFI
+    if (state.check(STATE_WIFI_CONNECTED)) {
+      teleClient.wifi.end();
+      state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
+      return;
+    }
+#endif
+    if (state.check(STATE_CELL_CONNECTED)) {
+      teleClient.cell.end();
+      state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
+    }
+  };
   CStorageRAM store;
   store.init(
 #if BOARD_HAS_PSRAM
@@ -2760,7 +2800,7 @@ void telemetry(void* inst)
       if (s_ota_active || s_http_standby_enter) break;
 
 #if ENABLE_WIFI
-      if (wifiSSID[0]) {
+      if (wifiSSID[0] || wifiSSID2[0]) {
         if (!state.check(STATE_WIFI_CONNECTED) && teleClient.wifi.connected()) {
           ip = teleClient.wifi.getIP();
           if (ip.length()) {
@@ -3062,7 +3102,21 @@ void telemetry(void* inst)
       if (s_catchupPending) {
         if (catchUpMissedFiles(store)) {
           s_catchupPending = false;
+          connErrors = 0;
         } else {
+          // A failed replay is a failed transmit. Count it like one, or a
+          // dead link never reaches the reconnect checks at the bottom of
+          // this loop and catch-up retries on it forever (seen live:
+          // "[CATCHUP] file N failed" every second, never recovering, after
+          // the cellular UDP socket broke). Live data still must not be
+          // sent before the backlog, so reconnect from here, not below.
+          connErrors++;
+          if (connErrors >= MAX_CONN_ERRORS_RECONNECT ||
+              (state.check(STATE_CELL_CONNECTED) && !teleClient.cell.check(1000))) {
+            Serial.println("[CATCHUP] Link looks dead - reconnecting");
+            dropConnection();
+            break;
+          }
           delay(1000);
           continue;
         }
@@ -3205,19 +3259,10 @@ void telemetry(void* inst)
         }
       }
 
-      if (connErrors >= MAX_CONN_ERRORS_RECONNECT) {
-#if ENABLE_WIFI
-        if (state.check(STATE_WIFI_CONNECTED)) {
-          teleClient.wifi.end();
-          state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
-          break;
-        }
-#endif
-        if (state.check(STATE_CELL_CONNECTED)) {
-          teleClient.cell.end();
-          state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
-          break;
-        }
+      if (connErrors >= MAX_CONN_ERRORS_RECONNECT &&
+          (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED))) {
+        dropConnection();
+        break;
       }
 
       if (deviceTemp >= COOLING_DOWN_TEMP) {

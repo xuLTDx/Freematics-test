@@ -299,6 +299,9 @@ public:
     // Returns the number of bytes written to buf (> 0), 0 at end-of-stream,
     // or -1 on error / unsupported modem type.
     int receiveBodyBytes(char* buf, int maxLen, unsigned int timeout = HTTP_CONN_TIMEOUT);
+    // Call whenever the modem was powered off/on (e.g. a sibling object's
+    // end()/begin()): the CCH service started by init() is gone with it.
+    void resetCch() { m_cchStarted = false; }
 protected:
     // Override to detect +CHTTPSCLSE: URCs that arrive during any AT command
     // and mark the session disconnected before send() tries to use it.
