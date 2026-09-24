@@ -88,7 +88,8 @@ appears — see `ClientWIFI::begin()`'s own comment in `FreematicsNetwork.cpp`).
 
 | Path | Handler | Purpose |
 |---|---|---|
-| `/api/live` | `handlerLiveData` (in `telelogger.ino`) | current sensor snapshot as JSON |
+| `/` | `handlerWebUI` | web UI — `webui/index.html`, gzipped + HTTP header baked into flash by `webui_gen.py` (pre-build; `webui_page.h` gitignored), so pull-OTA updates it |
+| `/api/live` | `handlerLiveData` (in `telelogger.ino`) | current sensor snapshot as JSON, incl. `sys` {v, st state bits, ml motionless s, src, lim standby s, f file, wm, cu} |
 | `/api/info` | `handlerInfo` | device ID, firmware build, uptime, … |
 | `/api/control` | `handlerControl` | `?cmd=KEY=value` — the general runtime-config write path (SSID=, WPWD=, OTA_TOKEN=, OTA_PORT=, WM_FILE=, RESET, ON/OFF, …) |
 | `/api/ota` | `handlerOTA` | local (LAN-side) firmware upload, separate from pull-OTA (A5) |
@@ -353,6 +354,19 @@ catchUpMissedFiles(CStorageRAM& replayStore):
       wmDoneFileId = id; nvs_commit()    // only after the WHOLE file sent OK
       if s_ota_active: return false      // yield, retry this file next pass
 ```
+
+**2026-09-24 (`dfa914f`):** (1) catch-up runs only once `fileid > 0` —
+WiFi joins in `setup()` before `initialize()` opens the SD file, and a
+catch-up that saw `fileid == 0` returned "nothing missed" and was skipped
+for the whole boot. (2) `gapFileId` (NVS `GAP_FILE`) = oldest file with a
+sample that never went out live (`markLiveGap()`: TX_FAIL, BUF_FULL eviction,
+STANDBY_PURGE/OVERHEAT/REINIT purge; also an SD event `LIVE_GAP …`). Files
+before it are marked done without replay (previously every previous file was
+re-sent in full → duplicated drives, inflated Traccar distance). A gap file
+itself is still replayed in full (overlap with what went live). Manual
+`WM_FILE=` sets `GAP_FILE=wm+1` to force the replay. (3) On standby the
+telemetry task sends the remaining buffers before the link drops;
+`standby()` waits ≤15 s (`s_standbyDrained`) before turning WiFi off.
 
 This is why a mid-file interruption is safe (small re-send overlap at
 worst, per the code's own comment) and why file-level (not record-level)
