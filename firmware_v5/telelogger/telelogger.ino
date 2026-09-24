@@ -801,8 +801,8 @@ static bool ensureOtaCellAttached()
 // ---------------------------------------------------------------------------
 // TEMPORARY bench test (2026-09-22) - saved plan's point 1: does pull-OTA's
 // meta.json check work at all over cellular? CellHTTP already exists in the
-// library (built/hardened for TeleClientHTTP mode - see CHANGELOG.md's
-// CCHOPEN/CCHSTART fixes) but has never been wired into anything in THIS
+// library (built/hardened for TeleClientHTTP mode upstream, see git history
+// for its CCHOPEN/CCHSTART fixes) but has never been wired into anything in THIS
 // build (TeleClientUDP - teleClient.cell is CellUDP, not CellHTTP). This
 // fetches meta.json only (no firmware download, no flash, no meta.json
 // "available" handling) via a SEPARATE CellHTTP object attached to the SAME
