@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telelogger</title>
+<style>
+:root{--bg:#eef1f4;--card:#fff;--ink:#1c2530;--mute:#667383;--line:#d5dce3;--acc:#0b6bcb;--ok:#1d8a4e;--warn:#b86e00;--bad:#c23a3a;--chip:#e3e8ee}
+@media (prefers-color-scheme:dark){:root{--bg:#12171d;--card:#1b222b;--ink:#e3e8ee;--mute:#8d9aa9;--line:#2c3642;--acc:#5aa7f2;--ok:#4cc27f;--warn:#e6a23c;--bad:#ef6b6b;--chip:#26303b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:12px 16px 32px;max-width:900px;margin-inline:auto}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin-bottom:10px}
+h1{font-size:20px;margin:0}
+.mute{color:var(--mute);font-size:13px}
+#status{border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--card);border-left:6px solid var(--mute)}
+#status b{font-size:17px;display:block}
+#status.ok{border-color:var(--ok)}#status.warn{border-color:var(--warn)}#status.bad{border-color:var(--bad)}
+.bar{height:6px;background:var(--chip);border-radius:3px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--warn);width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.tile{background:var(--card);border-radius:10px;padding:10px 12px}
+.tile h2,section h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:0 0 4px;font-weight:600}
+.big{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
+.kv{font-size:13px;color:var(--mute);font-variant-numeric:tabular-nums}
+section{background:var(--card);border-radius:10px;padding:10px 12px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+td{padding:4px 0;border-bottom:1px solid var(--line)}td:last-child{text-align:right;font-weight:600}td.mute{text-align:left;font-weight:400;border:0}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+select,button{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink)}
+button{cursor:pointer}button:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+button.danger{color:var(--bad)}
+pre{margin:0;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mute);margin-right:6px}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}
+#msg{min-height:1.4em;font-size:13px}
+</style>
+</head>
+<body>
+<header><h1 id="id">Telelogger</h1><span class="mute" id="fw"></span><span class="mute" id="conn"><span class="dot"></span>pripájam…</span></header>
+
+<div id="status"><b id="st">Načítavam…</b><span class="kv" id="st2"></span><div class="bar"><i id="stb"></i></div></div>
+
+<div class="grid">
+ <div class="tile"><h2>Napätie</h2><div class="big" id="v">–</div><div class="kv" id="v2"></div></div>
+ <div class="tile"><h2>GPS</h2><div class="big" id="g">–</div><div class="kv" id="g2"></div></div>
+ <div class="tile"><h2>Sieť</h2><div class="big" id="n">–</div><div class="kv" id="n2"></div></div>
+ <div class="tile"><h2>SD karta</h2><div class="big" id="sd">–</div><div class="kv" id="sd2"></div></div>
+</div>
+
+<section><h2>OBD (čerstvé hodnoty)</h2><table id="obd"><tr><td class="mute">Žiadne čerstvé OBD dáta (motor nebeží?)</td></tr></table></section>
+
+<section><h2>Udalosti na SD</h2>
+ <div class="row"><select id="file" aria-label="Súbor"><option value="0">aktuálny súbor</option></select><button id="evr">Obnoviť</button></div>
+ <pre id="ev">…</pre>
+</section>
+
+<section><h2>Akcie</h2>
+ <div class="row"><button id="ota">Skontrolovať OTA teraz</button><button id="sb"></button><button id="rst" class="danger">Reštartovať</button></div>
+ <div id="msg" class="mute"></div>
+</section>
+
+<script>
+var $=function(i){return document.getElementById(i)};
+var SRC={V:'napätie ≥ 12.8 V',R:'otáčky motora',G:'GPS rýchlosť','-':'zatiaľ žiadny'};
+var UNIT={268:' rpm',269:' km/h',260:' %',273:' %',261:' °C',271:' °C',326:' °C',348:' °C',287:' s',307:' kPa',267:' kPa'};
+var lim=null;
+// one request at a time: the device's httpd serves at most 2 clients
+var q=Promise.resolve();
+function get(u,t){var p=q.then(function(){var c=new AbortController(),h=setTimeout(function(){c.abort()},t||6000);return fetch(u,{signal:c.signal,cache:'no-store'}).finally(function(){clearTimeout(h)})});q=p.catch(function(){});return p}
+function json(u){return get(u).then(function(r){return r.json()})}
+function dur(s){s=Math.round(s);if(s<60)return s+' s';if(s<3600)return Math.floor(s/60)+' min '+(s%60)+' s';var h=Math.floor(s/3600);return h>47?Math.floor(h/24)+' d '+(h%24)+' h':h+' h '+Math.floor(s%3600/60)+' min'}
+function kb(b){return b>1e9?(b/1e9).toFixed(1)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':Math.round(b/1e3)+' kB'}
+function online(ok){$('conn').innerHTML='<span class="dot '+(ok?'ok':'bad')+'"></span>'+(ok?'online':'krabička neodpovedá')}
+
+function status(s){
+ var el=$('status'),t,t2='',pct=0,c='ok';
+ lim=s.lim;
+ if(s.v>0&&s.v<7){t='Na stole (USB napájanie)';t2='Pod 7 V nejde do standby.';c='warn'}
+ else if(!s.lim){t='Standby vypnutý';t2='STANDBY_TIME=65535: krabička nikdy nezaspí.';c='warn'}
+ else if(s.ml<10){t='Jazda';t2='Pohyb podľa: '+SRC[s.src]}
+ else{t='Stojí, standby o '+dur(Math.max(0,s.lim-s.ml));t2='Bez pohybu '+dur(s.ml)+' z '+dur(s.lim)+' · posledný pohyb: '+SRC[s.src];pct=Math.min(100,s.ml/s.lim*100);c='warn'}
+ el.className=c;$('st').textContent=t;$('st2').textContent=t2;$('stb').style.width=pct+'%';
+ $('sb').textContent=s.lim?'Vypnúť standby (stôl)':'Zapnúť standby';
+}
+
+function live(){
+ return json('/api/live').then(function(d){
+  online(true);var s=d.sys||{};status(s);
+  $('v').textContent=(s.v||d.obd.battery||0).toFixed(2)+' V';
+  $('v2').textContent=s.v>=13.2?'motor beží (nabíja)':s.v>=12.8?'nad prahom 12.8 V':s.v>=7?'motor stojí':'USB / bez auta';
+  var g=d.gps;
+  if(g&&(g.lat||g.lng)){$('g').textContent=(g.speed*1.852).toFixed(0)+' km/h';$('g2').textContent=g.lat.toFixed(5)+', '+g.lng.toFixed(5)+(g.sat?' · '+g.sat+' sat':'')+' · pred '+dur(g.age/1000)}
+  else{$('g').textContent='bez fixu';$('g2').textContent=g&&g.sat?g.sat+' satelitov':'hľadá satelity'}
+  var n=d.net,wifi=s.st&0x80,cell=s.st&0x40;
+  $('n').textContent=wifi?'WiFi':cell?'Mobilná':'odpojené';
+  $('n2').textContent=(n.op||'')+(n.rssi?' · '+n.rssi+' dBm':'')+' · '+n.packets+' paketov · '+kb(n.bytes);
+  $('sd2').dataset.f=s.f;var pend=Math.max(0,s.f-1-s.wm);
+  $('sd2').textContent='súbor '+s.f+' · '+(pend?pend+' súb. čaká na odoslanie':'všetko odoslané');
+  var rows=d.obd.pid.filter(function(p){return p.age<15000});
+  $('obd').innerHTML=rows.length?rows.map(function(p){return '<tr><td>'+p.name+'</td><td>'+p.value+(UNIT[p.pid]||'')+'</td></tr>'}).join(''):'<tr><td class="mute">Žiadne čerstvé OBD dáta (motor nebeží?)</td></tr>';
+ }).catch(function(){online(false)});
+}
+
+function info(){
+ return json('/api/info').then(function(d){
+  $('id').textContent=d.id;$('fw').textContent='FW '+d.fw+' · '+d.fw_build+' · beží '+dur(d.httpd.uptime/1000)+' · CPU '+d.cpu.temperature+' °C';
+  if(d.sd)$('sd').textContent=kb(d.sd.used)+' / '+kb(d.sd.total);
+ }).catch(function(){});
+}
+
+function files(){
+ return json('/api/list').then(function(l){
+  l.sort(function(a,b){return b.id-a.id});
+  $('file').innerHTML='<option value="0">aktuálny súbor</option>'+l.slice(0,40).map(function(f){return '<option value="'+f.id+'">'+f.id+(f.active?' (aktuálny)':'')+' · '+kb(f.size)+'</option>'}).join('');
+ }).catch(function(){});
+}
+
+function events(){
+ return get('/api/events/'+$('file').value).then(function(r){return r.text()}).then(function(t){
+  var l=t.trim().split('\n');$('ev').textContent=t.trim()?l.reverse().join('\n'):'(žiadne udalosti)';
+ }).catch(function(){$('ev').textContent='Nepodarilo sa načítať.'});
+}
+
+function cmd(c,ok){$('msg').textContent='Posielam…';return get('/api/control?cmd='+encodeURIComponent(c)).then(function(r){return r.text()}).then(function(t){$('msg').textContent=t.trim()=='OK'?ok:'Chyba: '+t})}
+$('ota').onclick=function(){cmd('OTA_CHECK_NOW','OTA kontrola naplánovaná, prebehne pri najbližšom cykle.')};
+$('rst').onclick=function(){if(confirm('Reštartovať krabičku?'))cmd('RESET','Reštartuje sa, stránka sa o chvíľu znova pripojí.').catch(function(){$('msg').textContent='Reštartuje sa…'})};
+$('sb').onclick=function(){var off=!!lim;if(off&&!confirm('Vypnúť standby? Krabička nezaspí, kým ho znova nezapneš. Iba pre testy na stole.'))return;cmd('STANDBY_TIME='+(off?65535:0),off?'Standby vypnutý.':'Standby zapnutý (predvolený čas).').then(live)};
+$('file').onchange=events;$('evr').onclick=events;
+
+function loop(){live().then(function(){setTimeout(loop,2000)})}
+info().then(files).then(events).then(loop);
+setInterval(info,15000);
+setInterval(function(){if($('file').value=='0')events()},20000);
+</script>
+</body>
+</html>

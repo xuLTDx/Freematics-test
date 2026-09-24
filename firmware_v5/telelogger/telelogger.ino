@@ -655,6 +655,17 @@ uint32_t wmDoneFileId = 0;
 // Not static: dataserver.cpp's WM_FILE= control-command handler needs to
 // re-arm this after a manual watermark override.
 bool s_catchupPending = true;
+// gapFileId (NVS key GAP_FILE, u32): oldest /DATA file that has samples which
+// never went out live (transmit failure, RAM buffer overflow, buffers dropped
+// at standby) - 0 = none. catchUpMissedFiles() replays only from this file
+// on; files that went out live in full are just marked done, never
+// re-sent (a full re-send duplicated every drive in Traccar and inflated its
+// distance). s_curFileGap: the current file got a gap this boot.
+uint32_t gapFileId = 0;
+volatile bool s_curFileGap = false;
+// Set by the telemetry task once it has sent/purged the remaining buffers
+// on standby entry; standby() waits for it before turning WiFi off.
+volatile bool s_standbyDrained = false;
 
 // SD card paths for the two-phase pull-OTA staging mechanism (STORAGE_SD only).
 // Phase 1 (during active telemetry): firmware is downloaded to OTA_PENDING_PATH.
@@ -1013,6 +1024,25 @@ void logNetEvent(const char* msg)
     logger.flush();
   }
 #endif
+}
+
+// A sample that is on SD but did not (and now never will) go out live: make
+// sure the next catch-up replays this file. One NVS write per file at most.
+void markLiveGap(const char* why)
+{
+  if (fileid <= 0) return;
+  if (!s_curFileGap) {
+    s_curFileGap = true;
+    char msg[48];
+    snprintf(msg, sizeof(msg), "LIVE_GAP %s", why);
+    Serial.println(msg);
+    logNetEvent(msg);
+  }
+  if (gapFileId == 0) {
+    gapFileId = fileid;
+    nvs_set_u32(nvs, "GAP_FILE", gapFileId);
+    nvs_commit(nvs);
+  }
 }
 
 // Live-diagnostic wrapper for dataserver.cpp's /api/control?cmd=STATE? -
@@ -1388,6 +1418,18 @@ int handlerLiveData(UrlHandlerParam* param)
     // covers everything the app would otherwise show over BLE.
     n += snprintf(buf + n, bufsize - n, ",\"net\":{\"op\":\"%s\",\"ip\":\"%s\",\"apn\":\"%s\",\"rssi\":%d,\"packets\":%u,\"bytes\":%u,\"rateKBh\":%u}",
         httpNetOp(), httpNetIp(), httpApn(), httpRssi(), httpNetPacketCount(), httpNetByteCount(), httpNetRateKBh());
+    // Web UI status: voltage, state bits, standby countdown (lim = effective
+    // standby time as process() computes it, 0 = standby disabled), last
+    // motion source, current SD file vs catch-up watermark.
+    {
+      const uint16_t stDef[] = STATIONARY_TIME_TABLE;
+      unsigned lim = stDef[sizeof(stDef) / sizeof(stDef[0]) - 1];
+      if (nvsStandbyTimeS == 0xFFFF) lim = 0;
+      else if (nvsStandbyTimeS >= 5) lim = nvsStandbyTimeS;
+      n += snprintf(buf + n, bufsize - n, ",\"sys\":{\"v\":%.2f,\"st\":%u,\"ml\":%u,\"src\":\"%c\",\"lim\":%u,\"f\":%d,\"wm\":%u,\"cu\":%u}",
+          batteryVoltage, (unsigned)getStateBits(), (unsigned)((millis() - lastMotionTime) / 1000), lastMotionSrc,
+          lim, fileid, (unsigned)wmDoneFileId, (unsigned)s_catchupPending);
+    }
     buf[n++] = '}';
     param->contentLength = n;
     param->contentType=HTTPFILETYPE_JSON;
@@ -1792,7 +1834,7 @@ void printTime()
 void initialize()
 {
   // dump buffer data
-  bufman.purge();
+  if (bufman.purge()) markLiveGap("REINIT");
 
   // Reset LED/beep/conn_type sentinels so the current state is re-sent in the
   // first buffer of the new telemetry session.  initialize() is called at the
@@ -1877,6 +1919,7 @@ void initialize()
       // activation only, seed the watermark to "everything up to and
       // including the previous file is already handled" and start real
       // gap-tracking fresh from this boot's own file onward.
+      if (nvs_get_u32(nvs, "GAP_FILE", &gapFileId) != ESP_OK) gapFileId = 0;
       esp_err_t wmErr = nvs_get_u32(nvs, "WM_FILE", &wmDoneFileId);
       if (wmErr == ESP_ERR_NVS_NOT_FOUND) {
         wmDoneFileId = (fileid > 1) ? (uint32_t)(fileid - 1) : 0;
@@ -2121,7 +2164,12 @@ void process()
   static uint32_t lastGPStick = 0;
   uint32_t startTime = millis();
 
+  static uint32_t lastEvicted = 0;
   CBuffer* buffer = bufman.getFree();
+  if (bufman.evicted != lastEvicted) {
+    lastEvicted = bufman.evicted;
+    markLiveGap("BUF_FULL");  // oldest unsent sample overwritten
+  }
   buffer->state = BUFFER_STATE_FILLING;
 
 #if ENABLE_OBD
@@ -2690,12 +2738,29 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
   uint32_t upTo = (uint32_t)fileid - 1;
   if (wmDoneFileId >= upTo) return true;  // nothing missed
 
+  // Files older than the first recorded live gap went out live in full -
+  // mark them done without re-sending anything.
+  uint32_t from = wmDoneFileId + 1;
+  if (gapFileId == 0 || gapFileId > upTo) {
+    Serial.printf("[CATCHUP] files %u..%u were sent live in full - nothing to replay\n",
+        (unsigned)from, (unsigned)upTo);
+    from = upTo + 1;
+  } else if (gapFileId > from) {
+    from = gapFileId;
+  }
+  if (from > wmDoneFileId + 1) {
+    wmDoneFileId = from - 1;
+    nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
+    nvs_commit(nvs);
+  }
+  if (from > upTo) return true;
+
   Serial.print("[CATCHUP] replaying files ");
-  Serial.print(wmDoneFileId + 1);
+  Serial.print(from);
   Serial.print("..");
   Serial.println(upTo);
 
-  for (uint32_t id = wmDoneFileId + 1; id <= upTo; id++) {
+  for (uint32_t id = from; id <= upTo; id++) {
     if (s_ota_active) return false;  // yield to OTA exactly like the live send loop does
     if (!sendCsvFile(replayStore, id)) {
       Serial.print("[CATCHUP] file ");
@@ -2710,6 +2775,10 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
     Serial.print(id);
     Serial.println(" done");
   }
+  // Older gaps are replayed; keep only a gap in the still-active file.
+  gapFileId = s_curFileGap ? (uint32_t)fileid : 0;
+  nvs_set_u32(nvs, "GAP_FILE", gapFileId);
+  nvs_commit(nvs);
   return true;
 }
 
@@ -2819,6 +2888,29 @@ void telemetry(void* inst)
     }
 
     if (state.check(STATE_STANDBY)) {
+      // Send what's still buffered (typically the last sample or two - the
+      // parking position) before the link goes down, oldest first, or it
+      // would be purged below and the whole drive's file replayed later.
+      // Not while a catch-up backlog is pending: live must not overtake it.
+      if ((state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) && !s_catchupPending) {
+        for (int i = 0; i < 30; i++) {
+          CBuffer* b = bufman.getOldest();
+          if (!b) break;
+#if SERVER_PROTOCOL == PROTOCOL_UDP
+          store.header(devid);
+#endif
+          store.timestamp(b->timestamp);
+          b->serialize(store);
+          bufman.free(b);
+          store.tailer();
+          if (!teleClient.transmit(store.buffer(), store.length())) {
+            markLiveGap("TX_FAIL");
+            break;
+          }
+        }
+      }
+      if (bufman.purge()) markLiveGap("STANDBY_PURGE");
+      s_standbyDrained = true;  // standby() may turn WiFi off now
       if (state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) {
         teleClient.shutdown();
         netop = "";
@@ -2827,7 +2919,6 @@ void telemetry(void* inst)
       }
       state.clear(STATE_NET_READY | STATE_CELL_CONNECTED | STATE_WIFI_CONNECTED);
       teleClient.reset();
-      bufman.purge();
       // Reset LED/beep/conn_type sentinels so the current state is re-sent in
       // the first buffer after the connection is re-established.  Without this
       // reset the state-change detection would suppress the PIDs (value
@@ -3192,7 +3283,11 @@ void telemetry(void* inst)
       // s_catchupPending stays true so the NEXT iteration retries catch-up
       // again instead of falling through to live data below - newer data
       // must never be sent while an older backlog is still incomplete.
-      if (s_catchupPending) {
+      // fileid > 0: not before initialize() has opened this boot's SD file.
+      // The network can come up first (WiFi joins in setup()); catch-up
+      // then saw fileid == 0, returned "nothing missed" and never ran for
+      // the whole boot. No live data exists before that point either.
+      if (s_catchupPending && fileid > 0) {
         if (catchUpMissedFiles(store)) {
           s_catchupPending = false;
           connErrors = 0;
@@ -3298,6 +3393,7 @@ void telemetry(void* inst)
         connErrors = 0;
         showStats();
       } else {
+        markLiveGap("TX_FAIL");  // buffer already freed - this sample is SD-only now
         timeoutsNet++;
         connErrors++;
         printTimeoutStats();
@@ -3362,7 +3458,7 @@ void telemetry(void* inst)
         // device too hot, cool down by pause transmission
         Serial.print("HIGH DEVICE TEMP: ");
         Serial.println(deviceTemp);
-        bufman.purge();
+        if (bufman.purge()) markLiveGap("OVERHEAT");
       }
 
     }
@@ -3374,6 +3470,7 @@ void telemetry(void* inst)
 *******************************************************************************/
 void standby()
 {
+  s_standbyDrained = false;
   state.set(STATE_STANDBY);
 
 #if STORAGE == STORAGE_SD
@@ -3399,6 +3496,11 @@ void standby()
     logger.end();
   }
 #endif
+
+  // Let the telemetry task send the last buffered samples over the still-up
+  // link first (see its STATE_STANDBY branch); capped so a stuck link can't
+  // hold standby off.
+  for (uint32_t t = millis(); !s_standbyDrained && millis() - t < 15000;) delay(50);
 
 #if ENABLE_WIFI
   // WiFi-off-in-standby (2026-09-22, corrected same day): WiFi always goes off

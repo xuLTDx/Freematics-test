@@ -166,9 +166,14 @@ void CBufferManager::init()
   assert(total > 0);
 }
 
-void CBufferManager::purge()
+int CBufferManager::purge()
 {
-  for (int n = 0; n < total; n++) slots[n]->purge();
+  int filled = 0;
+  for (int n = 0; n < total; n++) {
+    if (slots[n]->state == BUFFER_STATE_FILLED) filled++;
+    slots[n]->purge();
+  }
+  return filled;
 }
 
 CBuffer* CBufferManager::getFree()
@@ -191,6 +196,7 @@ CBuffer* CBufferManager::getFree()
   }
   // dispose oldest data when buffer is full
   while (slots[m]->state == BUFFER_STATE_LOCKED) delay(1);
+  if (slots[m]->state == BUFFER_STATE_FILLED) evicted++;
   slots[m]->purge();
   return slots[m];
 }

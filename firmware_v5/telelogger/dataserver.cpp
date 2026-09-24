@@ -68,6 +68,7 @@ extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDB
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
 extern uint32_t wmDoneFileId;  // missed-data catch-up watermark (NVS key WM_FILE)
 extern bool s_catchupPending;  // re-run catchUpMissedFiles() next send-loop iteration
+extern uint32_t gapFileId;     // oldest file with a live-send gap (NVS key GAP_FILE)
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
 extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
 // 2026-09-23: mirrors processBLE()'s NET_OP/NET_IP/NET_PACKET/NET_DATA/
@@ -702,6 +703,11 @@ int handlerControl(UrlHandlerParam* param)
             nvs_set_u32(nvs, "WM_FILE", wm) == ESP_OK
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         wmDoneFileId = wm;
+        // a manual watermark means "replay from here" - mark the next file
+        // as having a gap, or catch-up would skip it as sent-live
+        gapFileId = wm + 1;
+        nvs_set_u32(nvs, "GAP_FILE", gapFileId);
+        nvs_commit(nvs);
         s_catchupPending = true;
     } else {
         n = snprintf(buf, bufsize, "ERR");
@@ -915,7 +921,19 @@ int handlerOTA(UrlHandlerParam* param) {
     return FLAG_DATA_RAW;
 }
 
+// Web UI at "/": webui/index.html, gzipped with its full HTTP header by
+// webui_gen.py (pre-build) and sent straight from flash - part of
+// firmware.bin, so pull-OTA updates it; nothing to upload to SPIFFS.
+#include "webui_page.h"
+int handlerWebUI(UrlHandlerParam* param)
+{
+    param->pucBuffer = (char*)WEBUI_PAGE;
+    param->contentLength = sizeof(WEBUI_PAGE);
+    return FLAG_DATA_RAW | FLAG_CUSTOM_HEADER | FLAG_CONN_CLOSE;
+}
+
 UrlHandler urlHandlerList[]={
+    {"", handlerWebUI},  // empty prefix matches only "/" (httpd.c _mwCheckUrlHandlers)
     {"api/live", handlerLiveData},
     {"api/info", handlerInfo},
     {"api/control", handlerControl},
