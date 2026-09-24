@@ -3,7 +3,6 @@
 *.a
 *.so
 *.exe
-server/teleserver/teleserver
 
 # CodeQL
 _codeql_detected_source_root

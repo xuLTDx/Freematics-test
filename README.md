@@ -77,9 +77,9 @@ Kept in separate repositories:
 
 | Path | |
 |---|---|
-| `firmware_v5/telelogger/` | the firmware this README is about |
-| `libraries/FreematicsPlus/` | device, GPS, OBD and network (WiFi/cellular) libraries used by it |
-| everything else | inherited from upstream and not used by this fork |
+| `firmware_v5/telelogger/` | the firmware |
+| `libraries/FreematicsPlus/` | device, GPS, OBD, MEMS and network (WiFi/cellular/BLE) library |
+| `libraries/httpd/` | small HTTP server used for the local API |
 
 ## Credits and license
 

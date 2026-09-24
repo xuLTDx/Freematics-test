@@ -12,11 +12,9 @@
  * Reimplemented against the h2zero/NimBLE-Arduino library instead of raw
  * ESP-IDF Bluedroid, for a smaller RAM footprint that coexists with WiFi.
  *
- * External interface preserved exactly (verified against every call site in
- * firmware_v5/telelogger/telelogger.ino and firmware_v5/datalogger/
- * datalogger.ino - both only ever call ble_init(), ble_recv_command(), and
- * ble_send_response(); ble_send() itself is unused by either .ino today but
- * is kept for interface parity since it's part of the public header):
+ * External interface preserved exactly (telelogger.ino only ever calls
+ * ble_init(), ble_recv_command(), and ble_send_response(); ble_send() is
+ * unused but kept for interface parity since it's part of the public header):
  *
  *   void  ble_init(const char* adv_name);
  *   void  ble_send(int spp_index, void* data, int len);
