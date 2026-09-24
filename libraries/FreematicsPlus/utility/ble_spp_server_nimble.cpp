@@ -43,6 +43,7 @@ static char     g_advName[32]        = {0};
 static bool     g_bleInitialized     = false; // ble_init() has run at least once
 static bool     g_blePaused          = false;
 static uint32_t g_blePauseStartMs    = 0;
+static volatile bool g_scanning      = false;  // a scan burst is running (see ble_scan_start())
 
 // 2026-09-22: real mutex serializing ble_pause()/ble_resume(), added after a
 // SECOND boot-loop of the exact same class as the original 2026-09-21 race
@@ -301,9 +302,46 @@ void ble_init(const char* adv_name)
 // again every single time (not just the first), but whether the phone app
 // actually notices the disconnect and reconnects cleanly on ITS side is a
 // question for the phone app / BLE stack on that end, untestable from here.
+// 2026-09-24: WiFi-(re)connect coordination for the raw classic-BT presence
+// module (bt_presence.cpp), which runs INSTEAD of NimBLE when BT_MODE=1. The
+// same coexistence abort applies to it (BT controller enabled while WiFi
+// modem sleep is off), so ble_pause()/ble_resume() - already called around
+// every WiFi connect attempt - mark WiFi busy even when NimBLE isn't running,
+// and a presence burst only runs between them, holding the same mutex.
+static volatile bool g_wifiBusy = false;
+
+void ble_coex_init(void)
+{
+    if (!g_blePauseMutex) g_blePauseMutex = xSemaphoreCreateMutex();
+}
+
+bool ble_coex_begin(void)
+{
+    if (!g_blePauseMutex) return false;
+    if (xSemaphoreTake(g_blePauseMutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (g_wifiBusy) {
+        xSemaphoreGive(g_blePauseMutex);
+        return false;
+    }
+    return true;  // caller runs its burst, then ble_coex_end()
+}
+
+void ble_coex_end(void)
+{
+    if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
+}
+
 void ble_pause()
 {
-    if (!g_bleInitialized) return;
+    if (!g_bleInitialized) {
+        // classic presence mode (or BLE off): block bursts, wait for a running one
+        if (g_blePauseMutex) {
+            xSemaphoreTake(g_blePauseMutex, portMAX_DELAY);
+            g_wifiBusy = true;
+            xSemaphoreGive(g_blePauseMutex);
+        }
+        return;
+    }
     // Mutex (2026-09-22, see its own declaration comment above) - serializes
     // this against ble_resume() and against itself, closing the race the
     // 2026-09-21 flag-order fix only narrowed. portMAX_DELAY: this can only
@@ -315,6 +353,7 @@ void ble_pause()
     }
     Serial.println("[BLE] pausing BT controller for WiFi (re)connect");
     NimBLEDevice::deinit(true /* clearAll - see comment above for why */);
+    g_scanning = false;  // deinit ended any scan burst without its callback
     g_server = nullptr;
     g_statusChar = nullptr;
     g_blePauseStartMs = millis();
@@ -324,7 +363,10 @@ void ble_pause()
 
 void ble_resume()
 {
-    if (!g_bleInitialized) return;
+    if (!g_bleInitialized) {
+        g_wifiBusy = false;
+        return;
+    }
     // Mutex-protected (2026-09-22): this used to just clear g_blePaused
     // before the slow re-init work as a race mitigation (2026-09-21) - that
     // narrowed but did NOT close the window between two tasks' `if
@@ -346,6 +388,73 @@ void ble_resume()
     BLEDevice::init(g_advName);
     bleCreateGattServerAndAdvertise(g_advName);
     if (g_blePauseMutex) xSemaphoreGive(g_blePauseMutex);
+}
+
+// ---------------------------------------------------------------------------
+// Scan bursts. Runs next to advertising/the GATT server (NimBLE observer role
+// is compiled in, see platformio.ini). Active scan, so names in scan
+// responses are seen too. setMaxResults(0): nothing is stored, every
+// advertiser goes straight to the callback. The scan object is owned by
+// NimBLEDevice and deleted by ble_pause()'s deinit(true) - so it is fetched
+// fresh on every burst, and a burst cut short by a pause just ends.
+// ---------------------------------------------------------------------------
+static ble_scan_result_cb g_scanCb = nullptr;
+static uint32_t           g_scanStartMs = 0;
+static uint32_t           g_scanSeconds = 0;
+
+class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* dev) override {
+        if (!g_scanCb) return;
+        NimBLEAddress a = dev->getAddress();  // keep it alive: getNative() points into it
+        const uint8_t* le = a.getNative();    // little-endian
+        uint8_t addr[6];
+        for (int i = 0; i < 6; i++) addr[i] = le[5 - i];
+        uint16_t mfgId = 0xFFFF;
+        if (dev->haveManufacturerData()) {
+            std::string m = dev->getManufacturerData();
+            if (m.size() >= 2) mfgId = (uint8_t)m[0] | ((uint8_t)m[1] << 8);
+        }
+        std::string name = dev->haveName() ? dev->getName() : std::string();
+        g_scanCb(addr, dev->getAddressType(), dev->getRSSI(), name.c_str(), mfgId);
+    }
+};
+static ScanCallbacks g_scanCallbacks;
+
+static void scanComplete(NimBLEScanResults)
+{
+    g_scanning = false;
+}
+
+bool ble_scan_start(uint32_t seconds, ble_scan_result_cb onResult)
+{
+    if (!g_bleInitialized || !g_blePauseMutex) return false;
+    if (xSemaphoreTake(g_blePauseMutex, 0) != pdTRUE) return false;  // pause/resume in progress
+    bool ok = false;
+    if (!g_blePaused && !g_scanning) {
+        g_scanCb = onResult;
+        NimBLEScan* scan = NimBLEDevice::getScan();
+        scan->setAdvertisedDeviceCallbacks(&g_scanCallbacks, false);
+        scan->setActiveScan(true);
+        scan->setInterval(100);
+        scan->setWindow(50);   // 50% duty while the burst lasts
+        scan->setMaxResults(0);
+        g_scanning = true;
+        g_scanStartMs = millis();
+        g_scanSeconds = seconds;
+        ok = scan->start(seconds, scanComplete, false);
+        if (!ok) g_scanning = false;
+    }
+    xSemaphoreGive(g_blePauseMutex);
+    return ok;
+}
+
+bool ble_scan_running(void)
+{
+    // A pause/resume (deinit) ends a running burst without the complete
+    // callback - ble_pause() clears the flag; the time check is a second
+    // safety net so a lost callback can never stop scanning for good.
+    if (g_scanning && millis() - g_scanStartMs > (g_scanSeconds + 5) * 1000UL) g_scanning = false;
+    return g_scanning;
 }
 
 bool ble_isPausedTooLong(uint32_t maxPauseMs)

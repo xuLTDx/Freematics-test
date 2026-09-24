@@ -61,6 +61,26 @@ void  ble_pause(void);
 void  ble_resume(void);
 bool  ble_isPausedTooLong(uint32_t maxPauseMs);
 
+// 2026-09-24: BLE scan bursts (crew/driver detection by phone). One report
+// per advertiser per burst, called from the NimBLE host task - keep it short.
+// addr: 6 bytes, most significant first (as printed "AA:BB:..."); addrType:
+// 0 public, 1 random (see the top bits of addr[0] for static vs rotating);
+// mfgId: first two manufacturer-data bytes (company id, e.g. 0x004C Apple),
+// 0xFFFF if none. Returns false while BLE is paused/not initialised or a
+// burst is already running - the caller just tries again next time.
+typedef void (*ble_scan_result_cb)(const uint8_t* addr, uint8_t addrType, int rssi,
+                                   const char* name, uint16_t mfgId);
+bool  ble_scan_start(uint32_t seconds, ble_scan_result_cb onResult);
+bool  ble_scan_running(void);
+
+// Classic-BT presence mode (bt_presence.cpp, NimBLE not started): creates the
+// shared mutex (call once from setup(), before any task can connect WiFi);
+// begin() returns true when a burst may use the radio now (WiFi not in a
+// connect attempt) and then holds the mutex until end().
+void  ble_coex_init(void);
+bool  ble_coex_begin(void);
+void  ble_coex_end(void);
+
 #ifdef __cplusplus
 }
 #endif

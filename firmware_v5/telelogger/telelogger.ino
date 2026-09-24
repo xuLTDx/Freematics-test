@@ -605,6 +605,18 @@ bool enableObd = true;   // OBD-II PID polling (compile-time ENABLE_OBD must als
 // standby instead of the normal active-wait loop.  Loaded from NVS key
 // DEEP_STANDBY (u8, 0=off 1=on).  Defaults to false.
 bool enableDeepStandby = false;
+// BLE scan bursts for crew (phone) detection - NVS key BLE_SCAN, default off.
+bool enableBleScan = false;
+// Bluetooth mode (NVS key BT_MODE): 0 = NimBLE (GATT server for the phone
+// app + optional BLE scan), 1 = classic-BT phone presence (bt_presence.cpp,
+// no NimBLE). Takes effect after a reboot. BT_KNOWN: comma-separated classic
+// Bluetooth addresses of the crew's phones.
+uint8_t btMode = 0;
+char btKnown[160] = {0};
+#if ENABLE_BLE
+bool bt_presence_start(bool (*active)());
+void bt_presence_set_known(const char* list);
+#endif
 
 // Vehicle identification loaded from NVS (VEHICLE_MAKE, VEHICLE_MODEL, VEHICLE_YEAR).
 // Stored for informational purposes and future vehicle-specific PID selection.
@@ -1438,6 +1450,110 @@ int handlerLiveData(UrlHandlerParam* param)
 #endif
 
 /*******************************************************************************
+  BLE scan (crew detection, step 1: see what phones actually advertise).
+  A 5 s active scan burst every 30 s while working (never in standby),
+  results kept in a small table for /api/ble and the web UI. Enabled by NVS
+  BLE_SCAN=1 (default off).
+*******************************************************************************/
+#if ENABLE_BLE
+#define BLE_SCAN_MAX 32
+#define BLE_SCAN_EVERY_MS 30000
+#define BLE_SCAN_SECONDS 5
+struct BleSeen {
+  uint8_t addr[6];      // most significant byte first
+  uint8_t type;         // 0 public, 1 random
+  int8_t rssi, rssiMax;
+  uint16_t mfg;         // company id from manufacturer data, 0xFFFF none
+  uint16_t scans;       // bursts it was seen in
+  uint16_t lastScan;
+  uint32_t lastMs;
+  char name[21];
+};
+static BleSeen s_ble[BLE_SCAN_MAX];
+static uint8_t s_bleCount = 0;
+static volatile uint16_t s_bleScanNo = 0;
+static portMUX_TYPE s_bleMux = portMUX_INITIALIZER_UNLOCKED;
+
+// NimBLE host task
+static void onBleResult(const uint8_t* addr, uint8_t type, int rssi, const char* name, uint16_t mfg)
+{
+  portENTER_CRITICAL(&s_bleMux);
+  int i = 0;
+  while (i < s_bleCount && memcmp(s_ble[i].addr, addr, 6)) i++;
+  if (i == s_bleCount) {
+    if (s_bleCount < BLE_SCAN_MAX) {
+      s_bleCount++;
+    } else {
+      i = 0;  // full: reuse the least recently seen entry
+      for (int j = 1; j < BLE_SCAN_MAX; j++) if (s_ble[j].lastMs < s_ble[i].lastMs) i = j;
+    }
+    memset(&s_ble[i], 0, sizeof(BleSeen));
+    memcpy(s_ble[i].addr, addr, 6);
+    s_ble[i].type = type;
+    s_ble[i].rssiMax = -128;
+    s_ble[i].mfg = 0xFFFF;
+  }
+  BleSeen& d = s_ble[i];
+  d.rssi = (int8_t)rssi;
+  if (rssi > d.rssiMax) d.rssiMax = (int8_t)rssi;
+  if (mfg != 0xFFFF) d.mfg = mfg;
+  if (name && name[0]) {
+    strncpy(d.name, name, sizeof(d.name) - 1);
+    d.name[sizeof(d.name) - 1] = 0;
+  }
+  if (d.lastScan != s_bleScanNo) {
+    d.lastScan = s_bleScanNo;
+    d.scans++;
+  }
+  d.lastMs = millis();
+  portEXIT_CRITICAL(&s_bleMux);
+}
+
+// called from process() - starts the next burst when due
+static void bleScanTick()
+{
+  static uint32_t lastStart = 0;
+  if (!enableBleScan || ble_scan_running()) return;
+  if (lastStart && millis() - lastStart < BLE_SCAN_EVERY_MS) return;
+  s_bleScanNo++;
+  if (ble_scan_start(BLE_SCAN_SECONDS, onBleResult)) lastStart = millis();
+}
+
+#if ENABLE_HTTPD
+int handlerBleScan(UrlHandlerParam* param)
+{
+  char *buf = param->pucBuffer;
+  int bufsize = param->bufSize;
+  static BleSeen copy[BLE_SCAN_MAX];  // static: keep it off the httpd stack
+  portENTER_CRITICAL(&s_bleMux);
+  uint8_t cnt = s_bleCount;
+  memcpy(copy, s_ble, sizeof(BleSeen) * cnt);
+  portEXIT_CRITICAL(&s_bleMux);
+  uint32_t now = millis();
+  int n = snprintf(buf, bufsize, "{\"on\":%u,\"scan\":%u,\"dev\":[", (unsigned)enableBleScan, (unsigned)s_bleScanNo);
+  for (int i = 0; i < cnt && n < bufsize - 160; i++) {
+    const BleSeen& d = copy[i];
+    char nm[sizeof(d.name)];
+    for (int k = 0; k < (int)sizeof(nm); k++) {  // JSON-safe
+      char c = d.name[k];
+      nm[k] = (c == '"' || c == '\\' || (c > 0 && c < 32)) ? '_' : c;
+      if (!c) break;
+    }
+    n += snprintf(buf + n, bufsize - n,
+        "%s{\"a\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"t\":%u,\"r\":%d,\"rm\":%d,\"m\":%d,\"s\":%u,\"ago\":%u,\"n\":\"%s\"}",
+        i ? "," : "", d.addr[0], d.addr[1], d.addr[2], d.addr[3], d.addr[4], d.addr[5],
+        (unsigned)d.type, d.rssi, d.rssiMax, d.mfg == 0xFFFF ? -1 : (int)d.mfg,
+        (unsigned)d.scans, (unsigned)((now - d.lastMs) / 1000), nm);
+  }
+  n += snprintf(buf + n, bufsize - n, "]}");
+  param->contentLength = n;
+  param->contentType = HTTPFILETYPE_JSON;
+  return FLAG_DATA_RAW;
+}
+#endif
+#endif
+
+/*******************************************************************************
   Reading and processing OBD data
 *******************************************************************************/
 #if ENABLE_OBD
@@ -2164,6 +2280,9 @@ void process()
   static uint32_t lastGPStick = 0;
   uint32_t startTime = millis();
 
+#if ENABLE_BLE
+  bleScanTick();
+#endif
   static uint32_t lastEvicted = 0;
   CBuffer* buffer = bufman.getFree();
   if (bufman.evicted != lastEvicted) {
@@ -3787,6 +3906,16 @@ void loadConfig()
   if (nvs_get_u8(nvs, "DEEP_STANDBY", &nvsDeepStandby) == ESP_OK) {
     enableDeepStandby = nvsDeepStandby != 0;
   }
+
+  // BLE scan for crew detection (NVS key BLE_SCAN, u8, default 0 = off).
+  uint8_t nvsBleScan = 0;
+  enableBleScan = nvs_get_u8(nvs, "BLE_SCAN", &nvsBleScan) == ESP_OK && nvsBleScan;
+  if (nvs_get_u8(nvs, "BT_MODE", &btMode) != ESP_OK) btMode = 0;
+  size_t btKnownLen = sizeof(btKnown);
+  if (nvs_get_str(nvs, "BT_KNOWN", btKnown, &btKnownLen) != ESP_OK) btKnown[0] = 0;
+#if ENABLE_BLE
+  bt_presence_set_known(btKnown);
+#endif
 
   // Standby-time override (NVS key STANDBY_TIME, u16, seconds, 5-900).
   // 0 means "use compile-time STATIONARY_TIME_TABLE default" (currently 180 s).
@@ -5777,6 +5906,10 @@ void setup()
   // connected but nothing is ever sent". Moving creation here gives it first
   // claim on a much less fragmented heap. Retries + logs the outcome either
   // way so a future regression here can never be silently invisible again.
+#if ENABLE_BLE
+  // before any task can start a WiFi connect (it calls ble_pause())
+  ble_coex_init();
+#endif
   {
     Serial.printf("HEAP:free=%u maxblock=%u (internal, before telemetry task stack)\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
@@ -5862,8 +5995,14 @@ if (!state.check(STATE_MEMS_READY)) do {
 
 #if ENABLE_BLE
   if (enableBle) {
-    // init BLE
-    ble_init("FreematicsPlus");
+    if (btMode == 1) {
+      // classic-BT phone presence instead of NimBLE; bursts only while driving
+      bool ok = bt_presence_start([]() { return state.check(STATE_WORKING) && !state.check(STATE_STANDBY); });
+      Serial.printf("[BT] classic presence mode, %s\n", ok ? "started" : "FAILED");
+    } else {
+      // init BLE
+      ble_init("FreematicsPlus");
+    }
   }
 #endif
 

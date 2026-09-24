@@ -54,6 +54,18 @@ pre{margin:0;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;
  <pre id="ev">…</pre>
 </section>
 
+<section id="bts" hidden><h2>Telefóny posádky (klasický Bluetooth)</h2>
+ <div class="kv" id="bt2"></div>
+ <table id="bt"></table>
+ <h2 style="margin-top:12px">Nájdené v okolí (viditeľné)</h2>
+ <table id="btf"></table>
+</section>
+
+<section><h2>BLE v okolí</h2>
+ <div class="row"><button id="blet"></button><span class="mute" id="bles"></span></div>
+ <div style="overflow-x:auto"><table id="ble"></table></div>
+</section>
+
 <section><h2>Akcie</h2>
  <div class="row"><button id="ota">Skontrolovať OTA teraz</button><button id="sb"></button><button id="rst" class="danger">Reštartovať</button></div>
  <div id="msg" class="mute"></div>
@@ -126,6 +138,43 @@ $('ota').onclick=function(){cmd('OTA_CHECK_NOW','OTA kontrola naplánovaná, pre
 $('rst').onclick=function(){if(confirm('Reštartovať krabičku?'))cmd('RESET','Reštartuje sa, stránka sa o chvíľu znova pripojí.').catch(function(){$('msg').textContent='Reštartuje sa…'})};
 $('sb').onclick=function(){var off=!!lim;if(off&&!confirm('Vypnúť standby? Krabička nezaspí, kým ho znova nezapneš. Iba pre testy na stole.'))return;cmd('STANDBY_TIME='+(off?65535:0),off?'Standby vypnutý.':'Standby zapnutý (predvolený čas).').then(live)};
 $('file').onchange=events;$('evr').onclick=events;
+
+var MFG={76:'Apple',6:'Microsoft',224:'Google',117:'Samsung',135:'Garmin',911:'Xiaomi',343:'Huawei',741:'OnePlus'},bleOn=0;
+function atype(a,t){if(!t)return 'pevná';var b=parseInt(a.substr(0,2),16)>>6;return b==3?'pevná':b==1?'mení sa':'dočasná'}
+function ble(){
+ return json('/api/ble').then(function(d){
+  bleOn=d.on;$('blet').textContent=d.on?'Vypnúť BLE sken':'Zapnúť BLE sken';
+  $('bles').textContent=d.on?'skenov: '+d.scan+' · 5 s každých 30 s':'sken je vypnutý';
+  var l=d.dev.sort(function(a,b){return b.rm-a.rm});
+  $('ble').innerHTML=l.length?'<tr class="mute"><td>zariadenie</td><td>adresa</td><td>dBm</td><td>videné</td></tr>'+l.map(function(x){
+   var who=x.n||(x.m>=0?(MFG[x.m]||'výrobca 0x'+x.m.toString(16)):'?');
+   return '<tr><td>'+who.replace(/</g,'&lt;')+'<div class="kv">'+atype(x.a,x.t)+' · pred '+dur(x.ago)+'</div></td><td class="kv">'+x.a+'</td><td>'+x.r+' / '+x.rm+'</td><td>'+x.s+'×</td></tr>'}).join(''):'<tr><td class="mute">Zatiaľ nič.</td></tr>';
+ }).catch(function(){});
+}
+$('blet').onclick=function(){cmd('BLE_SCAN='+(bleOn?0:1),bleOn?'BLE sken vypnutý.':'BLE sken zapnutý, prvé výsledky do 30 s.').then(ble)};
+ble();setInterval(ble,5000);
+
+function bt(){
+ return json('/api/bt').then(function(d){
+  $('bts').hidden=!d.on;if(!d.on)return;
+  $('bt2').textContent='dotaz každú minútu počas jazdy · cyklov: '+d.cycles+(d.err?' · chyba '+d.err:'');
+  var known=d.dev.map(function(x){return x.a});
+  $('btf').innerHTML=d.found.length?d.found.map(function(x){
+   var phone=((x.cod>>8)&0x1f)==2,add=known.indexOf(x.a)<0?' <button data-a="'+x.a+'">Pridať</button>':' <span class="kv">známy</span>';
+   return '<tr><td>'+(x.n||'(bez mena)').replace(/</g,'&lt;')+'<div class="kv">'+x.a+' · '+(phone?'telefón':'iné zariadenie')+' · '+x.r+' dBm · pred '+dur(x.ago)+'</div></td><td>'+add+'</td></tr>'}).join(''):'<tr><td class="mute">Nič. Otvor na telefóne Nastavenia → Bluetooth (je viditeľný ~2 min).</td></tr>';
+  $('bt').innerHTML=d.dev.length?d.dev.map(function(x){
+   var st=x.st==0?'odpovedal':x.st==4?'nedosiahnuteľný':x.st<0?'zatiaľ nie':'kód '+x.st;
+   return '<tr><td>'+(x.n||x.a).replace(/</g,'&lt;')+'<div class="kv">'+x.a+' · '+st+' ('+x.ms+' ms)</div></td><td>'+(x.ago<0?'nikdy':'pred '+dur(x.ago))+'<div class="kv">'+x.hits+'/'+x.tries+'</div></td></tr>'}).join(''):'<tr><td class="mute">Žiadne telefóny (BT_KNOWN je prázdne).</td></tr>';
+ }).catch(function(){});
+}
+$('btf').onclick=function(ev){
+ var a=ev.target.dataset&&ev.target.dataset.a;if(!a)return;
+ get('/api/control?cmd=BT_KNOWN%3F').then(function(r){return r.text()}).then(function(t){
+  var l=t.trim()=='-'?[]:t.trim().split(',');if(l.indexOf(a)<0)l.push(a);
+  return cmd('BT_KNOWN='+l.join(','),'Pridané: '+a);
+ }).then(bt);
+};
+bt();setInterval(bt,10000);
 
 function loop(){live().then(function(){setTimeout(loop,2000)})}
 info().then(files).then(events).then(loop);

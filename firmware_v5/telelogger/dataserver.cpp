@@ -65,6 +65,13 @@ extern void loadConfig();
 extern bool enableLedRed;  // read here to apply LED state immediately in handlerControl
 extern bool enableObd;         // runtime OBD enable flag (NVS key OBD_EN)
 extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDBY)
+extern bool enableBleScan;     // BLE crew-detection scan (NVS key BLE_SCAN)
+extern uint8_t btMode;         // NVS BT_MODE: 0 NimBLE, 1 classic presence (after reboot)
+extern char btKnown[160];      // NVS BT_KNOWN: crew phones' classic BT addresses
+#if ENABLE_BLE
+int handlerBleScan(UrlHandlerParam* param);    // telelogger.ino
+int handlerBtPresence(UrlHandlerParam* param); // bt_presence.cpp
+#endif
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
 extern uint32_t wmDoneFileId;  // missed-data catch-up watermark (NVS key WM_FILE)
 extern bool s_catchupPending;  // re-run catchUpMissedFiles() next send-loop iteration
@@ -634,6 +641,32 @@ int handlerControl(UrlHandlerParam* param)
             nvs_set_u16(nvs, "STANDBY_TIME", v) == ESP_OK
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
+    } else if (!strcmp(cmd, "BT_MODE?")) {
+        n = snprintf(buf, bufsize, "%u", (unsigned)btMode);
+    } else if (!strncmp(cmd, "BT_MODE=", 8)) {
+        // 0 = NimBLE, 1 = classic-BT phone presence. Applies after RESET.
+        uint8_t v = atoi(cmd + 8) == 1 ? 1 : 0;
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_u8(nvs, "BT_MODE", v) == ESP_OK
+            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
+    } else if (!strcmp(cmd, "BT_KNOWN?")) {
+        n = snprintf(buf, bufsize, "%s", btKnown[0] ? btKnown : "-");
+    } else if (!strncmp(cmd, "BT_KNOWN=", 9)) {
+        // crew phones' classic Bluetooth addresses, "AA:BB:CC:DD:EE:FF,..."; "-" clears
+        const char* p = cmd + 9;
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_str(nvs, "BT_KNOWN", strcmp(p, "-") ? p : "") == ESP_OK
+            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
+        loadConfig();
+    } else if (!strcmp(cmd, "BLE_SCAN?")) {
+        n = snprintf(buf, bufsize, "%u", (unsigned)enableBleScan);
+    } else if (!strncmp(cmd, "BLE_SCAN=", 9)) {
+        // BLE scan bursts for crew detection (NVS key BLE_SCAN, u8, 0/1).
+        uint8_t v = atoi(cmd + 9) ? 1 : 0;
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_u8(nvs, "BLE_SCAN", v) == ESP_OK
+            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
+        loadConfig();
     } else if (!strncmp(cmd, "DEEP_STANDBY=", 13)) {
         // Enable or disable deep-standby mode (NVS key DEEP_STANDBY, u8).
         // 1 = use ESP32 deep sleep during standby, 0 = normal standby.
@@ -935,6 +968,10 @@ int handlerWebUI(UrlHandlerParam* param)
 UrlHandler urlHandlerList[]={
     {"", handlerWebUI},  // empty prefix matches only "/" (httpd.c _mwCheckUrlHandlers)
     {"api/live", handlerLiveData},
+#if ENABLE_BLE
+    {"api/ble", handlerBleScan},
+    {"api/bt", handlerBtPresence},
+#endif
     {"api/info", handlerInfo},
     {"api/control", handlerControl},
     {"api/ota", handlerOTA},
