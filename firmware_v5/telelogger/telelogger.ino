@@ -569,6 +569,8 @@ uint32_t lastMotionTime = 0;
 // 'R' RPM > 0, 'G' GPS speed, '-' none since boot. Logged at standby entry so a
 // drive log shows what kept the device awake (e.g. GPS noise while parked).
 char lastMotionSrc = '-';
+// last OBD read with RPM > 0 (engine-off RPM 0 is only sent after 5 s without)
+uint32_t lastRpmMs = 0;
 // Survive ESP.restart() after standby wake so the next boot can log how long
 // standby lasted and at what voltage it woke (SD is closed during standby).
 #define WAKE_INFO_MAGIC 0x57414B45UL
@@ -1594,7 +1596,7 @@ void processOBD(CBuffer* buffer)
         obdData[i].value = value;
         // Engine running = not parked, whatever the voltage says (see the
         // standby comment in process()).
-        if (pid == PID_RPM && value > 0) { lastMotionTime = millis(); lastMotionSrc = 'R'; }
+        if (pid == PID_RPM && value > 0) { lastMotionTime = millis(); lastMotionSrc = 'R'; lastRpmMs = millis(); }
         buffer->add((uint16_t)pid | 0x100, ELEMENT_INT32, &value, sizeof(value));
     } else {
         timeoutsOBD++;
@@ -2384,13 +2386,16 @@ void process()
   // the SIGNAL feeding it changed, not the debounce machinery itself) now
   // updates whenever voltage is at-or-above ENGINE_OFF_VOLTAGE, i.e.
   // "engine appears to be running (or we can't yet prove it isn't)".
-  // ENGINE_OFF_VOLTAGE is a placeholder default (typical resting 12V lead-
-  // acid battery, comfortably below JUMPSTART_VOLTAGE=13.2V to avoid
-  // flapping right at the wake threshold) - NOT yet calibrated against real
-  // drive data (no historical KEY_BATTERY readings survived tonight's DB
-  // wipes). Revisit once a real drive has logged engine-on vs engine-off
-  // voltage to Traccar.
+  // ENGINE_OFF_VOLTAGE: see config.h for the measured values.
   if (batteryVoltage >= ENGINE_OFF_VOLTAGE) { lastMotionTime = millis(); lastMotionSrc = 'V'; }
+  // Engine off: say so explicitly with RPM 0 (the decoder turns it into
+  // ignition=false). Without it the RPM PID just stopped coming, Traccar
+  // never saw the ignition go off, and with report.trip.useIgnition a drive,
+  // the parking and the next drive became one trip (2026-09-25).
+  if (batteryVoltage >= 7.0f && batteryVoltage < ENGINE_OFF_VOLTAGE && millis() - lastRpmMs > 5000) {
+    int32_t zero = 0;
+    buffer->add(PID_RPM | 0x100, ELEMENT_INT32, &zero, sizeof(zero));
+  }
 #endif
 
 #if LOG_EXT_SENSORS
@@ -2979,6 +2984,8 @@ static void buildStandbyReport(CStorageRAM& rb)
     uint32_t v = (uint32_t)(standbyVoltage * 100);
     rb.log(PID_BATTERY_VOLTAGE, &v, 1);
   }
+  int32_t rpm0 = 0;  // parked: ignition off for Traccar's trip detection
+  rb.log(PID_RPM | 0x100, &rpm0, 1);
   rb.tailer();
   Serial.print("[STANDBY] Report ");
   Serial.print(hasFix ? "with GPS fix: " : "WITHOUT GPS fix: ");
@@ -3703,14 +3710,13 @@ void standby()
     // Never reached: device restarts from setup() after wake-up.
   }
 
-  // Wake: voltage-only (2026-09-22, MEMS branch removed - MEMS is unused on
-  // this device, ENABLE_MEMS=0, chip not even confirmed populated - see
-  // project_freematics_one_hardware_inventory). Mirrors the standby-entry
-  // redesign above: same JUMPSTART_VOLTAGE=13.2V threshold as before, now
-  // the ONLY wake condition rather than one of three branches.
+  // Wake: voltage-only, the same ENGINE_OFF_VOLTAGE threshold as standby
+  // entry (2026-09-25; was a separate 13.2 V), confirmed by two readings in
+  // a row 5 s apart so a voltage hovering at the threshold can't flap.
   const uint32_t standbyStart = millis();
   float wakeVolt = 0;
 #if ENABLE_OBD
+  int above = 0;
   do {
     delay(5000);
     // Same source as the standby-entry decision in process(). Was
@@ -3719,7 +3725,8 @@ void standby()
     // reply to ATRV or ATI at all - so the device could never wake.
     wakeVolt = readSystemVoltage();
     standbyVoltage = wakeVolt; // for the telemetry task's standby report
-  } while (wakeVolt < JUMPSTART_VOLTAGE);
+    above = wakeVolt >= ENGINE_OFF_VOLTAGE ? above + 1 : 0;
+  } while (above < 2);
 #else
   delay(5000);
 #endif

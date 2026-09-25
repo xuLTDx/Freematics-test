@@ -217,23 +217,12 @@
 **************************************/
 // motion threshold for waking up
 #define MOTION_THRESHOLD 0.4f /* vehicle motion threshold in G */
-// engine jumpstart voltage for waking up (when MEMS unavailable) 
-// 2026-09-21: lowered from 14V - standard automotive thresholds (not yet
-// measured against this specific vehicle's real logs, SD card retrieval
-// endpoints (/api/log, /api/data) returned empty - verify against a real
-// drive's logs once available): engine running (alternator charging)
-// typically 13.8-14.7V, resting battery 12.0-12.8V. 14V sat right at the
-// edge of alternator output and could miss a cold start / low-idle-RPM
-// charging voltage. 13.2V is comfortably above resting voltage (even a
-// weak/discharged battery ~11.8V) and comfortably below alternator output.
-#define JUMPSTART_VOLTAGE 13.2 /* V */
-// 2026-09-22: standby-entry threshold (replaces the old OBD/GPS-speed-based
-// "motion" signal - a car idling at a light isn't "parked", voltage is the
-// correct proxy, not speed). Placeholder default (typical resting 12V
-// lead-acid battery, comfortably below JUMPSTART_VOLTAGE to avoid flapping
-// at the wake boundary) - NOT yet calibrated against this vehicle's real
-// KEY_BATTERY data in Traccar (none survived tonight's DB wipes). Revisit
-// once a real drive has logged engine-on vs engine-off voltage.
+// The one engine threshold (2026-09-25, replaces 12.8 V standby + 13.2 V
+// wake): at or above = engine running, below = engine off; under 7 V = not in
+// a car (USB/powerbank), never standby. Measured on the Passat 2026-09-25
+// (ESP32 ADC): engine off 11.7 V, cranking dip 10.35 V, running 15.1 V
+// (12.8-15.3), after switch-off below 12.8 V within ~3 s and 12.5 V at 15 s.
+// Standby wake needs two readings >= this 5 s apart (no flapping).
 #define ENGINE_OFF_VOLTAGE 12.8 /* V */
 // reset device after waking up
 #define RESET_AFTER_WAKEUP 1
