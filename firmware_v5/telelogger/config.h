@@ -167,9 +167,13 @@
 // position + battery voltage packet, disconnect. Every connect powers the
 // modem up for ~30-60 s, so this is deliberately rare (was an empty EV=PING
 // every 900 s). A thief driving the car wakes the device anyway (voltage).
+#ifndef STANDBY_REPORT_INTERVAL  /* -D override for bench tests only */
 #define STANDBY_REPORT_INTERVAL 10800 /* seconds (3 h) */
-// Max wait for a fresh GPS fix before sending the report without position
-#define STANDBY_REPORT_GPS_WAIT 90 /* seconds */
+#endif
+// Max wait for a fresh GPS fix before sending the report without position.
+// The GPS starts cold-ish each time (co-processor reset): the first fix
+// after a standby wake took 107 s on 2026-09-25.
+#define STANDBY_REPORT_GPS_WAIT 150 /* seconds */
 #define SIGNAL_CHECK_INTERVAL 10 /* seconds */
 
 // Minimum time between geofence-WiFi known-locations syncs (syncKnownLocations()

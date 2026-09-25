@@ -2976,9 +2976,12 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
 // Standby position report (see STANDBY_REPORT_INTERVAL): one regular data
 // packet (timestamp, GPS date/time/lat/lng/speed/sats, battery) so Traccar
 // stores it as a normal position. Runs in the telemetry task while the main
-// task sits in standby()'s voltage loop; the GPS is read-only here (parsed by
-// the GNSS driver in the background, GNSS_ALWAYS_ON) and the voltage comes
-// from standbyVoltage, sampled by standby() - never touch the OBD link here.
+// task sits in standby()'s voltage loop (ADC only - it never touches the link
+// then); the voltage comes from standbyVoltage, sampled by standby().
+// This device's GNSS sits behind the OBD co-processor (GNSS:OK(I)), which is
+// in ATLP during standby and answers nothing (not even ATI) - so it is woken
+// by a hardware reset of the link, the GPS switched on, and both put back to
+// sleep after the fix (2026-09-25).
 volatile float standbyVoltage = 0;
 
 // Built BEFORE connecting, so the modem isn't powered while waiting for GPS.
@@ -2988,7 +2991,13 @@ static void buildStandbyReport(CStorageRAM& rb)
   rb.timestamp(millis());
   bool hasFix = false;
 #if GNSS == GNSS_STANDALONE
+  bool gpsOn = false;
   if (state.check(STATE_GPS_READY)) {
+    sys.resetLink();  // co-processor out of ATLP
+    for (int i = 0; i < 3 && !gpsOn; i++) gpsOn = sys.gpsBegin();  // via the co-processor, as at boot
+    Serial.printf("[STANDBY] GPS %s\n", gpsOn ? "on, waiting for a fix" : "did not start");
+  }
+  if (gpsOn) {
     // A fix counts only if the GPS time advances while we watch - a stale gd
     // from before standby would otherwise report an old position as current.
     uint32_t firstTime = 0;
@@ -3011,7 +3020,23 @@ static void buildStandbyReport(CStorageRAM& rb)
       }
     }
   }
+  if (state.check(STATE_GPS_READY)) {
+    obd.enterLowPowerMode();  // co-processor (and its GPS) back to sleep
+  }
 #endif
+  if (!hasFix) {
+    // no fix: stamp with the clock (see process()), or the server files the
+    // report under the last fix's time
+    time_t now = time(nullptr);
+    if (now > 1735689600 /* 2025-01-01 */) {
+      struct tm u;
+      gmtime_r(&now, &u);
+      uint32_t d = (uint32_t)u.tm_mday * 10000 + (u.tm_mon + 1) * 100 + (u.tm_year % 100);
+      uint32_t t = (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100;
+      rb.log(PID_GPS_DATE, &d, 1);
+      rb.log(PID_GPS_TIME, &t, 1);
+    }
+  }
   if (standbyVoltage > 0) {
     uint32_t v = (uint32_t)(standbyVoltage * 100);
     rb.log(PID_BATTERY_VOLTAGE, &v, 1);
