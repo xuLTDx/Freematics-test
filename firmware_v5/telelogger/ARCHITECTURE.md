@@ -20,8 +20,8 @@ loadConfig()           NVS → every runtime-configurable global
 process()              ONE sample cycle: OBD → GPS → MEMS → ext inputs →
                         fills a CBuffer slot (runs from loop(), main core)
 standby()              car-off power state — SD close, GPS off, WiFi off
-                        (unconditional), deep-sleep OR JUMPSTART_VOLTAGE
-                        polling loop until the car restarts. Voltage via
+                        (unconditional), deep-sleep OR ENGINE_OFF_VOLTAGE
+                        (12.8 V, 2 readings) polling loop until the car restarts. Voltage via
                         readSystemVoltage() (ESP32 ADC on TYPE 14) - NOT
                         obd.getVoltage(): the co-processor is silent after
                         ATLP. Telemetry task sends a position+battery report
@@ -367,6 +367,27 @@ itself is still replayed in full (overlap with what went live). Manual
 `WM_FILE=` sets `GAP_FILE=wm+1` to force the replay. (3) On standby the
 telemetry task sends the remaining buffers before the link drops;
 `standby()` waits ≤15 s (`s_standbyDrained`) before turning WiFi off.
+
+**2026-09-25 (`5c948a6`, `c3b460a`, `4912fae`, `a3d1130`):**
+- **SD log mutex.** All `FileLogger` operations (dispatch/flush/begin/end)
+  hold one recursive mutex. Before, the telemetry task's `logNetEvent()`
+  flush (close+reopen) raced the main task's record writes; one failed
+  write called `end()` and SD logging was off for the rest of the boot
+  (both 2026-09-25 drives lost their log after 2-4 min; reproduced on the
+  bench within 1 s). A write error now reopens + retries and logs
+  `SD_WRITE_ERROR n=…`.
+- **Replay from the first lost sample.** `GAP_TS` (NVS) = millis timestamp
+  of the gap file's first sample that never went out live (smallest per
+  file, from `markLiveGap(why, ts)`); `sendCsvFile(…, fromTs)` skips records
+  before it. SD event `CATCHUP file N sent M records from ts X`.
+- **Clock time on fix-less records.** The ESP32 clock is set from GPS
+  (resync if off by >2 s; survives the soft restart after a standby wake)
+  and stamps records without a new fix (PID 0x10/0x11) - see the decoder
+  side in `ARCHITECTURE_FREEMATICS.md`.
+- **Explicit engine off.** Under `ENGINE_OFF_VOLTAGE` (12.8 V, above the
+  7 V USB guard) with no RPM for 5 s, records carry RPM 0 (= ignition
+  false); the standby report too. Standby wake uses the same 12.8 V (was
+  13.2 V), two readings 5 s apart.
 
 This is why a mid-file interruption is safe (small re-send overlap at
 worst, per the code's own comment) and why file-level (not record-level)
