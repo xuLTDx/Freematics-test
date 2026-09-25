@@ -54,6 +54,12 @@ protected:
     char* m_cache = 0;
 };
 
+// 2026-09-25: every FileLogger operation is serialized by one recursive
+// mutex. The main task writes records while the telemetry task writes events
+// and flush()es (SDLogger::flush() closes and reopens the file) - unguarded,
+// a record write hitting a closed file ended SD logging for the rest of the
+// boot (both drives on 2026-09-25 lost their SD log after 2-4 minutes;
+// reproduced on the bench within 1 s with events every 20 ms).
 class FileLogger : public CStorage {
 public:
     FileLogger() { m_delimiter = ','; }
@@ -61,21 +67,30 @@ public:
     virtual uint32_t size() { return m_size; }
     virtual void end()
     {
+        lock();
         m_file.close();
         m_id = 0;
         m_size = 0;
+        unlock();
     }
     virtual void flush()
     {
+        lock();
         m_file.flush();
+        unlock();
     }
+    uint32_t writeErrors() { return m_writeErrors; }
     // Write a human-readable diagnostic/event line to the log file.
     // The line is formatted as "FE,<text>" (PID 0xFE is reserved for events
     // and is never queried by handlerLogData(), so it is silently skipped
     // during data queries while remaining fully visible in the raw file view).
     void logEvent(const char* text);
 protected:
+    void lock();
+    void unlock();
+    virtual bool reopen() { return false; }  // SDLogger: close + open for append
     int getFileID(File& root);
+    uint32_t m_writeErrors = 0;
     uint32_t m_dataTime = 0;
     uint32_t m_dataCount = 0;
     uint32_t m_size = 0;
@@ -94,6 +109,8 @@ public:
     // (m_id) is never deleted.  Returns true if any files were removed.
     // Named purgeOldFiles() (not purge()) to avoid shadowing CStorage::purge().
     bool purgeOldFiles();
+protected:
+    bool reopen();
 };
 
 class SPIFFSLogger : public FileLogger {

@@ -119,20 +119,47 @@ void CStorageRAM::untailer()
     }
 }
 
+static SemaphoreHandle_t s_logMutex = 0;  // one logger instance per firmware
+
+void FileLogger::lock()
+{
+    if (!s_logMutex) s_logMutex = xSemaphoreCreateRecursiveMutex();
+    if (s_logMutex) xSemaphoreTakeRecursive(s_logMutex, portMAX_DELAY);
+}
+
+void FileLogger::unlock()
+{
+    if (s_logMutex) xSemaphoreGiveRecursive(s_logMutex);
+}
+
 void FileLogger::dispatch(const char* buf, byte len)
 {
-    if (m_id == 0) return;
-
-    if (m_file.write((uint8_t*)buf, len) != len) {
-        // try again
-        if (m_file.write((uint8_t*)buf, len) != len) {
-            Serial.println("Error writing. End file logging.");
-            end();
-            return;
-        }
+    lock();
+    if (m_id == 0) {
+        unlock();
+        return;
     }
-    m_file.write('\n');
-    m_size += (len + 1);
+    if (m_file.write((uint8_t*)buf, len) == len) {
+        m_file.write('\n');
+        m_size += (len + 1);
+    } else {
+        // Reopen and retry instead of giving up for the rest of the boot (the
+        // old behaviour: end() - every later record and event silently lost).
+        m_writeErrors++;
+        Serial.printf("[SD] write error #%u - reopening\n", (unsigned)m_writeErrors);
+        if (reopen() && m_file.write((uint8_t*)buf, len) == len) {
+            m_file.write('\n');
+            m_size += (len + 1);
+            char ev[40];
+            int n = snprintf(ev, sizeof(ev), "FE,SD_WRITE_ERROR n=%u", (unsigned)m_writeErrors);
+            if (m_file.write((uint8_t*)ev, n) == (size_t)n) {
+                m_file.write('\n');
+                m_size += (n + 1);
+            }
+        }
+        // still failing: this line is lost, the next write tries again
+    }
+    unlock();
 }
 
 void FileLogger::logEvent(const char* text)
@@ -189,6 +216,10 @@ static void sdUnstick()
 
 bool SDLogger::init()
 {
+    // creates the mutex here, in the main task, before STATE_STORAGE_READY
+    // lets any other task write
+    lock();
+    unlock();
     SPI.begin();
     bool ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ);
     uint32_t gap = 200;
@@ -216,6 +247,7 @@ bool SDLogger::init()
 
 uint32_t SDLogger::begin()
 {
+    lock();
     File root = SD.open("/DATA");
     m_id = getFileID(root);
     if (m_id == 0) {
@@ -232,18 +264,30 @@ uint32_t SDLogger::begin()
         m_id = 0;
     }
     m_dataCount = 0;
+    unlock();
     return m_id;
 }
 
-void SDLogger::flush()
+// FAT only records the file size on close, hence close + reopen
+bool SDLogger::reopen()
 {
+    if (m_id == 0) return false;
     char path[24];
     sprintf(path, "/DATA/%u.CSV", m_id);
     m_file.close();
     m_file = SD.open(path, FILE_APPEND);
     if (!m_file) {
         Serial.println("File error");
+        return false;
     }
+    return true;
+}
+
+void SDLogger::flush()
+{
+    lock();
+    reopen();
+    unlock();
 }
 
 bool SDLogger::purgeOldFiles()
