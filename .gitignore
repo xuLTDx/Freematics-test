@@ -39,3 +39,6 @@ server/ota-server/*.log
 # device's registry.json token - a token is a bearer credential, never commit.
 # See publish_ota_config.example.json for the expected shape.
 firmware_v5/telelogger/publish_ota_config.json
+# renamed copy used to build without auto-publishing - same secret token
+firmware_v5/telelogger/publish_ota_config.json.*
+!firmware_v5/telelogger/publish_ota_config.example.json
