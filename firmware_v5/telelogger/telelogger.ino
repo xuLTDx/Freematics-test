@@ -1788,6 +1788,26 @@ bool processGPS(CBuffer* buffer)
 
   float kph = gd->speed * 1.852f;
 
+  // Keep the ESP32 clock on GPS time: it survives the soft restart after a
+  // standby wake, so records before the next fix still carry a real time
+  // (see the !success branch after processGPS() in process()). No TZ is ever
+  // set, so mktime() is UTC here.
+  if (gd->date) {
+    struct tm g = {};
+    g.tm_mday = gd->date / 10000;
+    g.tm_mon = (gd->date / 100) % 100 - 1;
+    g.tm_year = gd->date % 100 + 100;
+    g.tm_hour = gd->time / 1000000;
+    g.tm_min = (gd->time / 10000) % 100;
+    g.tm_sec = (gd->time / 100) % 100;
+    time_t gpsNow = mktime(&g);
+    time_t now = time(nullptr);
+    if (gpsNow > 1735689600 /* 2025-01-01 */ && (now > gpsNow + 2 || now < gpsNow - 2)) {
+      struct timeval tv = { gpsNow, 0 };
+      settimeofday(&tv, nullptr);
+    }
+  }
+
   if (buffer) {
     buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &gd->time, sizeof(uint32_t));
     // Date (2026-09-22): PID_GPS_DATE was never sent, only PID_GPS_TIME. The
@@ -2382,6 +2402,21 @@ void process()
 #endif
 
   bool success = processGPS(buffer);
+  // No new GPS fix in this record: stamp it with the ESP32 clock instead, if
+  // the clock is set (GPS or NTP). Traccar gives a timeless record the time
+  // of the last fix - after the 2026-09-25 standby wake, 80 s of the next
+  // drive's data landed at the previous parking time and merged both drives.
+  if (!success && buffer) {
+    time_t now = time(nullptr);
+    if (now > 1735689600 /* 2025-01-01 */) {
+      struct tm u;
+      gmtime_r(&now, &u);
+      uint32_t d = (uint32_t)u.tm_mday * 10000 + (u.tm_mon + 1) * 100 + (u.tm_year % 100);
+      uint32_t t = (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100;
+      buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &t, sizeof(t));
+      buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &d, sizeof(d));
+    }
+  }
   // Never go to standby while actually moving. Voltage alone isn't safe:
   // ENGINE_OFF_VOLTAGE is uncalibrated, and VW's smart charging can hold the
   // bus under it for long stretches of a drive. Measured on ~20k parked
