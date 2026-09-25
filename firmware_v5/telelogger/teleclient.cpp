@@ -166,13 +166,18 @@ void CBufferManager::init()
   assert(total > 0);
 }
 
-int CBufferManager::purge()
+int CBufferManager::purge(uint32_t* oldestTs)
 {
   int filled = 0;
+  uint32_t oldest = 0xFFFFFFFF;
   for (int n = 0; n < total; n++) {
-    if (slots[n]->state == BUFFER_STATE_FILLED) filled++;
+    if (slots[n]->state == BUFFER_STATE_FILLED) {
+      filled++;
+      if (slots[n]->timestamp < oldest) oldest = slots[n]->timestamp;
+    }
     slots[n]->purge();
   }
+  if (oldestTs) *oldestTs = oldest;
   return filled;
 }
 
@@ -196,7 +201,10 @@ CBuffer* CBufferManager::getFree()
   }
   // dispose oldest data when buffer is full
   while (slots[m]->state == BUFFER_STATE_LOCKED) delay(1);
-  if (slots[m]->state == BUFFER_STATE_FILLED) evicted++;
+  if (slots[m]->state == BUFFER_STATE_FILLED) {
+    evictedTs = slots[m]->timestamp;
+    evicted++;
+  }
   slots[m]->purge();
   return slots[m];
 }

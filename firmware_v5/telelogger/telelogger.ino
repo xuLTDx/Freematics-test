@@ -677,6 +677,11 @@ bool s_catchupPending = true;
 // distance). s_curFileGap: the current file got a gap this boot.
 uint32_t gapFileId = 0;
 volatile bool s_curFileGap = false;
+// gapTs (NVS key GAP_TS): millis() timestamp of the first sample of gapFileId
+// that never went out live - catch-up replays that file from here on (0 =
+// whole file). s_curGapTs: the same for the current file, this boot.
+uint32_t gapTs = 0;
+uint32_t s_curGapTs = 0xFFFFFFFF;
 // Set by the telemetry task once it has sent/purged the remaining buffers
 // on standby entry; standby() waits for it before turning WiFi off.
 volatile bool s_standbyDrained = false;
@@ -1041,20 +1046,32 @@ void logNetEvent(const char* msg)
 }
 
 // A sample that is on SD but did not (and now never will) go out live: make
-// sure the next catch-up replays this file. One NVS write per file at most.
-void markLiveGap(const char* why)
+// sure the next catch-up replays this file - from `ts` on (the sample's
+// millis() timestamp, as in the SD record's PID 0), since everything before
+// the first lost sample did go out live. The smallest ts of a file is kept.
+void markLiveGap(const char* why, uint32_t ts)
 {
   if (fileid <= 0) return;
   if (!s_curFileGap) {
     s_curFileGap = true;
     char msg[48];
-    snprintf(msg, sizeof(msg), "LIVE_GAP %s", why);
+    snprintf(msg, sizeof(msg), "LIVE_GAP %s ts=%u", why, (unsigned)ts);
     Serial.println(msg);
     logNetEvent(msg);
   }
+  bool persist = false;
+  if (ts < s_curGapTs) s_curGapTs = ts;
   if (gapFileId == 0) {
     gapFileId = fileid;
+    gapTs = s_curGapTs;
+    persist = true;
+  } else if (gapFileId == (uint32_t)fileid && s_curGapTs < gapTs) {
+    gapTs = s_curGapTs;
+    persist = true;
+  }
+  if (persist) {
     nvs_set_u32(nvs, "GAP_FILE", gapFileId);
+    nvs_set_u32(nvs, "GAP_TS", gapTs);
     nvs_commit(nvs);
   }
 }
@@ -1972,7 +1989,8 @@ void printTime()
 void initialize()
 {
   // dump buffer data
-  if (bufman.purge()) markLiveGap("REINIT");
+  uint32_t purgedTs;
+  if (bufman.purge(&purgedTs)) markLiveGap("REINIT", purgedTs);
 
   // Reset LED/beep/conn_type sentinels so the current state is re-sent in the
   // first buffer of the new telemetry session.  initialize() is called at the
@@ -2058,6 +2076,7 @@ void initialize()
       // including the previous file is already handled" and start real
       // gap-tracking fresh from this boot's own file onward.
       if (nvs_get_u32(nvs, "GAP_FILE", &gapFileId) != ESP_OK) gapFileId = 0;
+      if (nvs_get_u32(nvs, "GAP_TS", &gapTs) != ESP_OK) gapTs = 0;
       esp_err_t wmErr = nvs_get_u32(nvs, "WM_FILE", &wmDoneFileId);
       if (wmErr == ESP_ERR_NVS_NOT_FOUND) {
         wmDoneFileId = (fileid > 1) ? (uint32_t)(fileid - 1) : 0;
@@ -2309,7 +2328,7 @@ void process()
   CBuffer* buffer = bufman.getFree();
   if (bufman.evicted != lastEvicted) {
     lastEvicted = bufman.evicted;
-    markLiveGap("BUF_FULL");  // oldest unsent sample overwritten
+    markLiveGap("BUF_FULL", bufman.evictedTs);  // oldest unsent sample overwritten
   }
   buffer->state = BUFFER_STATE_FILLING;
 
@@ -2812,8 +2831,13 @@ bool initCell(bool quick = false)
   watermark past a file that was only partially sent - it will be retried in
   full, not resumed mid-file, next time).
 *******************************************************************************/
-bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId)
+// fromTs: skip records with a timestamp (PID 0, millis since that boot)
+// below it - they went out live before the file's first gap.
+static uint32_t s_replaySent = 0;  // records transmitted by the last sendCsvFile()
+
+bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId, uint32_t fromTs)
 {
+  s_replaySent = 0;
   char path[24];
   sprintf(path, "/DATA/%u.CSV", (unsigned int)fileId);
   File f = SD.open(path, FILE_READ);
@@ -2847,8 +2871,11 @@ bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId)
             if (recordOpen) {
               replayStore.tailer();
               ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
+              if (ok) s_replaySent++;
             }
-            if (ok) {
+            recordOpen = false;
+            // records before fromTs went out live - don't send them twice
+            if (ok && strtoul(valueText, 0, 10) >= fromTs) {
               replayStore.header(devid);
               recordOpen = true;
             }
@@ -2869,6 +2896,7 @@ bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId)
   if (ok && recordOpen) {
     replayStore.tailer();
     ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
+    if (ok) s_replaySent++;
   }
   f.close();
   return ok;
@@ -2921,7 +2949,7 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
 
   for (uint32_t id = from; id <= upTo; id++) {
     if (s_ota_active) return false;  // yield to OTA exactly like the live send loop does
-    if (!sendCsvFile(replayStore, id)) {
+    if (!sendCsvFile(replayStore, id, id == gapFileId ? gapTs : 0)) {
       Serial.print("[CATCHUP] file ");
       Serial.print(id);
       Serial.println(" failed, will retry later");
@@ -2930,13 +2958,17 @@ bool catchUpMissedFiles(CStorageRAM& replayStore)
     wmDoneFileId = id;
     nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
     nvs_commit(nvs);
-    Serial.print("[CATCHUP] file ");
-    Serial.print(id);
-    Serial.println(" done");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "CATCHUP file %u sent %u records from ts %u",
+        (unsigned)id, (unsigned)s_replaySent, (unsigned)(id == gapFileId ? gapTs : 0));
+    Serial.println(msg);
+    logNetEvent(msg);
   }
   // Older gaps are replayed; keep only a gap in the still-active file.
   gapFileId = s_curFileGap ? (uint32_t)fileid : 0;
+  gapTs = s_curFileGap ? s_curGapTs : 0;
   nvs_set_u32(nvs, "GAP_FILE", gapFileId);
+  nvs_set_u32(nvs, "GAP_TS", gapTs);
   nvs_commit(nvs);
   return true;
 }
@@ -3060,17 +3092,19 @@ void telemetry(void* inst)
 #if SERVER_PROTOCOL == PROTOCOL_UDP
           store.header(devid);
 #endif
-          store.timestamp(b->timestamp);
+          const uint32_t ts = b->timestamp;
+          store.timestamp(ts);
           b->serialize(store);
           bufman.free(b);
           store.tailer();
           if (!teleClient.transmit(store.buffer(), store.length())) {
-            markLiveGap("TX_FAIL");
+            markLiveGap("TX_FAIL", ts);
             break;
           }
         }
       }
-      if (bufman.purge()) markLiveGap("STANDBY_PURGE");
+      uint32_t purgedTs;
+      if (bufman.purge(&purgedTs)) markLiveGap("STANDBY_PURGE", purgedTs);
       s_standbyDrained = true;  // standby() may turn WiFi off now
       if (state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) {
         teleClient.shutdown();
@@ -3480,7 +3514,8 @@ void telemetry(void* inst)
 #if SERVER_PROTOCOL == PROTOCOL_UDP
       store.header(devid);
 #endif
-      store.timestamp(buffer->timestamp);
+      const uint32_t sampleTs = buffer->timestamp;
+      store.timestamp(sampleTs);
       buffer->serialize(store);
       bufman.free(buffer);
       // Inject IST-Status PIDs (LED/beep/conn-type/SD) directly into this
@@ -3554,7 +3589,7 @@ void telemetry(void* inst)
         connErrors = 0;
         showStats();
       } else {
-        markLiveGap("TX_FAIL");  // buffer already freed - this sample is SD-only now
+        markLiveGap("TX_FAIL", sampleTs);  // buffer already freed - this sample is SD-only now
         timeoutsNet++;
         connErrors++;
         printTimeoutStats();
@@ -3619,7 +3654,8 @@ void telemetry(void* inst)
         // device too hot, cool down by pause transmission
         Serial.print("HIGH DEVICE TEMP: ");
         Serial.println(deviceTemp);
-        if (bufman.purge()) markLiveGap("OVERHEAT");
+        uint32_t purgedTs;
+        if (bufman.purge(&purgedTs)) markLiveGap("OVERHEAT", purgedTs);
       }
 
     }

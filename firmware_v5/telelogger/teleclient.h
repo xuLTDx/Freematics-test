@@ -46,8 +46,9 @@ class CBufferManager
 {
 public:
     void init();
-    // returns how many FILLED (never transmitted) slots were discarded
-    int purge();
+    // returns how many FILLED (never transmitted) slots were discarded;
+    // oldestTs (optional) gets the smallest timestamp among them
+    int purge(uint32_t* oldestTs = nullptr);
     void free(CBuffer* slot);
     CBuffer* getFree();
     CBuffer* getOldest();
@@ -56,6 +57,7 @@ public:
     // FILLED slots overwritten by getFree() because the buffer was full -
     // samples that are on SD but will never go out live (see markLiveGap())
     volatile uint32_t evicted = 0;
+    volatile uint32_t evictedTs = 0;  // timestamp of the last evicted sample
 private:
     CBuffer** slots = 0;
     CBuffer* last = 0;
