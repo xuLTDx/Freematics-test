@@ -672,6 +672,12 @@ int _mwBuildHttpHeader(HttpParam* hp, HttpSocket *phsSocket, time_t contentDateT
 	char *p = buffer;
 	char *end = buffer + 512;
 	const char *status;
+	// 2026-09-25: a non-chunked stream (FLAG_DATA_STREAM: /api/log, /api/data)
+	// has no known length - it used to go out with "Content-Length: 0" and
+	// clients read an empty body. Send no length and close the connection
+	// at the end instead (the body runs until close, valid HTTP/1.1).
+	BOOL streamUntilClose = ISFLAGSET(phsSocket, FLAG_DATA_STREAM) && !(phsSocket->flags & FLAG_CHUNK);
+	if (streamUntilClose) SETFLAG(phsSocket, FLAG_CONN_CLOSE);
 	BOOL keepalive = !ISFLAGSET(phsSocket,FLAG_CONN_CLOSE);
 
 	if (phsSocket->response.statusCode >= 200 && phsSocket->response.statusCode < 200 + sizeof(status200) / sizeof(status200[0])) {
@@ -712,14 +718,16 @@ int _mwBuildHttpHeader(HttpParam* hp, HttpSocket *phsSocket, time_t contentDateT
 	if (phsSocket->request.iCSeq) {
 		p += snprintf(p, end - p, "CSeq: %d\r\n", phsSocket->request.iCSeq);
 	}
-	if (phsSocket->response.contentLength > 0) {
+	if (phsSocket->response.contentLength > 0 || streamUntilClose) {
 		p += snprintf(p, end - p, "Content-Type: %s\r\n", phsSocket->mimeType ? phsSocket->mimeType : contentTypeTable[phsSocket->response.fileType]);
 		if (phsSocket->request.startByte) {
 			p += snprintf(p, end - p, "Content-Range: bytes %u-%u/*\r\n",
 				phsSocket->request.startByte, phsSocket->response.contentLength);
 		}
 	}
-	if (!(phsSocket->flags & FLAG_CHUNK)) {
+	if (streamUntilClose) {
+		// no Content-Length: the body ends when the connection closes
+	} else if (!(phsSocket->flags & FLAG_CHUNK)) {
 		p+=snprintf(p, end - p,"Content-Length: %u\r\n", phsSocket->response.contentLength);
 	} else {
 		p += sprintf(p, "Transfer-Encoding: chunked\r\n");
