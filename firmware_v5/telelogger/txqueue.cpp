@@ -479,6 +479,9 @@ int txqNextPacket(char* out, int cap, const char* devid)
 #ifdef TEST_TXQ
   if (g_txqTestPause) return 0;
 #endif
+#ifdef TEST_TXQ_HOLD_MS
+  if (millis() < TEST_TXQ_HOLD_MS) return 0;  // bench: build a backlog -> full-size packets
+#endif
   lock();
   expire();
   if (flightsUsed() >= TXQ_MAX_INFLIGHT) { unlock(); return 0; }
