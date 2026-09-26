@@ -571,6 +571,27 @@ uint32_t lastMotionTime = 0;
 char lastMotionSrc = '-';
 // last OBD read with RPM > 0 (engine-off RPM 0 is only sent after 5 s without)
 uint32_t lastRpmMs = 0;
+
+// Engine start/stop for the trip logbook (2026-09-26): the box decides and
+// the server follows. START = RPM > 0 or battery >= ENGINE_OFF_VOLTAGE,
+// whichever first (after a standby wake: the wake moment). STOP = the engine
+// ECU stops answering OBD for ENGINE_STOP_SILENT_CYCLES cycles (ignition off);
+// its time = the last RPM > 0. RPM 0 with the ECU answering is start-stop at
+// a light and does NOT end the trip. Without OBD at all: battery under the
+// threshold for ENGINE_STOP_LOW_V_MS. Each event is a record of its own
+// (PID 0x380 1=start 2=stop, 0x381 event unix time) - SD, live and catch-up.
+#define PID_ENGINE_EVENT      0x380
+#define PID_ENGINE_EVENT_TIME 0x381
+#define PID_SD_BACKLOG        0x382  /* 1 = samples on SD not yet in Traccar */
+#define ENGINE_STOP_SILENT_CYCLES 3
+#define ENGINE_STOP_LOW_V_MS 60000
+bool s_engineOn = false;
+time_t s_engineLastAlive = 0;   // clock time of the last RPM > 0 (or voltage-on without OBD)
+int s_obdCycle = -1;            // processOBD(): 1 = ECU answered, 0 = first read failed, -1 not run
+uint8_t s_obdSilent = 0;
+uint32_t s_lowVoltSinceMs = 0;
+RTC_NOINIT_ATTR uint32_t wakeInfoUnix;  // clock time of the standby wake (valid with WAKE_INFO_MAGIC)
+time_t s_wakeUnix = 0;                  // the same, taken over at boot for the ENGINE_START time
 // Survive ESP.restart() after standby wake so the next boot can log how long
 // standby lasted and at what voltage it woke (SD is closed during standby).
 #define WAKE_INFO_MAGIC 0x57414B45UL
@@ -1590,6 +1611,7 @@ void processOBD(CBuffer* buffer)
 {
   static int idx[2] = {0, 0};
   int tier = 1;
+  s_obdCycle = -1;
   for (byte i = 0; i < sizeof(obdData) / sizeof(obdData[0]); i++) {
     if (obdData[i].tier > tier) {
         // reset previous tier index
@@ -1609,13 +1631,18 @@ void processOBD(CBuffer* buffer)
     if (!obd.isValidPID(pid)) continue;
     int value;
     if (obd.readPID(pid, value)) {
+        s_obdCycle = 1;
         obdData[i].ts = millis();
         obdData[i].value = value;
         // Engine running = not parked, whatever the voltage says (see the
         // standby comment in process()).
-        if (pid == PID_RPM && value > 0) { lastMotionTime = millis(); lastMotionSrc = 'R'; lastRpmMs = millis(); }
+        if (pid == PID_RPM && value > 0) {
+          lastMotionTime = millis(); lastMotionSrc = 'R'; lastRpmMs = millis();
+          s_engineLastAlive = time(nullptr);
+        }
         buffer->add((uint16_t)pid | 0x100, ELEMENT_INT32, &value, sizeof(value));
     } else {
+        if (s_obdCycle < 0) s_obdCycle = 0;  // the ECU didn't answer this cycle's first read
         timeoutsOBD++;
         printTimeoutStats();
         break;
@@ -2100,6 +2127,7 @@ void initialize()
       // Set by standby() just before its ESP.restart() on voltage wake.
       if (wakeInfoMagic == WAKE_INFO_MAGIC) {
         wakeInfoMagic = 0;
+        s_wakeUnix = wakeInfoUnix;
         snprintf(diag, sizeof(diag), "WAKEUP V=%.2f after=%lus standby",
             wakeInfoVolt, (unsigned long)wakeInfoStandbySecs);
         logger.logEvent(diag);
@@ -2297,8 +2325,104 @@ bool waitMotion(long timeout)
 // standby, where the co-processor is in ATLP and doesn't answer.
 float readSystemVoltage()
 {
+#ifdef TEST_ENGINE
+  // bench only: 2 min "running" (14.0 V), 2 min "off" (12.0 V)
+  return ((millis() / 120000) % 2) ? 12.0f : 14.0f;
+#endif
   if (sys.devType > 12) return (float)(analogRead(A0) * 45) / 4095;
   return obd.getVoltage();
+}
+
+static void addTimeOf(CBuffer* b, time_t when)
+{
+  struct tm u;
+  gmtime_r(&when, &u);
+  uint32_t d = (uint32_t)u.tm_mday * 10000 + (u.tm_mon + 1) * 100 + (u.tm_year % 100);
+  uint32_t t = (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100;
+  b->add(PID_GPS_TIME, ELEMENT_UINT32, &t, sizeof(t));
+  b->add(PID_GPS_DATE, ELEMENT_UINT32, &d, sizeof(d));
+}
+
+// One record for an engine event, timed at the event itself (a STOP's time is
+// the last RPM > 0, i.e. earlier than now). Written to SD here; the telemetry
+// task sends it like any record (and the standby drain before sleeping).
+static void emitEngineEvent(bool start, time_t when)
+{
+  const bool clockOk = when > 1735689600;  // 2025-01-01
+  CBuffer* b = bufman.getFree();
+  b->state = BUFFER_STATE_FILLING;
+  if (clockOk) addTimeOf(b, when);
+  if (gd && (gd->lat || gd->lng)) {
+    b->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
+    b->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
+  }
+  if (batteryVoltage > 0) {
+    uint16_t v = batteryVoltage * 100;
+    b->add(PID_BATTERY_VOLTAGE, ELEMENT_UINT16, &v, sizeof(v));
+  }
+  uint8_t ev = start ? 1 : 2;
+  b->add(PID_ENGINE_EVENT, ELEMENT_UINT8, &ev, sizeof(ev));
+  uint32_t ts = clockOk ? (uint32_t)when : 0;
+  b->add(PID_ENGINE_EVENT_TIME, ELEMENT_UINT32, &ts, sizeof(ts));
+  if (!start) {
+    int32_t zero = 0;
+    b->add(PID_RPM | 0x100, ELEMENT_INT32, &zero, sizeof(zero));
+  }
+  b->timestamp = millis();
+  b->state = BUFFER_STATE_FILLED;
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) {
+    logger.timestamp(b->timestamp);
+    b->serialize(logger);
+  }
+#endif
+  char msg[64];
+  snprintf(msg, sizeof(msg), "%s V=%.2f t=%lu", start ? "ENGINE_START" : "ENGINE_STOP",
+      batteryVoltage, (unsigned long)ts);
+  Serial.println(msg);
+  logNetEvent(msg);
+}
+
+static void engineStop()
+{
+  if (!s_engineOn) return;
+  s_engineOn = false;
+  emitEngineEvent(false, s_engineLastAlive ? s_engineLastAlive : time(nullptr));
+}
+
+// once per process() cycle, after processOBD() and the voltage reading
+static void engineTick(CBuffer* buffer)
+{
+  const bool volts = batteryVoltage >= ENGINE_OFF_VOLTAGE && batteryVoltage < 20.0f;
+  const time_t now = time(nullptr);
+  const bool obd = state.check(STATE_OBD_READY);
+  if (volts && !obd) s_engineLastAlive = now;  // no OBD: the voltage is the only evidence
+  if (!s_engineOn) {
+    if ((lastRpmMs && millis() - lastRpmMs < 3000) || volts) {
+      s_engineOn = true;
+      time_t when = now;
+      if (s_wakeUnix && now >= s_wakeUnix && now - s_wakeUnix < 300) when = s_wakeUnix;
+      s_wakeUnix = 0;
+      if (!s_engineLastAlive) s_engineLastAlive = when;
+      s_obdSilent = 0;
+      s_lowVoltSinceMs = 0;
+      emitEngineEvent(true, when);
+    }
+  } else if (obd) {
+    if (s_obdCycle == 0) s_obdSilent++;
+    else if (s_obdCycle == 1) s_obdSilent = 0;
+    if (s_obdSilent >= ENGINE_STOP_SILENT_CYCLES) engineStop();
+  } else {
+    if (volts) s_lowVoltSinceMs = 0;
+    else if (!s_lowVoltSinceMs) s_lowVoltSinceMs = millis();
+    if (s_lowVoltSinceMs && millis() - s_lowVoltSinceMs > ENGINE_STOP_LOW_V_MS) engineStop();
+  }
+  static uint32_t lastBacklogMs = 0;
+  if (!lastBacklogMs || millis() - lastBacklogMs > 60000) {
+    lastBacklogMs = millis();
+    uint8_t backlog = gapFileId ? 1 : 0;
+    buffer->add(PID_SD_BACKLOG, ELEMENT_UINT8, &backlog, sizeof(backlog));
+  }
 }
 
 // SD record of why/when standby was entered - the post-drive evidence for the
@@ -2306,6 +2430,7 @@ float readSystemVoltage()
 // closes the SD log).
 static void logStandbyEntry(const char* cause, unsigned int motionless)
 {
+  engineStop();  // every standby path ends a running engine first
   char msg[112];
   snprintf(msg, sizeof(msg), "STANDBY cause=%s motionless=%us V=%.2f src=%c kmh=%.1f",
       cause, motionless, batteryVoltage, lastMotionSrc, gd ? gd->speed * 1.852f : -1.0f);
@@ -2407,11 +2532,13 @@ void process()
   // "engine appears to be running (or we can't yet prove it isn't)".
   // ENGINE_OFF_VOLTAGE: see config.h for the measured values.
   if (batteryVoltage >= ENGINE_OFF_VOLTAGE) { lastMotionTime = millis(); lastMotionSrc = 'V'; }
+  engineTick(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into
   // ignition=false). Without it the RPM PID just stopped coming, Traccar
   // never saw the ignition go off, and with report.trip.useIgnition a drive,
-  // the parking and the next drive became one trip (2026-09-25).
-  if (batteryVoltage >= 7.0f && batteryVoltage < ENGINE_OFF_VOLTAGE && millis() - lastRpmMs > 5000) {
+  // the parking and the next drive became one trip (2026-09-25). Only when
+  // the engine state is off - not during start-stop at a light (2026-09-26).
+  if (!s_engineOn && batteryVoltage >= 7.0f) {
     int32_t zero = 0;
     buffer->add(PID_RPM | 0x100, ELEMENT_INT32, &zero, sizeof(zero));
   }
@@ -3794,6 +3921,8 @@ void standby()
   Serial.println("WAKEUP");
   wakeInfoVolt = wakeVolt;
   wakeInfoStandbySecs = (millis() - standbyStart) / 1000;
+  // the engine started at the first of the two readings, ~5 s ago
+  wakeInfoUnix = (uint32_t)time(nullptr) - 5;
   wakeInfoMagic = WAKE_INFO_MAGIC;
   sys.resetLink();
 #if RESET_AFTER_WAKEUP

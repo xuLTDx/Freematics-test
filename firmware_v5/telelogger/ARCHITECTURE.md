@@ -95,7 +95,7 @@ appears — see `ClientWIFI::begin()`'s own comment in `FreematicsNetwork.cpp`).
 | `/api/ota` | `handlerOTA` | local (LAN-side) firmware upload, separate from pull-OTA (A5) |
 | `/api/list` | `handlerLogList` | list `/DATA/*.CSV` file ids + sizes |
 | `/api/data` | `handlerLogData` | query a log file's samples by PID |
-| `/api/log` | `handlerLogFile` | raw file download/stream |
+| `/api/log` | `handlerLogFile` | raw file download/stream (`/api/log/0` = current file); streams go out without Content-Length + `Connection: close` since 2026-09-25 (was `Content-Length: 0` → empty body); web UI "Stiahnuť CSV" |
 | `/api/events` | `handlerLogEvents` | just the `FE,` diagnostic lines from a log file |
 | `/api/delete` | `handlerLogDelete` | `DELETE /api/delete/<id>` — remove one `/DATA/<id>.CSV` (refuses the currently-active file) |
 
@@ -388,6 +388,17 @@ telemetry task sends the remaining buffers before the link drops;
   7 V USB guard) with no RPM for 5 s, records carry RPM 0 (= ignition
   false); the standby report too. Standby wake uses the same 12.8 V (was
   13.2 V), two readings 5 s apart.
+
+**2026-09-26 engine events (box decides, server follows):** `engineTick()`
+in `process()` - START = RPM > 0 or battery >= 12.8 V (after a standby wake:
+the wake moment, `wakeInfoUnix` in RTC memory); STOP = the engine ECU does not
+answer OBD for 3 cycles (ignition off; RPM 0 with the ECU answering =
+start-stop, not a stop), timed at the last RPM > 0; without OBD: battery under
+12.8 V for 60 s; `logStandbyEntry()` ends a running engine first. Each event
+is its own record (`emitEngineEvent()`: PID 0x380 1/2, 0x381 unix time, last
+position, battery; SD + live + catch-up). PID 0x382 = SD backlog flag every
+60 s. RPM 0 (ignition false) only while the engine state is off. Bench test:
+`-DTEST_ENGINE` fakes 14.0/12.0 V in 2 min halves.
 
 This is why a mid-file interruption is safe (small re-send overlap at
 worst, per the code's own comment) and why file-level (not record-level)
