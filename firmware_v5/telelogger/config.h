@@ -40,7 +40,9 @@
 * Circular Buffer Configuration
 **************************************/
 #if BOARD_HAS_PSRAM
-#define BUFFER_SLOTS 1024 /* max number of buffer slots */
+// 2026-09-26: a slot only builds one record, which then goes to SD and the
+// delivery queue (txqueue) and is freed at once - the queue holds the backlog
+#define BUFFER_SLOTS 8 /* max number of buffer slots */
 #define BUFFER_LENGTH 384 /* bytes per slot */
 #define SERIALIZE_BUFFER_SIZE 4096 /* bytes */
 #else
@@ -237,7 +239,10 @@
 #define PIN_SENSOR1 34
 #define PIN_SENSOR2 26
 
-#define COOLING_DOWN_TEMP 75 /* celsius degrees */
+// ESP32 die temperature (not the air in the box): reads ~68 °C on a desk,
+// so 75 was hit without any real heat problem (2026-09-26). Transmitting
+// only pauses above this; no data is dropped.
+#define COOLING_DOWN_TEMP 90 /* celsius degrees */
 
 // enable(1)/disable(0) http server
 // Defaults to 1 (enabled) so that OTA firmware updates via WiFi work out of

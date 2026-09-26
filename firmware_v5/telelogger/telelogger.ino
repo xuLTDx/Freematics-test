@@ -31,6 +31,7 @@ extern UpdateClass Update;
 #include "config.h"
 #include "telestore.h"
 #include "teleclient.h"
+#include "txqueue.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -670,39 +671,22 @@ uint16_t nvsStandbyTimeS = 0;
 // The telemetry task checks this flag and yields the WiFi to the OTA upload.
 volatile bool s_ota_active = false;
 
-// --- Missed-data catch-up (store-and-forward across outages) ------------
-// wmDoneFileId (NVS key WM_FILE, u32): highest /DATA/<id>.CSV file id whose
-// ENTIRE contents were confirmed successfully sent to the server. Written
-// only after a file is fully replayed - never mid-file - so an interruption
-// just means that one file is retried in full next time (small harmless
-// re-send overlap at worst, never a gap). This is deliberately per-FILE, not
-// per-record: PID 0 in each CSV line is a boot-relative millis() counter,
-// not wall-clock time, and cannot be compared across different boot
-// sessions/files, so file-level granularity avoids needing to correlate
-// millis() to real time at all.
-// Left at 0 (meaning "nothing confirmed yet") when never set - see
-// catchUpMissedFiles() for why that is deliberately treated as "everything
-// before the current session's own file is caught up" rather than
-// replaying the device's entire lifetime SD history on first boot.
-uint32_t wmDoneFileId = 0;
-// One-shot per boot: runs catchUpMissedFiles() the first time the telemetry
-// send loop is about to send a live packet, then never again until reboot.
-// Not static: dataserver.cpp's WM_FILE= control-command handler needs to
-// re-arm this after a manual watermark override.
-bool s_catchupPending = true;
-// gapFileId (NVS key GAP_FILE, u32): oldest /DATA file that has samples which
-// never went out live (transmit failure, RAM buffer overflow, buffers dropped
-// at standby) - 0 = none. catchUpMissedFiles() replays only from this file
-// on; files that went out live in full are just marked done, never
-// re-sent (a full re-send duplicated every drive in Traccar and inflated its
-// distance). s_curFileGap: the current file got a gap this boot.
-uint32_t gapFileId = 0;
-volatile bool s_curFileGap = false;
-// gapTs (NVS key GAP_TS): millis() timestamp of the first sample of gapFileId
-// that never went out live - catch-up replays that file from here on (0 =
-// whole file). s_curGapTs: the same for the current file, this boot.
-uint32_t gapTs = 0;
-uint32_t s_curGapTs = 0xFFFFFFFF;
+// --- Delivery (2026-09-26, replaces the SD catch-up / gap tracking) -------
+// Every record goes to SD and into the delivery queue (txqueue.cpp) at the
+// same time; the telemetry task sends the queue and a record leaves it only
+// when the server has ACKed it (after storing it). A record's identity is
+// (boot number, PID 0); PID 0 is made strictly increasing (nextRecordTs()) so
+// two records of one boot never share it.
+uint32_t s_bootNo = 0;         // NVS BOOT_NO, +1 at every boot
+static uint32_t s_recTs = 0;   // last record timestamp handed out
+static float s_lastFixLat = 0, s_lastFixLng = 0;  // last GPS fix, for records without one
+uint32_t nextRecordTs()
+{
+  uint32_t t = millis();
+  if (t <= s_recTs) t = s_recTs + 1;
+  s_recTs = t;
+  return t;
+}
 // Set by the telemetry task once it has sent/purged the remaining buffers
 // on standby entry; standby() waits for it before turning WiFi off.
 volatile bool s_standbyDrained = false;
@@ -1066,35 +1050,18 @@ void logNetEvent(const char* msg)
 #endif
 }
 
-// A sample that is on SD but did not (and now never will) go out live: make
-// sure the next catch-up replays this file - from `ts` on (the sample's
-// millis() timestamp, as in the SD record's PID 0), since everything before
-// the first lost sample did go out live. The smallest ts of a file is kept.
-void markLiveGap(const char* why, uint32_t ts)
+// One finished record (the CBuffer, already written to SD) into the delivery
+// queue, in the wire format "0:<ts>,<pid>:<value>,...".
+static void queueRecord(CBuffer* b)
 {
-  if (fileid <= 0) return;
-  if (!s_curFileGap) {
-    s_curFileGap = true;
-    char msg[48];
-    snprintf(msg, sizeof(msg), "LIVE_GAP %s ts=%u", why, (unsigned)ts);
-    Serial.println(msg);
-    logNetEvent(msg);
-  }
-  bool persist = false;
-  if (ts < s_curGapTs) s_curGapTs = ts;
-  if (gapFileId == 0) {
-    gapFileId = fileid;
-    gapTs = s_curGapTs;
-    persist = true;
-  } else if (gapFileId == (uint32_t)fileid && s_curGapTs < gapTs) {
-    gapTs = s_curGapTs;
-    persist = true;
-  }
-  if (persist) {
-    nvs_set_u32(nvs, "GAP_FILE", gapFileId);
-    nvs_set_u32(nvs, "GAP_TS", gapTs);
-    nvs_commit(nvs);
-  }
+  static char rec[1024];
+  CStorageRAM r;
+  r.init(rec, sizeof(rec));
+  r.timestamp(b->timestamp);
+  b->serialize(r);
+  int len = r.length();
+  if (len && rec[len - 1] == ',') len--;
+  if (!txqPush(b->timestamp, rec, len)) Serial.println("[TXQ] record not queued");
 }
 
 // Live-diagnostic wrapper for dataserver.cpp's /api/control?cmd=STATE? -
@@ -1478,9 +1445,9 @@ int handlerLiveData(UrlHandlerParam* param)
       unsigned lim = stDef[sizeof(stDef) / sizeof(stDef[0]) - 1];
       if (nvsStandbyTimeS == 0xFFFF) lim = 0;
       else if (nvsStandbyTimeS >= 5) lim = nvsStandbyTimeS;
-      n += snprintf(buf + n, bufsize - n, ",\"sys\":{\"v\":%.2f,\"st\":%u,\"ml\":%u,\"src\":\"%c\",\"lim\":%u,\"f\":%d,\"wm\":%u,\"cu\":%u}",
+      n += snprintf(buf + n, bufsize - n, ",\"sys\":{\"v\":%.2f,\"st\":%u,\"ml\":%u,\"src\":\"%c\",\"lim\":%u,\"f\":%d,\"boot\":%u,\"txq\":%u,\"txu\":%u}",
           batteryVoltage, (unsigned)getStateBits(), (unsigned)((millis() - lastMotionTime) / 1000), lastMotionSrc,
-          lim, fileid, (unsigned)wmDoneFileId, (unsigned)s_catchupPending);
+          lim, fileid, (unsigned)s_bootNo, (unsigned)txqPending(), (unsigned)txqUsedPercent());
     }
     buf[n++] = '}';
     param->contentLength = n;
@@ -1866,6 +1833,8 @@ bool processGPS(CBuffer* buffer)
     // from Sep 21 replayed the next morning that decoded into that afternoon's
     // live drive window and corrupted the trip/stop reports.
     buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &gd->date, sizeof(uint32_t));
+    s_lastFixLat = gd->lat;
+    s_lastFixLng = gd->lng;
     buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
     buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
     buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
@@ -2015,9 +1984,7 @@ void printTime()
 *******************************************************************************/
 void initialize()
 {
-  // dump buffer data
-  uint32_t purgedTs;
-  if (bufman.purge(&purgedTs)) markLiveGap("REINIT", purgedTs);
+  // (records already live in the delivery queue - nothing to dump here)
 
   // Reset LED/beep/conn_type sentinels so the current state is re-sent in the
   // first buffer of the new telemetry session.  initialize() is called at the
@@ -2094,27 +2061,17 @@ void initialize()
   if (state.check(STATE_STORAGE_READY)) {
     fileid = logger.begin();
     if (fileid) {
-      // Load the catch-up watermark (see wmDoneFileId's own comment above).
-      // ESP_ERR_NVS_NOT_FOUND means this is the first boot ever with this
-      // feature - on a device that already has a long SD history (this one
-      // has hundreds of files from months of use), catching up from file 1
-      // would flood the server with its entire lifetime history. So on first
-      // activation only, seed the watermark to "everything up to and
-      // including the previous file is already handled" and start real
-      // gap-tracking fresh from this boot's own file onward.
-      if (nvs_get_u32(nvs, "GAP_FILE", &gapFileId) != ESP_OK) gapFileId = 0;
-      if (nvs_get_u32(nvs, "GAP_TS", &gapTs) != ESP_OK) gapTs = 0;
-      esp_err_t wmErr = nvs_get_u32(nvs, "WM_FILE", &wmDoneFileId);
-      if (wmErr == ESP_ERR_NVS_NOT_FOUND) {
-        wmDoneFileId = (fileid > 1) ? (uint32_t)(fileid - 1) : 0;
-        nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
-        nvs_commit(nvs);
+      // the boot number in every file: the delivery queue's SD replay needs
+      // it to rebuild the records' identity (boot, PID 0)
+      {
+        char b[24];
+        snprintf(b, sizeof(b), "BOOTID=%u", (unsigned)s_bootNo);
+        logger.logEvent(b);
       }
       // Write a diagnostic boot banner so that every CSV log file carries
       // the firmware version, device ID, and the initial subsystem status
       // that would otherwise only appear on the serial console.
       char diag[128];
-      logger.timestamp(millis());
       snprintf(diag, sizeof(diag), "BOOT FW=%s ID=%s", FIRMWARE_VERSION, devid);
       logger.logEvent(diag);
       // See PID_RESET_REASON comment above - answers "why did it reboot"
@@ -2145,6 +2102,8 @@ void initialize()
       logger.flush();
     }
   }
+  // records of this session have an SD copy only if the file opened
+  txqSetFile(state.check(STATE_STORAGE_READY) && fileid > 0 ? (uint32_t)fileid : 0);
 #endif
 
 #if STORAGE == STORAGE_SD
@@ -2352,9 +2311,12 @@ static void emitEngineEvent(bool start, time_t when)
   CBuffer* b = bufman.getFree();
   b->state = BUFFER_STATE_FILLING;
   if (clockOk) addTimeOf(b, when);
-  if (gd && (gd->lat || gd->lng)) {
-    b->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
-    b->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
+  if (s_lastFixLat || s_lastFixLng) {
+    // the box's own last fix (not whatever the server received last)
+    b->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &s_lastFixLat, sizeof(float));
+    b->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &s_lastFixLng, sizeof(float));
+    uint8_t one = 1;
+    b->add(PID_TX_NOFIX, ELEMENT_UINT8, &one, sizeof(one));
   }
   if (batteryVoltage > 0) {
     uint16_t v = batteryVoltage * 100;
@@ -2368,7 +2330,7 @@ static void emitEngineEvent(bool start, time_t when)
     int32_t zero = 0;
     b->add(PID_RPM | 0x100, ELEMENT_INT32, &zero, sizeof(zero));
   }
-  b->timestamp = millis();
+  b->timestamp = nextRecordTs();
   b->state = BUFFER_STATE_FILLED;
 #if STORAGE != STORAGE_NONE
   if (state.check(STATE_STORAGE_READY)) {
@@ -2376,6 +2338,8 @@ static void emitEngineEvent(bool start, time_t when)
     b->serialize(logger);
   }
 #endif
+  queueRecord(b);
+  bufman.free(b);
   char msg[64];
   snprintf(msg, sizeof(msg), "%s V=%.2f t=%lu", start ? "ENGINE_START" : "ENGINE_STOP",
       batteryVoltage, (unsigned long)ts);
@@ -2420,8 +2384,8 @@ static void engineTick(CBuffer* buffer)
   static uint32_t lastBacklogMs = 0;
   if (!lastBacklogMs || millis() - lastBacklogMs > 60000) {
     lastBacklogMs = millis();
-    uint8_t backlog = gapFileId ? 1 : 0;
-    buffer->add(PID_SD_BACKLOG, ELEMENT_UINT8, &backlog, sizeof(backlog));
+    uint32_t backlog = txqPending();  // records not yet confirmed by the server
+    buffer->add(PID_SD_BACKLOG, ELEMENT_UINT32, &backlog, sizeof(backlog));
   }
 }
 
@@ -2449,12 +2413,7 @@ void process()
 #if ENABLE_BLE
   bleScanTick();
 #endif
-  static uint32_t lastEvicted = 0;
-  CBuffer* buffer = bufman.getFree();
-  if (bufman.evicted != lastEvicted) {
-    lastEvicted = bufman.evicted;
-    markLiveGap("BUF_FULL", bufman.evictedTs);  // oldest unsent sample overwritten
-  }
+  CBuffer* buffer = bufman.getFree();  // only builds the record; it is queued and freed below
   buffer->state = BUFFER_STATE_FILLING;
 
 #if ENABLE_OBD
@@ -2469,6 +2428,7 @@ void process()
 #endif
         logStandbyEntry("OBD_ERRORS", (millis() - lastMotionTime) / 1000);
         state.clear(STATE_OBD_READY | STATE_WORKING);
+        bufman.free(buffer);  // the unfinished record is dropped, the slot reused
         return;
       }
     }
@@ -2566,6 +2526,14 @@ void process()
       uint32_t t = (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100;
       buffer->add(PID_GPS_TIME, ELEMENT_UINT32, &t, sizeof(t));
       buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &d, sizeof(d));
+    }
+    // and the box's own last fix, flagged (the server must not borrow the
+    // position it happened to receive last - records may arrive out of order)
+    if (s_lastFixLat || s_lastFixLng) {
+      buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &s_lastFixLat, sizeof(float));
+      buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &s_lastFixLng, sizeof(float));
+      uint8_t one = 1;
+      buffer->add(PID_TX_NOFIX, ELEMENT_UINT8, &one, sizeof(one));
     }
   }
   // Never go to standby while actually moving. Voltage alone isn't safe:
@@ -2706,14 +2674,8 @@ void process()
   }
 #endif
 
-  buffer->timestamp = millis();
+  buffer->timestamp = nextRecordTs();  // PID 0 = the record's identity within this boot
   buffer->state = BUFFER_STATE_FILLED;
-
-  // display file buffer stats
-  if (startTime - lastStatsTime >= 3000) {
-    bufman.printStats();
-    lastStatsTime = startTime;
-  }
 
 #if STORAGE != STORAGE_NONE
   if (state.check(STATE_STORAGE_READY)) {
@@ -2757,6 +2719,15 @@ void process()
     }
   }
 #endif
+  // the same record into the delivery queue (SD copy above, same content)
+  queueRecord(buffer);
+  bufman.free(buffer);
+  if (startTime - lastStatsTime >= 10000) {
+    char st[112];
+    txqStatus(st, sizeof(st));
+    Serial.println(st);
+    lastStatsTime = startTime;
+  }
 
   const int dataIntervals[] = DATA_INTERVAL_TABLE;
 #if ENABLE_OBD || ENABLE_MEMS
@@ -2941,164 +2912,6 @@ bool initCell(bool quick = false)
   return state.check(STATE_CELL_CONNECTED);
 }
 
-/*******************************************************************************
-  Missed-data catch-up: replay one /DATA/<fileId>.CSV file's contents as
-  live-format packets over the current connection.
-  A CSV line ("<HEXPID>,<valuetext>") is byte-identical to the value text a
-  live wire packet would carry for the same PID - both come from the same
-  CStorage::log() formatting, just with a different delimiter/separator
-  (file: ',' and '\n'; wire: ':' and ','). So no typed re-decoding is needed:
-  each line is reformatted from "PID,value" to "PID:value" and fed straight
-  into replayStore's own dispatch(), bookended by header()/tailer() per
-  record (a record = the lines between one PID-0/timestamp line and the
-  next). PID 0xFE ("FE,<text>") is FileLogger::logEvent()'s diagnostic-text
-  marker, not a sensor reading - skipped during replay.
-  Returns true only if every record in the file was transmitted successfully
-  (false stops at the first failure, so the caller does not advance the
-  watermark past a file that was only partially sent - it will be retried in
-  full, not resumed mid-file, next time).
-*******************************************************************************/
-// fromTs: skip records with a timestamp (PID 0, millis since that boot)
-// below it - they went out live before the file's first gap.
-static uint32_t s_replaySent = 0;  // records transmitted by the last sendCsvFile()
-
-bool sendCsvFile(CStorageRAM& replayStore, uint32_t fileId, uint32_t fromTs)
-{
-  s_replaySent = 0;
-  char path[24];
-  sprintf(path, "/DATA/%u.CSV", (unsigned int)fileId);
-  File f = SD.open(path, FILE_READ);
-  if (!f) {
-    // Already purged by SDLogger::purgeOldFiles() under SD space pressure -
-    // nothing left to replay; don't let a deleted file block later ones.
-    return true;
-  }
-
-  char line[64];
-  int lineLen = 0;
-  bool recordOpen = false;
-  bool ok = true;
-  int yieldCounter = 0;
-
-  while (ok && f.available()) {
-    char buf[256];
-    int n = f.readBytes(buf, sizeof(buf));
-    for (int i = 0; i < n && ok; i++) {
-      char c = buf[i];
-      if (c == '\n') {
-        line[lineLen] = 0;
-        char* comma = strchr(line, ',');
-        if (comma) {
-          *comma = 0;
-          const char* valueText = comma + 1;
-          uint16_t pid = (uint16_t)strtoul(line, 0, 16);
-          if (pid == 0) {
-            // New record boundary (PID 0 = timestamp, see CStorage::timestamp()).
-            // Close and send the previous record first, if any.
-            if (recordOpen) {
-              replayStore.tailer();
-              ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
-              if (ok) s_replaySent++;
-            }
-            recordOpen = false;
-            // records before fromTs went out live - don't send them twice
-            if (ok && strtoul(valueText, 0, 10) >= fromTs) {
-              replayStore.header(devid);
-              recordOpen = true;
-            }
-          }
-          if (ok && recordOpen && pid != 0xFE) {
-            char entry[80];
-            int elen = snprintf(entry, sizeof(entry), "%X:%s", pid, valueText);
-            replayStore.dispatch(entry, elen);
-          }
-        }
-        lineLen = 0;
-      } else if (lineLen < (int)sizeof(line) - 1) {
-        line[lineLen++] = c;
-      }
-    }
-    if (++yieldCounter >= 4) { yield(); yieldCounter = 0; }
-  }
-  if (ok && recordOpen) {
-    replayStore.tailer();
-    ok = teleClient.transmit(replayStore.buffer(), replayStore.length());
-    if (ok) s_replaySent++;
-  }
-  f.close();
-  return ok;
-}
-
-// Driver: replays every /DATA file between the watermark and the current
-// session's own file (exclusive - the active file is still being live-
-// written and is handled by the normal send loop, not this one). Advances
-// and persists wmDoneFileId to NVS after each fully-successful file so a
-// later interruption resumes at the next unfinished file, not from scratch.
-// Called once per boot (see s_catchupPending) right before the send loop
-// starts sending live packets, so any gap left by an extended outage
-// (Switzerland/ferry-style, no WiFi or cellular for hours+) gets replayed
-// in strict file order before today's live data resumes - this ordering
-// matters because Traccar's DistanceHandler computes totalDistance from
-// consecutive positions in arrival order, so sending newer data before an
-// older backlog would corrupt the odometer calibration chain.
-// Returns true only once every missed file has been fully sent (or there
-// was nothing missed to begin with) - false means the caller must NOT fall
-// through to sending live data this iteration (that would let newer data
-// overtake a still-incomplete backlog), and must retry catch-up again
-// instead, e.g. on the next reconnect.
-bool catchUpMissedFiles(CStorageRAM& replayStore)
-{
-  if (fileid <= 0) return true;
-  uint32_t upTo = (uint32_t)fileid - 1;
-  if (wmDoneFileId >= upTo) return true;  // nothing missed
-
-  // Files older than the first recorded live gap went out live in full -
-  // mark them done without re-sending anything.
-  uint32_t from = wmDoneFileId + 1;
-  if (gapFileId == 0 || gapFileId > upTo) {
-    Serial.printf("[CATCHUP] files %u..%u were sent live in full - nothing to replay\n",
-        (unsigned)from, (unsigned)upTo);
-    from = upTo + 1;
-  } else if (gapFileId > from) {
-    from = gapFileId;
-  }
-  if (from > wmDoneFileId + 1) {
-    wmDoneFileId = from - 1;
-    nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
-    nvs_commit(nvs);
-  }
-  if (from > upTo) return true;
-
-  Serial.print("[CATCHUP] replaying files ");
-  Serial.print(from);
-  Serial.print("..");
-  Serial.println(upTo);
-
-  for (uint32_t id = from; id <= upTo; id++) {
-    if (s_ota_active) return false;  // yield to OTA exactly like the live send loop does
-    if (!sendCsvFile(replayStore, id, id == gapFileId ? gapTs : 0)) {
-      Serial.print("[CATCHUP] file ");
-      Serial.print(id);
-      Serial.println(" failed, will retry later");
-      return false;
-    }
-    wmDoneFileId = id;
-    nvs_set_u32(nvs, "WM_FILE", wmDoneFileId);
-    nvs_commit(nvs);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "CATCHUP file %u sent %u records from ts %u",
-        (unsigned)id, (unsigned)s_replaySent, (unsigned)(id == gapFileId ? gapTs : 0));
-    Serial.println(msg);
-    logNetEvent(msg);
-  }
-  // Older gaps are replayed; keep only a gap in the still-active file.
-  gapFileId = s_curFileGap ? (uint32_t)fileid : 0;
-  gapTs = s_curFileGap ? s_curGapTs : 0;
-  nvs_set_u32(nvs, "GAP_FILE", gapFileId);
-  nvs_set_u32(nvs, "GAP_TS", gapTs);
-  nvs_commit(nvs);
-  return true;
-}
 
 // Standby position report (see STANDBY_REPORT_INTERVAL): one regular data
 // packet (timestamp, GPS date/time/lat/lng/speed/sats, battery) so Traccar
@@ -3114,8 +2927,9 @@ volatile float standbyVoltage = 0;
 // Built BEFORE connecting, so the modem isn't powered while waiting for GPS.
 static void buildStandbyReport(CStorageRAM& rb)
 {
-  rb.header(devid);
-  rb.timestamp(millis());
+  // a regular record: into the delivery queue (SD is closed in standby)
+  const uint32_t recTs = nextRecordTs();
+  rb.timestamp(recTs);
   bool hasFix = false;
 #if GNSS == GNSS_STANDALONE
   bool gpsOn = false;
@@ -3142,6 +2956,8 @@ static void buildStandbyReport(CStorageRAM& rb)
         rb.log(PID_GPS_LONGITUDE, &lng, 1, "%.6f");
         rb.log(PID_GPS_SPEED, &kph, 1, "%.1f");
         if (sat) rb.log(PID_GPS_SAT_COUNT, &sat, 1);
+        s_lastFixLat = lat;
+        s_lastFixLng = lng;
         hasFix = true;
         break;
       }
@@ -3163,6 +2979,13 @@ static void buildStandbyReport(CStorageRAM& rb)
       rb.log(PID_GPS_DATE, &d, 1);
       rb.log(PID_GPS_TIME, &t, 1);
     }
+    if (s_lastFixLat || s_lastFixLng) {  // the box's own last fix, flagged
+      float lat = s_lastFixLat, lng = s_lastFixLng;
+      uint8_t one = 1;
+      rb.log(PID_GPS_LATITUDE, &lat, 1, "%.6f");
+      rb.log(PID_GPS_LONGITUDE, &lng, 1, "%.6f");
+      rb.log(PID_TX_NOFIX, &one, 1);
+    }
   }
   if (standbyVoltage > 0) {
     uint32_t v = (uint32_t)(standbyVoltage * 100);
@@ -3170,10 +2993,13 @@ static void buildStandbyReport(CStorageRAM& rb)
   }
   int32_t rpm0 = 0;  // parked: ignition off for Traccar's trip detection
   rb.log(PID_RPM | 0x100, &rpm0, 1);
-  rb.tailer();
+  int len = rb.length();
+  if (len && rb.buffer()[len - 1] == ',') len--;
+  txqPush(recTs, rb.buffer(), len);
   Serial.print("[STANDBY] Report ");
   Serial.print(hasFix ? "with GPS fix: " : "WITHOUT GPS fix: ");
-  Serial.println(rb.buffer());
+  Serial.write((const uint8_t*)rb.buffer(), len);  // not NUL-terminated
+  Serial.println();
 }
 
 /*******************************************************************************
@@ -3197,15 +3023,22 @@ void telemetry(void* inst)
       state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
     }
   };
-  CStorageRAM store;
-  store.init(
-#if BOARD_HAS_PSRAM
-    (char*)heap_caps_malloc(SERIALIZE_BUFFER_SIZE, MALLOC_CAP_SPIRAM),
-#else
-    (char*)malloc(SERIALIZE_BUFFER_SIZE),
-#endif
-    SERIALIZE_BUFFER_SIZE
-  );
+  static char pkt[TXQ_PACKET_BUF];
+  // Send what the delivery queue holds and collect the server's ACKs, for at
+  // most maxMs - true when everything is confirmed.
+  auto drainQueue = [&](uint32_t maxMs) -> bool {
+    for (uint32_t t0 = millis(); millis() - t0 < maxMs; ) {
+      int n = txqNextPacket(pkt, sizeof(pkt), devid);
+      if (n > 0 && !teleClient.transmit(pkt, n)) {
+        txqSendFailed();
+        return false;
+      }
+      for (int i = 0; i < 4; i++) teleClient.inbound();
+      if (txqPending() == 0) return true;
+      if (n <= 0) delay(100);
+    }
+    return txqPending() == 0;
+  };
   teleClient.reset();
 
   for (;;) {
@@ -3233,30 +3066,14 @@ void telemetry(void* inst)
     }
 
     if (state.check(STATE_STANDBY)) {
-      // Send what's still buffered (typically the last sample or two - the
-      // parking position) before the link goes down, oldest first, or it
-      // would be purged below and the whole drive's file replayed later.
-      // Not while a catch-up backlog is pending: live must not overtake it.
-      if ((state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) && !s_catchupPending) {
-        for (int i = 0; i < 30; i++) {
-          CBuffer* b = bufman.getOldest();
-          if (!b) break;
-#if SERVER_PROTOCOL == PROTOCOL_UDP
-          store.header(devid);
-#endif
-          const uint32_t ts = b->timestamp;
-          store.timestamp(ts);
-          b->serialize(store);
-          bufman.free(b);
-          store.tailer();
-          if (!teleClient.transmit(store.buffer(), store.length())) {
-            markLiveGap("TX_FAIL", ts);
-            break;
-          }
-        }
+      // Send what's still queued (the last records - the parking position)
+      // before the link goes down. Nothing is discarded: what does not get
+      // confirmed now stays in the queue (and on SD) for the next connection.
+      if (state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) {
+        bool all = drainQueue(15000);
+        Serial.printf("[TXQ] standby drain: %s\n", all ? "all confirmed" : "backlog kept");
       }
-      uint32_t purgedTs;
-      if (bufman.purge(&purgedTs)) markLiveGap("STANDBY_PURGE", purgedTs);
+      txqSave(true);
       s_standbyDrained = true;  // standby() may turn WiFi off now
       if (state.check(STATE_CELL_CONNECTED) || state.check(STATE_WIFI_CONNECTED)) {
         teleClient.shutdown();
@@ -3284,10 +3101,10 @@ void telemetry(void* inst)
       } while (state.check(STATE_STANDBY) && millis() - t < 1000UL * STANDBY_REPORT_INTERVAL);
       if (state.check(STATE_STANDBY)) {
         // standby position report: ping (server session) + one position packet
-        char reportCache[192];
+        char reportCache[320];
         CStorageRAM report;
         report.init(reportCache, sizeof(reportCache));
-        buildStandbyReport(report);
+        buildStandbyReport(report);  // -> delivery queue, with whatever else is pending
         bool sent = false;
 #if ENABLE_WIFI
         if (wifiSSID[0] || wifiSSID2[0]) {
@@ -3295,17 +3112,18 @@ void telemetry(void* inst)
         }
         if (teleClient.wifi.setup()) {
           Serial.println("[WIFI] Standby report...");
-          sent = teleClient.ping() && teleClient.transmit(report.buffer(), report.length());
+          sent = teleClient.ping() && drainQueue(20000);
         }
         else
 #endif
         {
           if (initCell()) {
             Serial.println("[CELL] Standby report...");
-            sent = teleClient.ping() && teleClient.transmit(report.buffer(), report.length());
+            sent = teleClient.ping() && drainQueue(20000);
           }
         }
-        Serial.println(sent ? "[STANDBY] Report sent" : "[STANDBY] Report NOT sent");
+        txqSave(true);
+        Serial.println(sent ? "[STANDBY] Report confirmed" : "[STANDBY] Report NOT confirmed (kept in queue)");
         teleClient.shutdown();
         state.clear(STATE_CELL_CONNECTED | STATE_WIFI_CONNECTED);
       }
@@ -3621,166 +3439,54 @@ void telemetry(void* inst)
         }
       }
 
-      // One-shot per boot, right before the first live packet: replay any
-      // /DATA files left over from an outage that spanned a reboot (or
-      // simply never got sent) before resuming normal live transmission.
-      // See catchUpMissedFiles()'s own comment for why this must run here,
-      // strictly before getNewest() below, not interleaved with it. If it
-      // returns false (interrupted, e.g. lost connection mid-replay),
-      // s_catchupPending stays true so the NEXT iteration retries catch-up
-      // again instead of falling through to live data below - newer data
-      // must never be sent while an older backlog is still incomplete.
-      // fileid > 0: not before initialize() has opened this boot's SD file.
-      // The network can come up first (WiFi joins in setup()); catch-up
-      // then saw fileid == 0, returned "nothing missed" and never ran for
-      // the whole boot. No live data exists before that point either.
-      if (s_catchupPending && fileid > 0) {
-        if (catchUpMissedFiles(store)) {
-          s_catchupPending = false;
-          connErrors = 0;
-        } else {
-          // A failed replay is a failed transmit. Count it like one, or a
-          // dead link never reaches the reconnect checks at the bottom of
-          // this loop and catch-up retries on it forever (seen live:
-          // "[CATCHUP] file N failed" every second, never recovering, after
-          // the cellular UDP socket broke). Live data still must not be
-          // sent before the backlog, so reconnect from here, not below.
-          connErrors++;
-          if (connErrors >= MAX_CONN_ERRORS_RECONNECT ||
-              (state.check(STATE_CELL_CONNECTED) && !teleClient.cell.check(1000))) {
-            Serial.println("[CATCHUP] Link looks dead - reconnecting");
-            dropConnection();
-            break;
-          }
-          delay(1000);
-          continue;
-        }
-      }
-
-      // get data from buffer
-      CBuffer* buffer = bufman.getNewest();
-      if (!buffer) {
-        delay(50);
-        continue;
-      }
-#if SERVER_PROTOCOL == PROTOCOL_UDP
-      store.header(devid);
-#endif
-      const uint32_t sampleTs = buffer->timestamp;
-      store.timestamp(sampleTs);
-      buffer->serialize(store);
-      bufman.free(buffer);
-      // Inject IST-Status PIDs (LED/beep/conn-type/SD) directly into this
-      // packet whenever a new connection has just been established.
-      //
-      // Without this injection, there is a race between process() and the
-      // telemetry loop that reliably loses these PIDs on cellular connections:
-      //   1. Sentinel reset Ã¢â€ â€™ process() adds PIDs to Buffer A, updates sentinel.
-      //   2. OTA meta-check over cellular takes several seconds while process()
-      //      fills Buffers B, C, D Ã¢â‚¬Â¦ (sentinel already matches, no PIDs).
-      //   3. getNewest() returns Buffer D (newest), Buffer A is overwritten.
-      //   4. Result: HA never receives LED/beep/SD Ã¢â€ â€™ "Unbekannt" forever.
-      // WiFi is not immune but the OTA check is much faster there, so the race
-      // is rarely observed.  With this injection both transports are reliable.
-      if (s_send_state_pids) {
-        s_send_state_pids = false;
-        {
-          uint8_t v = enableLedWhite ? 1 : 0;
-          store.log(PID_LED_WHITE_STATE, &v, 1);
-          s_lastLedWhite = (int8_t)v;
-        }
-        {
-          uint8_t v = enableBeep ? 1 : 0;
-          store.log(PID_BEEP_STATE, &v, 1);
-          s_lastBeep = (int8_t)v;
-        }
-        if (state.check(STATE_NET_READY)) {
-          uint8_t v = state.check(STATE_WIFI_CONNECTED) ? 1 : 2;
-          store.log(PID_CONN_TYPE, &v, 1);
-          s_lastConnType = (int8_t)v;
-        }
-        {
-          uint8_t ov = enableObd ? 1 : 0;
-          store.log(PID_OBD_STATE, &ov, 1);
-          s_lastObd = (int8_t)ov;
-        }
-        {
-          store.log(PID_STANDBY_TIME, &nvsStandbyTimeS, 1);
-          s_lastStandbyTime = (int16_t)nvsStandbyTimeS;
-        }
-        {
-          uint8_t dv = enableDeepStandby ? 1 : 0;
-          store.log(PID_DEEP_STANDBY, &dv, 1);
-          s_lastDeepStandby = (int8_t)dv;
-        }
-#if STORAGE == STORAGE_SD
-        // s_cachedSdTotalMb/Free are kept current by process(); they are 0
-        // before the first SD read which HA correctly interprets as "no card".
-        store.log(PID_SD_TOTAL_MB, &s_cachedSdTotalMb, 1);
-        store.log(PID_SD_FREE_MB,  &s_cachedSdFreeMb,  1);
-#endif
-      }
-      store.tailer();
-      Serial.print("[DAT] ");
-      Serial.println(store.buffer());
-
-      // start transmission
-      // Snapshot enableLedWhite before the (blocking) transmit call so that
-      // if the main task processes a LED_WHITE=0 /api/control command while
-      // teleClient.transmit() is running, the LED is still driven LOW after
-      // the transmission completes.  Without the snapshot, the check at the
-      // second #ifdef PIN_LED block could see enableLedWhite=false and skip
-      // the LOW write, leaving the LED stuck on.
+      // --- Delivery (2026-09-26, replaces catch-up + live send) -------------
+      // One path: the delivery queue (txqueue.cpp). The server ACKs a packet
+      // once its records are stored; what is not ACKed in time is sent again,
+      // and nothing is dropped on a failed transmit - it stays queued (and on
+      // SD). The newest record goes first while a backlog is worked off.
+      {
+        int n = txqNextPacket(pkt, sizeof(pkt), devid);
+        if (n > 0) {
 #ifdef PIN_LED
-      const bool ledWhiteFlash = enableLedWhite;
-      if (ledWhiteFlash) digitalWrite(PIN_LED, HIGH);
+          const bool ledWhiteFlash = enableLedWhite;
+          if (ledWhiteFlash) digitalWrite(PIN_LED, HIGH);
 #endif
-
-      if (teleClient.transmit(store.buffer(), store.length())) {
-        // successfully sent
-        connErrors = 0;
-        showStats();
-      } else {
-        markLiveGap("TX_FAIL", sampleTs);  // buffer already freed - this sample is SD-only now
-        timeoutsNet++;
-        connErrors++;
-        printTimeoutStats();
-        if (connErrors < MAX_CONN_ERRORS_RECONNECT) {
-          // quick reconnect
-          if (!teleClient.connect(true)) {
-            // Quick reconnect failed while the WiFi radio is still up.
-            // Check if this is a heap-fragmentation failure (the TLS handshake
-            // cannot allocate its internal buffers) rather than a transient
-            // server-side error.  ESP.getMaxAllocHeap() returns the largest
-            // contiguous free DRAM block; values below TLS_MIN_FREE_HEAP
-            // indicate that mbedtls_ssl_setup()'s 2Ãƒâ€”17 KB record buffers
-            // cannot be satisfied even if total free memory is nominally OK.
-            // In that case waiting for MAX_CONN_ERRORS_RECONNECT attempts
-            // wastes ~40 s in an unrecoverable state.  Disconnect WiFi now to
-            // trigger the outer loop's WiFi-restart path (begin + setup), which
-            // stops and re-starts the WiFi driver.  The driver's internal DRAM
-            // allocations are freed by esp_wifi_stop() and re-initialised by
-            // esp_wifi_start(), coalescing the fragmented heap and giving the
-            // next TLS handshake a contiguous block to work with.
+          Serial.print("[DAT] ");
+          Serial.println(pkt);
+          bool ok = teleClient.transmit(pkt, n);
+#ifdef PIN_LED
+          if (ledWhiteFlash) digitalWrite(PIN_LED, LOW);
+#endif
+          if (ok) {
+            connErrors = 0;
+            showStats();
+          } else {
+            txqSendFailed();
+            timeoutsNet++;
+            connErrors++;
+            printTimeoutStats();
+            if (connErrors < MAX_CONN_ERRORS_RECONNECT && !teleClient.connect(true)) {
 #if ENABLE_WIFI
-            if (state.check(STATE_WIFI_CONNECTED) &&
-                ESP.getMaxAllocHeap() < TLS_MIN_FREE_HEAP) {
-              Serial.printf("[WIFI] Low heap (%u bytes max block) after TLS fail, restarting WiFi\n",
-                            (unsigned)ESP.getMaxAllocHeap());
-              teleClient.wifi.end();
-              state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
-              break;
-            }
+              // a TLS/heap-fragmentation failure: restart WiFi to coalesce the heap
+              if (state.check(STATE_WIFI_CONNECTED) &&
+                  ESP.getMaxAllocHeap() < TLS_MIN_FREE_HEAP) {
+                Serial.printf("[WIFI] Low heap (%u bytes max block) after TLS fail, restarting WiFi\n",
+                              (unsigned)ESP.getMaxAllocHeap());
+                teleClient.wifi.end();
+                state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
+                break;
+              }
 #endif
+            }
           }
+        } else {
+          delay(50);
         }
       }
-#ifdef PIN_LED
-      if (ledWhiteFlash) digitalWrite(PIN_LED, LOW);
-#endif
-      store.purge();
+      txqSave(false);
 
-      teleClient.inbound();
+      // ACKs from the server (and commands such as OTA_READY)
+      for (int i = 0; i < 4; i++) teleClient.inbound();
 
       if (state.check(STATE_CELL_CONNECTED) && !teleClient.cell.check(1000)) {
         Serial.println("[CELL] Not in service");
@@ -3802,12 +3508,22 @@ void telemetry(void* inst)
         break;
       }
 
+      // Too hot: pause transmitting to cool down - but keep the data (it
+      // stays buffered in RAM and on SD and goes out once cooled). This used
+      // to purge the unsent buffers, which on the desk (ESP32 die sensor
+      // ~68-75 °C) dropped live data and forced SD replays (2026-09-26).
+      static bool s_hot = false;
       if (deviceTemp >= COOLING_DOWN_TEMP) {
-        // device too hot, cool down by pause transmission
-        Serial.print("HIGH DEVICE TEMP: ");
-        Serial.println(deviceTemp);
-        uint32_t purgedTs;
-        if (bufman.purge(&purgedTs)) markLiveGap("OVERHEAT", purgedTs);
+        if (!s_hot) {
+          s_hot = true;
+          char msg[40];
+          snprintf(msg, sizeof(msg), "OVERHEAT %dC - pausing transmit", deviceTemp);
+          Serial.println(msg);
+          logNetEvent(msg);
+        }
+        delay(5000);
+      } else {
+        s_hot = false;
       }
 
     }
@@ -3844,6 +3560,7 @@ void standby()
   if (state.check(STATE_STORAGE_READY)) {
     logger.end();
   }
+  txqSetFile(0);  // records made in standby (position reports) have no SD copy
 #endif
 
   // Let the telemetry task send the last buffered samples over the still-up
@@ -5697,6 +5414,7 @@ void processBLE(int timeout)
 #if STORAGE
     logger.end();
 #endif
+    txqSave(true);
     ESP.restart();
     // never reach here
   } else if (!strcmp(cmd, "OFF")) {
@@ -6078,9 +5796,27 @@ void setup()
   if (err == ESP_OK && nvs_open("storage", NVS_READWRITE, &nvs) == ESP_OK) {
     loadConfig();
   }
+#if defined(TEST_NOWIFI) && ENABLE_WIFI
+  wifiSSID[0] = 0;   // bench: cellular only (NVS untouched)
+  wifiSSID2[0] = 0;
+#endif
 
   // initialize USB serial
   Serial.begin(115200);
+
+  // Delivery queue: its PSRAM reserve must be the FIRST PSRAM allocation so
+  // it lands at the same address every boot and what it held survives an
+  // ESP.restart()/panic (verified 2026-09-26). Then the boot number (record
+  // identity = boot number + PID 0).
+  txqEarlyInit();
+  {
+    uint32_t b = 0;
+    nvs_get_u32(nvs, "BOOT_NO", &b);
+    s_bootNo = b + 1;
+    nvs_set_u32(nvs, "BOOT_NO", s_bootNo);
+    nvs_commit(nvs);
+  }
+  txqBegin(s_bootNo);
 
   // Redirect mbedTLS's internal TLS-session buffer allocations to PSRAM
   // before anything below can possibly touch WiFi/TLS (fixes the

@@ -19,6 +19,7 @@
 #include "telestore.h"
 #include "teleclient.h"
 #include "config.h"
+#include "txqueue.h"
 
 extern int16_t rssi;
 extern char devid[];
@@ -144,8 +145,11 @@ void CBuffer::serialize(CStorage& store)
 void CBufferManager::init()
 {
   total = BUFFER_SLOTS;
+  // internal RAM if PSRAM is missing or failed - never the old boot loop
+  // (assert below, 74 restarts in 90 s measured 2026-09-26 without PSRAM)
 #if BOARD_HAS_PSRAM
     slots = (CBuffer**)heap_caps_malloc(BUFFER_SLOTS * sizeof(void*), MALLOC_CAP_SPIRAM);
+    if (!slots) slots = (CBuffer**)malloc(BUFFER_SLOTS * sizeof(void*));
 #else
     slots = (CBuffer**)malloc(BUFFER_SLOTS * sizeof(void*));
 #endif
@@ -153,6 +157,7 @@ void CBufferManager::init()
     void* mem;
 #if BOARD_HAS_PSRAM
     mem = heap_caps_malloc(BUFFER_LENGTH, MALLOC_CAP_SPIRAM);
+    if (!mem) mem = malloc(BUFFER_LENGTH);
 #else
     mem = malloc(BUFFER_LENGTH);
 #endif
@@ -600,6 +605,23 @@ void TeleClientUDP::inbound()
     Serial.print("[UDP] ");
     Serial.println(data);
     rxBytes += len;
+    // delivery ACK(s) from the server, "1#ACK=<packet>*CS" (2026-09-26) - a
+    // read may hold several, each with its own checksum
+    bool acked = false;
+    for (char* a = strstr(data, "1#ACK="); a; a = strstr(a + 6, "1#ACK=")) {
+      char* star = strchr(a, '*');
+      if (!star) break;
+      uint8_t sum = 0;
+      for (char* q = a; q < star; q++) sum += *q;
+      if (hex2uint8(star + 1) == sum) {
+        txqOnAck(strtoul(a + 6, 0, 10));
+        acked = true;
+      }
+    }
+    if (acked) {
+      lastSyncTime = millis();  // the link is alive: no "poor connection" reconnect
+      break;
+    }
     if (!verifyChecksum(data)) {
       Serial.print("[UDP] Checksum mismatch:");
       Serial.println(data);

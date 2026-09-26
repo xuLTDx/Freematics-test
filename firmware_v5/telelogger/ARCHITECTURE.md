@@ -334,7 +334,54 @@ STATE_STANDBY          0x200   device is in standby (car off)
 actually established" (not just radio-on) — `CBuffer`s only get *sent* live
 when `STATE_NET_READY`; they always get *SD-logged* independent of this.
 
-## B5. SD store-and-forward / catch-up (`telelogger.ino:659-673`, `2462-2489`)
+## B4b. Delivery queue (2026-09-26) - REPLACES B5's catch-up below
+
+Everything in B5 about `WM_FILE`, `GAP_*`, `markLiveGap`, `catchUpMissedFiles`
+and `getNewest()` is gone. The inherited design had two send paths and no
+receipt acknowledgement; measured on the 2026-09-26 drives: 24 of 2231 records
+never reached Traccar, 43 arrived twice, and the link was re-opened every
+~122 s ("poor connection", nothing ever came back from the server).
+
+- **One path** (`txqueue.cpp/.h`). `process()` builds a record in a CBuffer
+  (now only 8 slots), writes it to SD, then `queueRecord()` puts the same
+  record (wire text `0:<ts>,<pid>:<val>,...`) into the delivery queue and
+  frees the slot. The telemetry task sends from the queue only.
+- **Identity** = boot number (NVS `BOOT_NO`, +1 per boot; `FE,BOOTID=n` at
+  the top of every SD file) + PID 0 (`nextRecordTs()`, strictly increasing).
+  Packet: `ZKUCA42T#383:<boot>,384:<packet no>,0:...,0:...*CS` (several
+  records, one boot per packet, ~700 B).
+- **ACK**: the server answers `1#ACK=<packet no>*CS` after the records are
+  stored (see ARCHITECTURE_FREEMATICS.md B10). `TeleClientUDP::inbound()`
+  handles it (and still `EV=` / `OTA_READY`) and refreshes `lastSyncTime`.
+  Up to 4 packets in flight, re-sent after 8 s without ACK.
+- **PSRAM reserve** 1 MB, the FIRST PSRAM allocation (same address every
+  boot). Survives `ESP.restart()` and panics because `testSPIRAM()` (weak hook
+  of the Arduino core) is overridden - the core's boot test wrote every 8th
+  word (12 % loss measured); ours tests the top 64 KB. Lost on power off.
+  Header + per-record CRC; a damaged/lost reserve -> SD replay from the NVS
+  cursor `TXQ_CUR` (saved every 30 s and at standby).
+- **SD replay** when the queue overflows (drops its oldest to SD), after a
+  lost reserve, or on `cmd=RESEND=<file>`; reads `/DATA/<n>.CSV` from a
+  (file, ts, byte pos) cursor until it meets the queue's oldest record.
+- **No SD**: from 50 % queue use, records keep only time code (0, 10, 11),
+  position (A, B), speed (D), heading (E), no-fix flag (385) and engine
+  start/stop (380, 381); from 80 % one record per 10 s (start/stop never
+  thinned). Full -> oldest dropped (`lost=` in `TXQ?`).
+- **No PSRAM**: 16 KB internal-RAM queue, CBuffers fall back to malloc - no
+  more boot loop (was `assert` in `CBufferManager::init`, 74 restarts/90 s).
+- Newest record goes first (alone) every 5 s while a backlog > 20 s is worked off.
+- Records without a new fix carry the box's own last fix + PID 0x385
+  (`noFix`), not the position the server received last.
+- Standby: `drainQueue(15 s)` before the link drops (nothing purged); the 3 h
+  standby report is a queued record, sent and confirmed like any other.
+- PID 0x382 = number of records not yet confirmed. Web/API: `/api/live`
+  `sys.boot/txq/txu`, `cmd=TXQ?`, `cmd=RESEND=<file>`.
+- Bench-verified 2026-09-26 (SD vs Traccar by identity, 0 missing, 0 dup):
+  WiFi, cellular, server outage + restart, SD replay, overflow + simulated
+  power loss (`-DTEST_TXQ -DTXQ_RESERVE_BYTES=4096`, `cmd=TXQLOSE/TXQNOSD/
+  TXQPAUSE/TXQRESUME`), OTA_READY over cellular, forced standby + report.
+
+## B5. SD store-and-forward / catch-up (HISTORY - replaced by B4b)
 
 ```
 wmDoneFileId   (u32, NVS key "WM_FILE")

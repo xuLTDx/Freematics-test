@@ -121,6 +121,18 @@ void CStorageRAM::untailer()
 
 static SemaphoreHandle_t s_logMutex = 0;  // one logger instance per firmware
 
+// the delivery queue reads records back from SD (txqueue.cpp): same mutex
+void sdLock()
+{
+  if (!s_logMutex) s_logMutex = xSemaphoreCreateRecursiveMutex();
+  if (s_logMutex) xSemaphoreTakeRecursive(s_logMutex, portMAX_DELAY);
+}
+
+void sdUnlock()
+{
+  if (s_logMutex) xSemaphoreGiveRecursive(s_logMutex);
+}
+
 void FileLogger::lock()
 {
     if (!s_logMutex) s_logMutex = xSemaphoreCreateRecursiveMutex();
