@@ -376,6 +376,13 @@ never reached Traccar, 43 arrived twice, and the link was re-opened every
   standby report is a queued record, sent and confirmed like any other.
 - PID 0x382 = number of records not yet confirmed. Web/API: `/api/live`
   `sys.boot/txq/txu`, `cmd=TXQ?`, `cmd=RESEND=<file>`.
+- 2026-09-27 (`89e7aa5`, after the first real drives - SD 1652 = Traccar
+  1652, 0 missing, 0 dup, two cellular outages drained): records without
+  time (clock not set: power-on before the first fix; SNTP runs only on
+  WiFi) wait in the queue and get `t = now - (millis - ts)` once the clock is
+  valid (10 min cap); last fix kept in RTC memory + NVS `LASTFIX`; SD file id
+  from NVS `FILE_ID` (listing /DATA took 14.4 s per boot, first record now
+  ~16 s after a restart); engine START only on RPM > 0 while OBD answers.
 - Bench-verified 2026-09-26 (SD vs Traccar by identity, 0 missing, 0 dup):
   WiFi, cellular, server outage + restart, SD replay, overflow + simulated
   power loss (`-DTEST_TXQ -DTXQ_RESERVE_BYTES=4096`, `cmd=TXQLOSE/TXQNOSD/
