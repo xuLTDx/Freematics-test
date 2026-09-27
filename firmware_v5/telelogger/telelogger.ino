@@ -680,6 +680,39 @@ volatile bool s_ota_active = false;
 uint32_t s_bootNo = 0;         // NVS BOOT_NO, +1 at every boot
 static uint32_t s_recTs = 0;   // last record timestamp handed out
 static float s_lastFixLat = 0, s_lastFixLng = 0;  // last GPS fix, for records without one
+// The last fix outlives a restart (RTC memory: standby wake, OTA, crash) and a
+// power-off (NVS LASTFIX: at standby entry and every 10 min of fixes) - on
+// 2026-09-27 every record before the first fix after a wake (105-161 s) went
+// out without it.
+#define LASTFIX_MAGIC 0x4C465831
+RTC_NOINIT_ATTR uint32_t rtcFixMagic;
+RTC_NOINIT_ATTR float rtcFixLat, rtcFixLng;
+static void rememberFix(float lat, float lng)
+{
+  s_lastFixLat = lat;
+  s_lastFixLng = lng;
+  rtcFixLat = lat;
+  rtcFixLng = lng;
+  rtcFixMagic = LASTFIX_MAGIC;
+}
+static void saveLastFix()
+{
+  if (!s_lastFixLat && !s_lastFixLng) return;
+  float v[2] = {s_lastFixLat, s_lastFixLng};
+  nvs_set_blob(nvs, "LASTFIX", v, sizeof(v));
+  nvs_commit(nvs);
+}
+static void loadLastFix()
+{
+  if (rtcFixMagic == LASTFIX_MAGIC && (rtcFixLat || rtcFixLng)) {
+    s_lastFixLat = rtcFixLat;
+    s_lastFixLng = rtcFixLng;
+    return;
+  }
+  float v[2];
+  size_t len = sizeof(v);
+  if (nvs_get_blob(nvs, "LASTFIX", v, &len) == ESP_OK && len == sizeof(v)) rememberFix(v[0], v[1]);
+}
 uint32_t nextRecordTs()
 {
   uint32_t t = millis();
@@ -1833,8 +1866,14 @@ bool processGPS(CBuffer* buffer)
     // from Sep 21 replayed the next morning that decoded into that afternoon's
     // live drive window and corrupted the trip/stop reports.
     buffer->add(PID_GPS_DATE, ELEMENT_UINT32, &gd->date, sizeof(uint32_t));
-    s_lastFixLat = gd->lat;
-    s_lastFixLng = gd->lng;
+    rememberFix(gd->lat, gd->lng);
+    {
+      static uint32_t lastFixSave = 0;
+      if (!lastFixSave || millis() - lastFixSave > 600000) {  // NVS wear: every 10 min
+        lastFixSave = millis();
+        saveLastFix();
+      }
+    }
     buffer->add(PID_GPS_LATITUDE, ELEMENT_FLOAT, &gd->lat, sizeof(float));
     buffer->add(PID_GPS_LONGITUDE, ELEMENT_FLOAT, &gd->lng, sizeof(float));
     buffer->add(PID_GPS_ALTITUDE, ELEMENT_FLOAT_D1, &gd->alt, sizeof(float)); /* m */
@@ -2059,8 +2098,12 @@ void initialize()
     }
   }
   if (state.check(STATE_STORAGE_READY)) {
-    fileid = logger.begin();
+    uint32_t lastFile = 0;
+    nvs_get_u32(nvs, "FILE_ID", &lastFile);  // skip listing /DATA (14 s with 900+ files)
+    fileid = logger.begin(lastFile);
     if (fileid) {
+      nvs_set_u32(nvs, "FILE_ID", fileid);
+      nvs_commit(nvs);
       // the boot number in every file: the delivery queue's SD replay needs
       // it to rebuild the records' identity (boot, PID 0)
       {
@@ -2362,7 +2405,11 @@ static void engineTick(CBuffer* buffer)
   const bool obd = state.check(STATE_OBD_READY);
   if (volts && !obd) s_engineLastAlive = now;  // no OBD: the voltage is the only evidence
   if (!s_engineOn) {
-    if ((lastRpmMs && millis() - lastRpmMs < 3000) || volts) {
+    // With OBD answering, only RPM > 0 starts the engine: right after a STOP
+    // the battery still reads 12.8-12.9 V for a few seconds, and a
+    // voltage-started START followed by a second STOP came after every
+    // switch-off on 2026-09-27. The voltage decides only without OBD.
+    if ((lastRpmMs && millis() - lastRpmMs < 3000) || (volts && !obd)) {
       s_engineOn = true;
       time_t when = now;
       if (s_wakeUnix && now >= s_wakeUnix && now - s_wakeUnix < 300) when = s_wakeUnix;
@@ -2395,6 +2442,7 @@ static void engineTick(CBuffer* buffer)
 static void logStandbyEntry(const char* cause, unsigned int motionless)
 {
   engineStop();  // every standby path ends a running engine first
+  saveLastFix();  // the parking position survives a power-off too
   char msg[112];
   snprintf(msg, sizeof(msg), "STANDBY cause=%s motionless=%us V=%.2f src=%c kmh=%.1f",
       cause, motionless, batteryVoltage, lastMotionSrc, gd ? gd->speed * 1.852f : -1.0f);
@@ -2956,8 +3004,7 @@ static void buildStandbyReport(CStorageRAM& rb)
         rb.log(PID_GPS_LONGITUDE, &lng, 1, "%.6f");
         rb.log(PID_GPS_SPEED, &kph, 1, "%.1f");
         if (sat) rb.log(PID_GPS_SAT_COUNT, &sat, 1);
-        s_lastFixLat = lat;
-        s_lastFixLng = lng;
+        rememberFix(lat, lng);
         hasFix = true;
         break;
       }
@@ -5809,6 +5856,10 @@ void setup()
   // ESP.restart()/panic (verified 2026-09-26). Then the boot number (record
   // identity = boot number + PID 0).
   txqEarlyInit();
+  loadLastFix();
+#ifdef TEST_CLOCK
+  { struct timeval tv = {0, 0}; settimeofday(&tv, nullptr); }  // bench: as after a power-on
+#endif
   {
     uint32_t b = 0;
     nvs_get_u32(nvs, "BOOT_NO", &b);
@@ -5997,6 +6048,23 @@ if (!state.check(STATE_MEMS_READY)) do {
 
 void loop()
 {
+#ifdef TEST_CLOCK
+  {  // bench: the clock becomes valid 150 s after boot, as with a late first GPS fix
+    static bool clockSet = false;
+    if (!clockSet && millis() > 150000) {
+      clockSet = true;
+      struct tm b = {};
+      char mon[4];
+      sscanf(__DATE__, "%3s %d %d", mon, &b.tm_mday, &b.tm_year);
+      sscanf(__TIME__, "%d:%d:%d", &b.tm_hour, &b.tm_min, &b.tm_sec);
+      b.tm_year -= 1900;
+      b.tm_mon = (strstr("JanFebMarAprMayJunJulAugSepOctNovDec", mon) - "JanFebMarAprMayJunJulAugSepOctNovDec") / 3;
+      struct timeval tv = {mktime(&b) - 7200 + 300, 0};  // build time (CEST) -> UTC, +5 min
+      settimeofday(&tv, nullptr);
+      Serial.printf("[TEST_CLOCK] clock set to %lu\n", (unsigned long)tv.tv_sec);
+    }
+  }
+#endif
   // error handling
   if (!state.check(STATE_WORKING)) {
     standby();

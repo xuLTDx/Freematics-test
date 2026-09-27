@@ -5,6 +5,7 @@
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <time.h>
 #include "txqueue.h"
 
 extern nvs_handle_t nvs;
@@ -362,6 +363,37 @@ static void expire()
   }
 }
 
+// ---- records made before the clock was set (power-on, no GPS fix yet) ----
+// Such a record has no time (PID 10/11); Traccar would file it under the time
+// of the last position it knows (2026-09-27: 57 s of a drive landed on the
+// evening before). They wait in the queue until the clock is valid, then get
+// their time computed from their ms timestamp: t = now - (millis() - ts).
+#define TXQ_UNTIMED_HOLD_MS 600000  // after 10 min without a clock: sent as they are
+static bool clockValid() { return time(nullptr) > 1735689600; }  // 2025-01-01
+static bool recHasTime(const char* rec, int len)
+{
+  for (int i = 0; i + 4 <= len; i++) {
+    if (rec[i] == ',' && rec[i + 1] == '1' && rec[i + 2] == '0' && rec[i + 3] == ':') return true;
+  }
+  return false;
+}
+// 0 = send as is, 1 = append the computed time, -1 = hold it back for now
+static int untimedAction(uint32_t boot, uint32_t ts, const char* rec, int len)
+{
+  if (recHasTime(rec, len) || boot != s_boot) return 0;  // other boot: its millis base is gone
+  if (clockValid()) return 1;
+  return millis() - ts < TXQ_UNTIMED_HOLD_MS ? -1 : 0;
+}
+static int timeFields(char* out, int cap, uint32_t ts)
+{
+  time_t t = time(nullptr) - (time_t)((millis() - ts) / 1000);
+  struct tm u;
+  gmtime_r(&t, &u);
+  return snprintf(out, cap, ",10:%u,11:%u",
+      (unsigned)(u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100),
+      (unsigned)(u.tm_mday * 10000 + (u.tm_mon + 1) * 100 + u.tm_year % 100));
+}
+
 static int header(char* out, int cap, const char* devid, uint32_t boot, uint32_t no)
 {
   return snprintf(out, cap, "%s#%X:%u,%X:%u", devid, PID_TX_BOOT, (unsigned)boot, PID_TX_PACKET, (unsigned)no);
@@ -405,7 +437,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   static char recBuf[TXQ_PACKET_MAX + 700];  // a record is never cut: start one only below TXQ_PACKET_MAX
   int recLen = 0;         // records accepted into the packet
   int cur = -1;           // start of the record being read in recBuf, -1 = skipping
-  bool curHasData = false;
+  bool curHasData = false, curHasTime = false;
   uint32_t curTs = 0, curPos = 0;
   bool eof = false, done = false;
   uint32_t nextTs = 0, nextPos = 0;
@@ -426,6 +458,8 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     if (!strcmp(key, "0")) {
       uint32_t ts = strtoul(val, 0, 10);
       if (cur >= 0 && !curHasData) recLen = cur;  // an empty record: leave it out
+      else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
+        recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
       cur = -1;  // the previous record (if any) is complete
       if (!s_sdBoot) continue;  // file without a boot id (old firmware): not replayable
       if (ts < s_sdTs) continue;
@@ -433,6 +467,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
       if (recLen >= TXQ_PACKET_MAX) { nextTs = ts; nextPos = linePos; break; }
       cur = recLen;
       curHasData = false;
+      curHasTime = false;
       if (recLen) recBuf[recLen++] = ',';
       recLen += snprintf(recBuf + recLen, sizeof(recBuf) - recLen, "0:%u", (unsigned)ts);
       curTs = ts;
@@ -441,6 +476,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     }
     if (cur < 0) continue;
     curHasData = true;
+    if (!strcmp(key, "10")) curHasTime = true;
     int kl = strlen(key), vl = strlen(val);
     if (recLen + kl + vl + 2 < (int)sizeof(recBuf)) {
       recBuf[recLen++] = ',';
@@ -450,7 +486,9 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     }
   }
   if (cur >= 0 && !curHasData) recLen = cur;
-  (void)curTs; (void)curPos;
+  else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
+    recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
+  (void)curPos;
   file.close();
   sdUnlock();
   if (!recLen) {
@@ -495,12 +533,14 @@ int txqNextPacket(char* out, int cap, const char* devid)
   if (H->count > 1 && millis() - s_lastPriority > 5000) {
     QEnt* last = ent(H->lastPos);
     QEnt* first = ent(norm(H->tail));
-    if (last->state == ST_PENDING && last->ts - first->ts > 20000 && last->boot == first->boot) {
+    int act = untimedAction(last->boot, last->ts, (const char*)(last + 1), last->len);
+    if (last->state == ST_PENDING && last->ts - first->ts > 20000 && last->boot == first->boot && act >= 0) {
       s_lastPriority = millis();
       n = header(out, cap, devid, last->boot, f->no);
       out[n++] = ',';
       memcpy(out + n, last + 1, last->len);
       n += last->len;
+      if (act == 1) n += timeFields(out + n, cap - n, last->ts);
       last->state = ST_INFLIGHT;
       last->packet = f->no;
     }
@@ -521,16 +561,19 @@ int txqNextPacket(char* out, int cap, const char* devid)
       pos = norm(pos);
       QEnt* e = ent(pos);
       if (e->state == ST_PENDING) {
+        int act = untimedAction(e->boot, e->ts, (const char*)(e + 1), e->len);
+        if (act < 0) break;  // no clock yet: this and the newer records wait
         if (!n) {
           boot = e->boot;
           n = header(out, cap, devid, boot, f->no);
         } else if (e->boot != boot) {
           break;
         }
-        if (n + 1 + e->len + 8 > cap || n + 1 + e->len > TXQ_PACKET_MAX + 64) break;
+        if (n + 1 + e->len + 32 > cap || n + 1 + e->len > TXQ_PACKET_MAX + 64) break;
         out[n++] = ',';
         memcpy(out + n, e + 1, e->len);
         n += e->len;
+        if (act == 1) n += timeFields(out + n, cap - n, e->ts);
         e->state = ST_INFLIGHT;
         e->packet = f->no;
       }

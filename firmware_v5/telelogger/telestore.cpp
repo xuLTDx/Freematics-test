@@ -257,16 +257,28 @@ bool SDLogger::init()
     }
 }
 
-uint32_t SDLogger::begin()
+uint32_t SDLogger::begin(uint32_t lastId)
 {
     lock();
-    File root = SD.open("/DATA");
-    m_id = getFileID(root);
-    if (m_id == 0) {
-        SD.mkdir("/DATA");
-        m_id = 1;
-    }
     char path[24];
+    if (lastId) {
+        // 2026-09-27: listing /DATA (900+ files) took 14.4 s of every boot,
+        // all of it before the first record. The caller remembers the last
+        // id (NVS); only check that the next one is really free.
+        m_id = lastId + 1;
+        for (;;) {
+            sprintf(path, "/DATA/%u.CSV", m_id);
+            if (!SD.exists(path)) break;
+            m_id++;
+        }
+    } else {
+        File root = SD.open("/DATA");
+        m_id = getFileID(root);
+        if (m_id == 0) {
+            SD.mkdir("/DATA");
+            m_id = 1;
+        }
+    }
     sprintf(path, "/DATA/%u.CSV", m_id);
     Serial.print("File: ");
     Serial.println(path);

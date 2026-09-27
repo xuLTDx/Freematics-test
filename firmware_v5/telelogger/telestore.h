@@ -101,7 +101,7 @@ protected:
 class SDLogger : public FileLogger {
 public:
     bool init();
-    uint32_t begin();
+    uint32_t begin(uint32_t lastId = 0);  // lastId: last file id used (0 = list /DATA)
     void flush();
     // Purge oldest log files when SD card is >= 80% full.
     // Deletes files in ascending ID order (oldest first) until at least 20%

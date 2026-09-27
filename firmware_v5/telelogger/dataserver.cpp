@@ -724,6 +724,12 @@ int handlerControl(UrlHandlerParam* param)
         uint32_t f = (uint32_t)strtoul(cmd + 7, 0, 10);
         txqResendFrom(f);
         n = snprintf(buf, bufsize, "OK");
+#ifdef TEST_CLOCK
+    } else if (!strncmp(cmd, "SETCLOCK=", 9)) {  // bench: the clock becomes valid (as a GPS fix does)
+        struct timeval tv = {(time_t)strtoul(cmd + 9, 0, 10), 0};
+        settimeofday(&tv, nullptr);
+        n = snprintf(buf, bufsize, "OK");
+#endif
     } else if (!strcmp(cmd, "TXQ?")) {
         txqStatus(buf, bufsize);
         n = strlen(buf);
