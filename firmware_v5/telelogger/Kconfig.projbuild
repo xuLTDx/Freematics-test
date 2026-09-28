@@ -32,8 +32,6 @@ menu "Telelogger Configuration"
             bool "No GNSS"
         config GNSS_INTERNAL
             bool "Internal GNSS"
-        config GNSS_EXTERNAL
-            bool "External GNSS"
         config GNSS_CELLULAR
             bool "Cellular GNSS"
     
@@ -43,7 +41,6 @@ menu "Telelogger Configuration"
         int
         default 0 if GNSS_NONE
         default 1 if GNSS_INTERNAL
-        default 2 if GNSS_EXTERNAL
         default 3 if GNSS_CELLULAR
 
     config BOARD_HAS_PSRAM

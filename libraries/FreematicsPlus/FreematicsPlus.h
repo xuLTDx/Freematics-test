@@ -147,8 +147,8 @@ public:
   bool begin(bool useCoProc = true, bool useCellular = true);
   // start GPS
   bool gpsBegin();
-  // start GPS
-  bool gpsBeginExt(int baudrate = 115200);
+  // gpsBeginExt() (external GNSS on the Molex GPIO26/34) removed: those pins
+  // carry the CAN module in this fork.
   // turn off GPS
   void gpsEnd(bool powerOff = true);
   // get parsed GPS data (returns the number of data parsed since last invoke)

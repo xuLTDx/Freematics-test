@@ -32,6 +32,7 @@ extern UpdateClass Update;
 #include "telestore.h"
 #include "teleclient.h"
 #include "txqueue.h"
+#include "canodo.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -591,6 +592,114 @@ time_t s_engineLastAlive = 0;   // clock time of the last RPM > 0 (or voltage-on
 int s_obdCycle = -1;            // processOBD(): 1 = ECU answered, 0 = first read failed, -1 not run
 uint8_t s_obdSilent = 0;
 uint32_t s_lowVoltSinceMs = 0;
+
+// Real odometer over the soldered CAN module (canodo.cpp), 2026-09-28. Read
+// fresh for every engine START/STOP record (the trip's km come from those
+// two), once a minute while the engine runs, and the last value (if not
+// older than ODO_MAX_AGE_MS) goes into every record as PID 0x1A6 = km.
+// Nothing is sent to the car while the engine is off.
+#define PID_ODOMETER_KM   (PID_ODOMETER | 0x100)
+#ifndef ODO_PERIOD_MS
+#define ODO_PERIOD_MS     60000   // while the engine runs (START/STOP read at once)
+#endif
+// Fuel (22 22B0, NOT confirmed where the litres are - see canodo.h): read
+// with the odometer, sent as the [34:36] candidate in 0.1 l plus the raw
+// data bytes, for confirmation against a refuel receipt.
+#define PID_FUEL_CAND     0x391   // candidate, 0.1 l (data bytes [34:36] big-endian)
+#define PID_FUEL_RAW      0x392   // data bytes after 62 22 B0 (decimal, ';'-separated)
+#define ODO_MAX_AGE_MS    600000
+// Diagnosis of every read attempt, sent with the next record (canodo.h):
+#define PID_CAN_RESULT    0x386   // CanOdoResult (0 = OK)
+#define PID_CAN_NRC       0x387   // gateway negative response code
+#define PID_CAN_STATE     0x388   // controller state (1 = running)
+#define PID_CAN_FRAMES    0x389   // frames received since boot, any ID
+#define PID_CAN_FRAMES77A 0x38A   // frames from the gateway (0x77A) since boot
+#define PID_CAN_TXERR     0x38B   // TX error counter
+#define PID_CAN_RXERR     0x38C   // RX error counter
+#define PID_CAN_BUSERR    0x38D   // bus errors since boot
+#define PID_CAN_TXFAIL    0x38E   // failed transmissions since boot
+#define PID_CAN_RAW       0x38F   // gateway reply bytes (decimal, ';'-separated)
+#define PID_CAN_LASTID    0x390   // ID of the last frame received
+uint32_t s_odoKm = 0;           // last good reading
+uint32_t s_odoMs = 0;           // millis() of that reading
+uint32_t s_odoTryMs = 0;        // millis() of the last attempt
+CanOdoDiag s_odoDiag;
+bool s_odoDiagNew = false;      // a diagnosis to report in the next record
+CanOdoDiag s_odoDiagSent;       // the last one reported (report again only on change)
+uint8_t s_fuelRaw[56];
+size_t s_fuelLen = 0;
+bool s_fuelNew = false;
+
+static bool odoRead()
+{
+  s_odoTryMs = millis();
+  uint32_t km;
+  bool ok = canOdoRead(&km, &s_odoDiag);
+  // the diagnosis goes out on a failure, on the first read after boot and
+  // when an error counter moved - not with every good read
+  static bool reportedOnce = false;
+  if (!ok || !reportedOnce || s_odoDiag.txErr != s_odoDiagSent.txErr ||
+      s_odoDiag.rxErr != s_odoDiagSent.rxErr || s_odoDiag.busErr != s_odoDiagSent.busErr ||
+      s_odoDiag.txFailed != s_odoDiagSent.txFailed) {
+    s_odoDiagNew = true;
+    s_odoDiagSent = s_odoDiag;
+    reportedOnce = true;
+  }
+  if (ok) {
+    s_odoKm = km;
+    s_odoMs = millis();
+  }
+  Serial.printf("[CAN] ODO %s km=%lu res=%u nrc=0x%02X state=%u frames=%lu/77A=%lu txErr=%lu rxErr=%lu busErr=%lu txFail=%lu lastId=0x%lX raw=%u\n",
+      ok ? "OK" : "FAIL", (unsigned long)(ok ? km : 0), s_odoDiag.result, s_odoDiag.nrc, s_odoDiag.state,
+      (unsigned long)s_odoDiag.framesAll, (unsigned long)s_odoDiag.frames77A,
+      (unsigned long)s_odoDiag.txErr, (unsigned long)s_odoDiag.rxErr, (unsigned long)s_odoDiag.busErr,
+      (unsigned long)s_odoDiag.txFailed, (unsigned long)s_odoDiag.lastId, s_odoDiag.rawLen);
+  return ok;
+}
+
+static void fuelRead()
+{
+  CanOdoDiag d;
+  size_t n = 0;
+  if (canFuelRead(s_fuelRaw, sizeof(s_fuelRaw), &n, &d)) {
+    s_fuelLen = n;
+    s_fuelNew = true;
+    Serial.printf("[CAN] FUEL %u bytes, [34:36]=%u\n", (unsigned)n,
+        n >= 36 ? (unsigned)((s_fuelRaw[34] << 8) | s_fuelRaw[35]) : 0);
+  } else {
+    Serial.printf("[CAN] FUEL failed res=%u nrc=0x%02X\n", d.result, d.nrc);
+  }
+}
+
+static void addOdo(CBuffer* b)
+{
+  if (s_fuelNew) {
+    s_fuelNew = false;
+    if (s_fuelLen >= 36) {
+      uint16_t cand = (s_fuelRaw[34] << 8) | s_fuelRaw[35];
+      b->add(PID_FUEL_CAND, ELEMENT_UINT16, &cand, sizeof(cand));
+    }
+    b->add(PID_FUEL_RAW, ELEMENT_UINT8, s_fuelRaw, s_fuelLen, s_fuelLen);
+  }
+  if (s_odoKm && millis() - s_odoMs < ODO_MAX_AGE_MS) {
+    b->add(PID_ODOMETER_KM, ELEMENT_UINT32, &s_odoKm, sizeof(s_odoKm));
+  }
+  if (s_odoDiagNew) {
+    s_odoDiagNew = false;
+    CanOdoDiag& d = s_odoDiag;   // add() takes non-const pointers
+    b->add(PID_CAN_RESULT, ELEMENT_UINT8, &d.result, sizeof(d.result));
+    b->add(PID_CAN_NRC, ELEMENT_UINT8, &d.nrc, sizeof(d.nrc));
+    b->add(PID_CAN_STATE, ELEMENT_UINT8, &d.state, sizeof(d.state));
+    b->add(PID_CAN_FRAMES, ELEMENT_UINT32, &d.framesAll, sizeof(d.framesAll));
+    b->add(PID_CAN_FRAMES77A, ELEMENT_UINT32, &d.frames77A, sizeof(d.frames77A));
+    b->add(PID_CAN_TXERR, ELEMENT_UINT32, &d.txErr, sizeof(d.txErr));
+    b->add(PID_CAN_RXERR, ELEMENT_UINT32, &d.rxErr, sizeof(d.rxErr));
+    b->add(PID_CAN_BUSERR, ELEMENT_UINT32, &d.busErr, sizeof(d.busErr));
+    b->add(PID_CAN_TXFAIL, ELEMENT_UINT32, &d.txFailed, sizeof(d.txFailed));
+    b->add(PID_CAN_LASTID, ELEMENT_UINT32, &d.lastId, sizeof(d.lastId));
+    if (d.rawLen) b->add(PID_CAN_RAW, ELEMENT_UINT8, d.raw, d.rawLen, d.rawLen);
+  }
+}
 RTC_NOINIT_ATTR uint32_t wakeInfoUnix;  // clock time of the standby wake (valid with WAKE_INFO_MAGIC)
 time_t s_wakeUnix = 0;                  // the same, taken over at boot for the ENGINE_START time
 // Survive ESP.restart() after standby wake so the next boot can log how long
@@ -1713,10 +1822,10 @@ static long parseUdsHexValue(const char* resp, uint16_t did)
 
 bool initGPS()
 {
-  // start GNSS receiver
-  if (sys.gpsBeginExt()) {
-    Serial.println("GNSS:OK(E)");
-  } else if (sys.gpsBegin()) {
+  // start GNSS receiver - internal one only (behind the co-processor).
+  // No external GNSS probe (sys.gpsBeginExt()): it would claim the Molex
+  // pins GPIO26/34 as a UART, and those carry the CAN module's CTX/CRX.
+  if (sys.gpsBegin()) {
     Serial.println("GNSS:OK(I)");
   } else {
     Serial.println("GNSS:NO");
@@ -2365,6 +2474,10 @@ static void emitEngineEvent(bool start, time_t when)
     uint16_t v = batteryVoltage * 100;
     b->add(PID_BATTERY_VOLTAGE, ELEMENT_UINT16, &v, sizeof(v));
   }
+  // the trip's km come from the odometer in its START and STOP records: read
+  // it now (the gateway still answers right after the engine stops)
+  odoRead();
+  addOdo(b);
   uint8_t ev = start ? 1 : 2;
   b->add(PID_ENGINE_EVENT, ELEMENT_UINT8, &ev, sizeof(ev));
   uint32_t ts = clockOk ? (uint32_t)when : 0;
@@ -2541,6 +2654,13 @@ void process()
   // ENGINE_OFF_VOLTAGE: see config.h for the measured values.
   if (batteryVoltage >= ENGINE_OFF_VOLTAGE) { lastMotionTime = millis(); lastMotionSrc = 'V'; }
   engineTick(buffer);
+#ifdef TEST_CANODO_BENCH
+  // bench only: attempts without a running engine, to see the diagnosis reach the server
+  if (millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+#else
+  if (s_engineOn && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+#endif
+  addOdo(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into
   // ignition=false). Without it the RPM PID just stopped coming, Traccar
   // never saw the ignition go off, and with report.trip.useIgnition a drive,
@@ -5868,6 +5988,7 @@ void setup()
     nvs_commit(nvs);
   }
   txqBegin(s_bootNo);
+  canOdoBegin();
 
   // Redirect mbedTLS's internal TLS-session buffer allocations to PSRAM
   // before anything below can possibly touch WiFi/TLS (fixes the
