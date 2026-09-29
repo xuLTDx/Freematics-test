@@ -8,6 +8,7 @@ The sketch collects following data.
 * Vehicle OBD data (from OBD port)
 * Battery voltage (from OBD port)
 * Geolocation data (from internal GNSS; no external GNSS - the Molex GPIO26/34 carry the CAN module)
+* Real odometer over an added CAN transceiver - hardware modification and firmware: [docs/can_odometer](docs/can_odometer/README.md)
 * Accelerometer and gyroscope data (from internal MEMS motion sensor)
 * Cellular or WiFi network signal level
 * Device temperature
