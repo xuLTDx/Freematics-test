@@ -546,13 +546,57 @@ stateDiagram-v2
 
 ## B9. Odometer / distance PIDs sent (relevant to Traccar-side calibration)
 
-`case 0x1a6` (whole km, UDS/PID-normalised or GPS-distance fallback) is the
-only *absolute* odometer PID this firmware sends — see
-`Traccar_ARCHITECTURE_FREEMATICS.md` §"Odometer calibration" for how the
-server turns this (or, when unavailable, GPS-integrated `KEY_TOTAL_DISTANCE`)
-into a real-world-calibrated value.
+**Since 2026-09-28 (`3552b62`) the odometer is the car's own**, read over an
+added CAN transceiver (WCMCU-230 on Molex GPIO26/34 + OBD pins 6/14, wiring
+and photos: [docs/can_odometer](docs/can_odometer/README.md)) by
+`canodo.cpp`: UDS `22 02 BD` to the VW Gateway 0x710 → 0x77A, km = data
+bytes 1..3. Verified in the car: 157638 km = dashboard.
+
+- `PID 0x1A6` = km (Traccar: `odometer` in metres). Read fresh for every
+  engine START/STOP record (`emitEngineEvent()`), once a minute
+  (`ODO_PERIOD_MS`) while the engine runs, never with the engine off; the last
+  value (< 10 min old) goes into every record. No GPS fallback any more: no
+  reading = no 0x1A6.
+- `0x386`-`0x390` = CAN diagnosis of a read (result, NRC, controller state,
+  frames received, frames from 0x77A, TX/RX error counters, bus errors, failed
+  transmissions, reply bytes, last frame ID), sent on a failure, on the first
+  read after boot and when an error counter moves. `frames = 0` in the car =
+  the module receives nothing (wiring).
+- `0x391`/`0x392` = fuel from the instrument cluster (`22 22 B0`,
+  0x714 → 0x77E): candidate [34:36] in 0.1 l and the raw data bytes -
+  **position of the litres NOT confirmed** (the candidate rose while driving
+  on 2026-09-28).
+- Bench build flag `-DTEST_CANODO_BENCH`: tries without a running engine.
+
+Traccar side (`ReportUtils.applyCarOdometer`, device attribute
+`odometerSource = odo`): trip odometer and km come only from these readings;
+a missing reading is filled from the neighbouring trip (the car stands between
+trips) or, between two real readings, the km are split over the trips by GPS
+share (`odometerComputed`, marked on the Trips screen only); no reading around
+a trip = empty (`odometerMissing`). `odometerSource = gps` keeps the old
+anchor + GPS × factor calibration.
 
 ## B10. Known open items (as of 2026-09-22, see project memory for detail)
+
+Added 2026-09-29 (found by reading the code, fixes not written yet):
+
+- **Crash 2026-09-28 21:27:30 (panic, coredump):** `TeleClientUDP::inbound()`
+  calls `cell.getBuffer()` while WiFi is up, which allocates the modem's
+  `m_buffer` without `begin()` ever setting `m_device` (0 by default). When
+  WiFi drops for a moment, `inbound()` falls to `cell.receive()` →
+  `CellSIMCOM::sendCommand()`, which only checks `m_buffer`, and calls
+  `m_device->xbWrite()` on a null pointer. The coredump stops exactly there
+  (`sendCommand("AT+CIPRXGET=2,0,1500")` from `CellUDP::receive` from
+  `inbound`) while the WiFi event task was running `WiFi.begin`; the box was on
+  the home WiFi at the time (cellular never started). `cell.send()` has the
+  same exposure.
+- **Record lost across an OTA flash:** both flash paths (`standby()` start and
+  the boot-time staged flash) restart without draining the queue or
+  `txqSave(true)`. On 2026-09-28 the STOP 22:41:03 existed only on SD and never
+  reached the server; the exact sequence (OTA restart, then unplugged) is not
+  proven - to be reproduced on the bench with the serial log.
+- **Watchdog reset 2026-09-28 23:05:36** (reset reason 7, box on a powerbank,
+  ~3 min silent before it): cause unknown, no coredump for this reset type.
 
 - **WiFi pull-OTA real firmware download-and-flash: CONFIRMED WORKING
   END-TO-END 2026-09-23**, live on the real device (ZKUCA42T). Full
