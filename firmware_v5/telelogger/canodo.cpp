@@ -42,6 +42,14 @@ bool canOdoBegin()
   return s_ready;
 }
 
+void canOdoEnd()
+{
+  if (!s_ready) return;
+  s_ready = false;
+  twai_stop();
+  twai_driver_uninstall();
+}
+
 // Back to a usable state after errors (no ACK on the bench, bus-off).
 static void recover()
 {

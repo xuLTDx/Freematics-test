@@ -33,6 +33,7 @@ extern UpdateClass Update;
 #include "teleclient.h"
 #include "txqueue.h"
 #include "canodo.h"
+#include "sniff.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -620,6 +621,7 @@ uint32_t s_lowVoltSinceMs = 0;
 #define PID_CAN_TXFAIL    0x38E   // failed transmissions since boot
 #define PID_CAN_RAW       0x38F   // gateway reply bytes (decimal, ';'-separated)
 #define PID_CAN_LASTID    0x390   // ID of the last frame received
+#define PID_SNIFF_MIN     0x393   // sniff mode: minutes left, 0 = off (sniff.h)
 uint32_t s_odoKm = 0;           // last good reading
 uint32_t s_odoMs = 0;           // millis() of that reading
 uint32_t s_odoTryMs = 0;        // millis() of the last attempt
@@ -2167,7 +2169,7 @@ void initialize()
 
 #if ENABLE_OBD
   // initialize OBD communication (skipped when enableObd=false via NVS key OBD_EN)
-  if (enableObd && !state.check(STATE_OBD_READY)) {
+  if (enableObd && !state.check(STATE_OBD_READY) && !sniffWanted()) {  // sniff: nothing sent on the bus
     timeoutsOBD = 0;
     // Pre-wake: send OBD2 diagnostic requests BEFORE obd.init() so the vehicle ECU
     // is active when init() tries to communicate.  Many vehicles (especially VAG:
@@ -2577,9 +2579,31 @@ void process()
   CBuffer* buffer = bufman.getFree();  // only builds the record; it is queued and freed below
   buffer->state = BUFFER_STATE_FILLING;
 
+  // Sniff mode (sniff.h): owns the CAN controller while on; OBD requests and
+  // odometer reads stop, standby is held off (see the stationary check)
+  {
+    int ev = sniffTick();
+    if (ev == SNIFF_EV_STARTED) state.clear(STATE_OBD_READY);
+#if STORAGE != STORAGE_NONE
+    if (ev && state.check(STATE_STORAGE_READY)) {
+      char diag[48];
+      if (ev == SNIFF_EV_STARTED) snprintf(diag, sizeof(diag), "SNIFF ON file=S%lu min=%u", (unsigned long)sniffFileNo(), (unsigned)sniffMinutesLeft());
+      else snprintf(diag, sizeof(diag), "SNIFF OFF file=S%lu", (unsigned long)sniffFileNo());
+      logger.logEvent(diag);
+    }
+#endif
+    static uint16_t lastMin = 0;
+    uint16_t m = sniffMinutesLeft();
+    if (m != lastMin) {  // minutes left (0 = off), so the server sees the mode
+      lastMin = m;
+      buffer->add(PID_SNIFF_MIN, ELEMENT_UINT16, &m, sizeof(m));
+    }
+  }
+
 #if ENABLE_OBD
-  // process OBD data if connected
-  if (state.check(STATE_OBD_READY)) {
+  // process OBD data if connected (never in sniff mode: nothing is sent on the bus)
+  if (sniffActive()) {
+  } else if (state.check(STATE_OBD_READY)) {
     processOBD(buffer);
     if (obd.errors >= MAX_OBD_ERRORS) {
       if (!obd.init()) {
@@ -2656,9 +2680,9 @@ void process()
   engineTick(buffer);
 #ifdef TEST_CANODO_BENCH
   // bench only: attempts without a running engine, to see the diagnosis reach the server
-  if (millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (!sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
 #else
-  if (s_engineOn && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (s_engineOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
 #endif
   addOdo(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into
@@ -2981,6 +3005,9 @@ void process()
   if (batteryVoltage > 0 && batteryVoltage < 7.0f) {
     stationary = false;
   }
+  // sniff mode: a VCDS session with the engine off must not be cut off
+  // (the mode switches itself off after its minutes, sniff.h)
+  if (sniffActive()) stationary = false;
 
   if (stationary) {
     // stationery timeout
@@ -3702,6 +3729,12 @@ void telemetry(void* inst)
 *******************************************************************************/
 void standby()
 {
+  if (sniffActive()) {  // forced standby (cmd=OFF): the session ends
+    sniffStopNow();
+#if STORAGE != STORAGE_NONE
+    if (state.check(STATE_STORAGE_READY)) logger.logEvent("SNIFF OFF (standby)");
+#endif
+  }
   s_standbyDrained = false;
   state.set(STATE_STANDBY);
 
@@ -5988,7 +6021,7 @@ void setup()
     nvs_commit(nvs);
   }
   txqBegin(s_bootNo);
-  canOdoBegin();
+  if (!sniffInit()) canOdoBegin();  // sniff mode on before the restart: it takes the controller
 
   // Redirect mbedTLS's internal TLS-session buffer allocations to PSRAM
   // before anything below can possibly touch WiFi/TLS (fixes the

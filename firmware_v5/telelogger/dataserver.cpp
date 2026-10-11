@@ -73,6 +73,9 @@ int handlerBleScan(UrlHandlerParam* param);    // telelogger.ino
 int handlerBtPresence(UrlHandlerParam* param); // bt_presence.cpp
 #endif
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
+#include "sniff.h"           // sniff mode: SNIFF=..., /api/sniff
+void sdLock();               // telestore.cpp - SD shared with the logger and sniff.cpp
+void sdUnlock();
 #include "txqueue.h"         // delivery queue: TXQ? status, RESEND=<file>
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
 extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
@@ -755,6 +758,27 @@ int handlerControl(UrlHandlerParam* param)
         }, "wifi_drop", 3072, NULL, 1, NULL);
         n = snprintf(buf, bufsize, "OK");
 #endif
+    } else if (!strncmp(cmd, "SNIFF=", 6)) {  // SNIFF=1[,<min>] | SNIFF=0 (sniff.h)
+        const char* c = strchr(cmd + 6, ',');
+        sniffRequest(cmd[6] == '1', c ? (uint16_t)atoi(c + 1) : 0);
+        n = snprintf(buf, bufsize, "OK");
+    } else if (!strcmp(cmd, "SNIFF?")) {
+        n = sniffStatus(buf, bufsize);
+    } else if (!strncmp(cmd, "SNIFF_SEND=", 11)) {  // <id hex>,<data hex bytes>: one frame on purpose
+        const char* c = strchr(cmd + 11, ',');
+        uint8_t data[8];
+        int len = 0;
+        for (const char* p = c ? c + 1 : ""; *p && len < 8;) {
+            while (*p == ' ') p++;
+            if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) break;
+            char pair[3] = {p[0], p[1], 0};
+            data[len++] = (uint8_t)strtoul(pair, nullptr, 16);
+            p += 2;
+        }
+        if (!c || !len) n = snprintf(buf, bufsize, "ERR need <id>,<data>");
+        else n = sniffSend(strtoul(cmd + 11, nullptr, 16), data, len, buf, bufsize);
+    } else if (!strncmp(cmd, "SNIFF_VEH=", 10)) {
+        n = snprintf(buf, bufsize, sniffSetVehicle(cmd + 10) ? "OK" : "ERR");
     } else {
         n = snprintf(buf, bufsize, "ERR");
     }
@@ -978,6 +1002,84 @@ int handlerWebUI(UrlHandlerParam* param)
     return FLAG_DATA_RAW | FLAG_CUSTOM_HEADER | FLAG_CONN_CLOSE;
 }
 
+// Sniff mode (sniff.h): /api/sniff = status JSON, /api/sniff/live?id=&mask=
+// = the last frames as text, /api/sniff/list = the session files,
+// /api/sniff/<n> = /SNIFF/S<n>.LOG (streamed like /api/log)
+class SniffFileContext {
+public:
+    File file;
+};
+
+int handlerSniff(UrlHandlerParam* param)
+{
+    char *buf = param->pucBuffer;
+    int bufsize = param->bufSize;
+    SniffFileContext* ctx = (SniffFileContext*)param->hs->ptr;
+    if (ctx) {
+        if (!param->pucBuffer) {
+            sdLock();
+            ctx->file.close();
+            sdUnlock();
+            delete ctx;
+            param->hs->ptr = 0;
+            return 0;
+        }
+    } else {
+        const char* r = param->pucRequest;
+        if (*r == '/') r++;
+        if (!*r || *r == '?') {
+            param->contentLength = sniffStatus(buf, bufsize);
+            param->contentType = HTTPFILETYPE_JSON;
+            return FLAG_DATA_RAW;
+        }
+        if (!strncmp(r, "live", 4)) {
+            param->contentLength = sniffLive(buf, bufsize, mwGetVarValueHex(param->pxVars, "id", 0),
+                                             mwGetVarValueHex(param->pxVars, "mask", 0));
+            param->contentType = HTTPFILETYPE_TEXT;
+            return FLAG_DATA_RAW;
+        }
+        if (!strncmp(r, "list", 4)) {
+            int n = snprintf(buf, bufsize, "[");
+            sdLock();
+            File root = SD.open("/SNIFF");
+            File f;
+            while (root && n < bufsize - 64 && (f = root.openNextFile())) {
+                const char* fn = f.name();
+                const char* p = strrchr(fn, '/');
+                if (p) fn = p + 1;
+                if (fn[0] == 'S') n += snprintf(buf + n, bufsize - n, "{\"n\":%u,\"size\":%u},", (unsigned)atoi(fn + 1), (unsigned)f.size());
+                f.close();
+            }
+            sdUnlock();
+            if (buf[n - 1] == ',') n--;
+            n += snprintf(buf + n, bufsize - n, "]");
+            param->contentLength = n;
+            param->contentType = HTTPFILETYPE_JSON;
+            return FLAG_DATA_RAW;
+        }
+        char path[32];
+        snprintf(path, sizeof(path), "/SNIFF/S%u.LOG", (unsigned)atoi(r));
+        ctx = new SniffFileContext;
+        sdLock();
+        ctx->file = SD.open(path, FILE_READ);
+        sdUnlock();
+        if (!ctx->file) {
+            delete ctx;
+            param->contentLength = snprintf(buf, bufsize, "%s not found", path);
+            param->contentType = HTTPFILETYPE_TEXT;
+            return FLAG_DATA_RAW;
+        }
+        param->hs->ptr = (void*)ctx;
+    }
+    sdLock();
+    int n = ctx->file.available() ? ctx->file.readBytes(buf, bufsize) : 0;
+    sdUnlock();
+    if (!n) return 0;  // EOF
+    param->contentLength = n;
+    param->contentType = HTTPFILETYPE_TEXT;
+    return FLAG_DATA_STREAM;
+}
+
 UrlHandler urlHandlerList[]={
     {"", handlerWebUI},  // empty prefix matches only "/" (httpd.c _mwCheckUrlHandlers)
     {"api/live", handlerLiveData},
@@ -994,6 +1096,7 @@ UrlHandler urlHandlerList[]={
     {"api/log", handlerLogFile},
     {"api/events", handlerLogEvents},
     {"api/delete", handlerLogDelete},
+    {"api/sniff", handlerSniff},
 #endif
     {0}
 };

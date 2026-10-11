@@ -49,6 +49,10 @@ struct CanOdoDiag {
 // frames accepted (counted for the diagnosis).
 bool canOdoBegin();
 
+// Releases the controller (sniff mode takes it over, sniff.cpp); canOdoBegin()
+// again afterwards. Reads fail with CANODO_NOT_READY meanwhile.
+void canOdoEnd();
+
 // Odometer: one request/response (ISO-TP, flow control sent by us). Every
 // frame goes out single-shot, so an unanswered frame is not repeated on the
 // bus. Returns true and the km on success; `diag` is filled either way.

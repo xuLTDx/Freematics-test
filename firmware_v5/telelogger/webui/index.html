@@ -8,6 +8,7 @@
 :root{--bg:#eef1f4;--card:#fff;--ink:#1c2530;--mute:#667383;--line:#d5dce3;--acc:#0b6bcb;--ok:#1d8a4e;--warn:#b86e00;--bad:#c23a3a;--chip:#e3e8ee}
 @media (prefers-color-scheme:dark){:root{--bg:#12171d;--card:#1b222b;--ink:#e3e8ee;--mute:#8d9aa9;--line:#2c3642;--acc:#5aa7f2;--ok:#4cc27f;--warn:#e6a23c;--bad:#ef6b6b;--chip:#26303b}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:12px 16px 32px;max-width:900px;margin-inline:auto}
 header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin-bottom:10px}
 h1{font-size:20px;margin:0}
@@ -26,8 +27,9 @@ section{background:var(--card);border-radius:10px;padding:10px 12px;margin-botto
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 td{padding:4px 0;border-bottom:1px solid var(--line)}td:last-child{text-align:right;font-weight:600}td.mute{text-align:left;font-weight:400;border:0}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
-select,button{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink)}
-button{cursor:pointer}button:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+select,button,input{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink)}
+input{width:7em}
+button{cursor:pointer}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 button.danger{color:var(--bad)}
 a.btn{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--ink);text-decoration:none}
 a.btn:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
@@ -66,6 +68,13 @@ pre{margin:0;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;
 <section><h2>BLE v okolí</h2>
  <div class="row"><button id="blet"></button><span class="mute" id="bles"></span></div>
  <div style="overflow-x:auto"><table id="ble"></table></div>
+</section>
+
+<section><h2>Sniff (záznam CAN zbernice)</h2>
+ <div class="row"><button id="snt"></button><select id="snm" aria-label="Ako dlho"><option value="30">30 min</option><option value="60">1 h</option><option value="120" selected>2 h</option><option value="240">4 h</option><option value="480">8 h</option></select><span class="mute" id="sns"></span></div>
+ <div class="row" id="snf" hidden><label>ID <input id="sni" placeholder="napr. 7E0"></label><label>maska <input id="snk" placeholder="napr. 7FF"></label><button id="sna">Filtrovať</button><span class="mute">len zobrazenie, na SD ide všetko</span></div>
+ <pre id="snl" hidden></pre>
+ <div class="row" style="margin-top:8px"><select id="snfile" aria-label="Záznam"></select><a id="sndl" class="btn" href="#">Stiahnuť záznam</a></div>
 </section>
 
 <section><h2>Akcie</h2>
@@ -177,6 +186,31 @@ $('btf').onclick=function(ev){
  }).then(bt);
 };
 bt();setInterval(bt,10000);
+
+var snOn=0,snId='',snMask='';
+function sniff(){
+ return json('/api/sniff').then(function(d){
+  snOn=d.on;$('snt').textContent=d.on?'Vypnúť sniff':'Zapnúť sniff';$('snm').hidden=!!d.on;
+  $('sns').textContent=d.on?'beží, zostáva '+d.min+' min · S'+d.file+(d.sd?'':' (SD nedostupná!)')+' · '+d.speed+' kbit/s'+(d.found?'':' (hľadá rýchlosť)')+' · rámcov '+d.frames+' · stratených '+(d.dropped+d.missed+d.overrun)+' · chýb zbernice '+d.buserr:'vypnutý · vozidlo '+d.vehicle;
+  $('snf').hidden=$('snl').hidden=!d.on;
+  if(d.on)return get('/api/sniff/live?id='+encodeURIComponent(snId)+'&mask='+encodeURIComponent(snMask)).then(function(r){return r.text()}).then(function(t){$('snl').textContent=t.trim()?t.trim().split('\n').reverse().join('\n'):'(zatiaľ žiadne rámce)'});
+ }).catch(function(){});
+}
+function snDl(){var n=$('snfile').value;$('sndl').href=n?'/api/sniff/'+n:'#';$('sndl').download='S'+n+'.LOG'}
+function snFiles(){
+ return json('/api/sniff/list').then(function(l){
+  l.sort(function(a,b){return b.n-a.n});
+  $('snfile').innerHTML=l.length?l.slice(0,40).map(function(f){return '<option value="'+f.n+'">S'+f.n+' · '+kb(f.size)+'</option>'}).join(''):'<option value="">žiadne záznamy</option>';snDl();
+ }).catch(function(){});
+}
+$('snfile').onchange=snDl;
+$('snt').onclick=function(){
+ if(snOn){cmd('SNIFF=0','Sniff sa vypína, záznam sa uzavrie.').then(function(){setTimeout(function(){sniff();snFiles()},4000)});return}
+ if(!confirm('Zapnúť sniff na '+$('snm').selectedOptions[0].text+'? Krabička medzitým nečíta OBD ani tachometer a nezaspí. Po čase sa vypne sama.'))return;
+ cmd('SNIFF=1,'+$('snm').value,'Sniff sa zapína (do pár sekúnd).').then(function(){setTimeout(function(){sniff();snFiles()},4000)});
+};
+$('sna').onclick=function(){snId=$('sni').value.trim();snMask=$('snk').value.trim();sniff()};
+sniff();snFiles();setInterval(sniff,3000);
 
 function loop(){live().then(function(){setTimeout(loop,2000)})}
 info().then(files).then(events).then(loop);

@@ -18,6 +18,7 @@
 #include <FreematicsPlus.h>
 #include "telestore.h"
 #include "teleclient.h"
+#include "sniff.h"
 #include "config.h"
 #include "txqueue.h"
 
@@ -647,6 +648,15 @@ void TeleClientUDP::inbound()
           Serial.println("[UDP] CMD:OTA_READY");
           logNetEvent("NET CMD_OTA_READY");
           httpTriggerOtaCheckNow();
+        }
+        // sniff mode on/off from the server (sniff.h): CMD=SNIFF=1[,<min>] or SNIFF=0
+        if (cmdp && !strncmp(cmdp + 4, "SNIFF=", 6)) {
+          bool on = cmdp[10] == '1';
+          const char* c = strchr(cmdp + 10, ',');
+          uint16_t min = c && c[1] != '*' ? (uint16_t)atoi(c + 1) : 0;
+          sniffRequest(on, min);
+          Serial.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
+          logNetEvent(on ? "NET CMD_SNIFF_ON" : "NET CMD_SNIFF_OFF");
         }
         break;
     }

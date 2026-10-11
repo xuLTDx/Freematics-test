@@ -576,6 +576,39 @@ share (`odometerComputed`, marked on the Trips screen only); no reading around
 a trip = empty (`odometerMissing`). `odometerSource = gps` keeps the old
 anchor + GPS × factor calibration.
 
+## B9b. Sniff mode (2026-10-11, `sniff.cpp`/`sniff.h`) - replaces the HexSniff firmware
+
+The former HexSniff firmware (HexSniff repo, v2) is a mode of the telelogger,
+so the box never has to change firmware to record a scan-tool session.
+
+- **On:** the CAN module (shared with `canodo.cpp`: `canOdoEnd()` /
+  `canOdoBegin()`) runs **listen-only** (never transmits or ACKs), bus speed
+  probed 500/250/125 kbit/s, frames go through a PSRAM queue (8192) and a
+  writer task (under `sdLock()`) to `/SNIFF/S<n>.LOG` in the HexSniff line
+  format, with a header (vehicle, build, boot, `# clock unix=... at_ms=...`)
+  and `# stats` every minute. `n` = above every file already on the card
+  (HexSniff's own S1..S16 are there); **nothing is ever deleted**.
+- **While on, `telelogger.ino`:** no OBD requests (no `processOBD()`, no OBD
+  re-init, `initialize()` skips OBD when `sniffWanted()`), no odometer/fuel
+  reads, **no standby** (stationary forced false), so a VCDS session with the
+  engine off is recorded. GPS, telemetry, OTA keep running. Engine
+  START/STOP then follow the voltage only (no RPM), trips get no odometer.
+  The co-processor is only left idle (not ATLP - it would need a link reset).
+- **Off:** after its minutes (default 120, max 1440; minutes left kept in NVS
+  `SNIFF_MIN`, so it survives a restart), by command, or by a forced standby.
+- **Commands:** `/api/control?cmd=SNIFF=1[,min]|SNIFF=0|SNIFF?|SNIFF_SEND=<id>,<hex>|SNIFF_VEH=<tag>`;
+  from the server (any link, cellular too) `sniff_cmd.py on [min]|off`
+  (Traccar custom command `CMD=SNIFF=...`, handled in `TeleClientUDP::inbound()`).
+- **Server sees it:** PID `0x393` = minutes left (Traccar `io915`), SD events
+  `SNIFF ON file=S<n> min=<m>` / `SNIFF OFF`.
+- **Files:** `/api/sniff` (status JSON), `/api/sniff/live?id=&mask=`,
+  `/api/sniff/list`, `/api/sniff/<n>`; web UI section "Sniff".
+- **Verified 2026-10-11 on the bench (no bus):** on/off over LAN and over
+  Traccar, auto-off after 2 min, S17 created after the existing S16, old files
+  untouched, file closed with `# end`. **Not yet verified:** a real capture
+  in the car (frames, speed detection, 0 lost) and the odometer coming back
+  after `SNIFF=0`.
+
 ## B10. Known open items (as of 2026-09-22, see project memory for detail)
 
 Added 2026-09-29 (found by reading the code, fixes not written yet):
