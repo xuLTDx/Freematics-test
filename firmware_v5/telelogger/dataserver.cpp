@@ -745,6 +745,16 @@ int handlerControl(UrlHandlerParam* param)
         g_txqTestPause = !strcmp(cmd, "TXQPAUSE");
         n = snprintf(buf, bufsize, "OK");
 #endif
+#ifdef TEST_WIFI_DROP
+    } else if (!strcmp(cmd, "WIFI_DROP")) {  // bench: a 5 s WiFi outage, as a router blip (2026-09-28 crash path)
+        xTaskCreate([](void*) {
+            WiFi.disconnect(false);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            WiFi.reconnect();
+            vTaskDelete(NULL);
+        }, "wifi_drop", 3072, NULL, 1, NULL);
+        n = snprintf(buf, bufsize, "OK");
+#endif
     } else {
         n = snprintf(buf, bufsize, "ERR");
     }

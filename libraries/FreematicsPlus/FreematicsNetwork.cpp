@@ -551,6 +551,7 @@ void CellSIMCOM::end()
 bool CellSIMCOM::setup(const char* apn, const char* username, const char* password, unsigned int timeout)
 {
   if (!m_buffer) return false;
+  if (!m_device) return false;
   uint32_t t = millis();
   bool success = false;
 
@@ -847,6 +848,10 @@ String CellSIMCOM::queryIP(const char* host)
 bool CellSIMCOM::sendCommand(const char* cmd, unsigned int timeout, const char* expected)
 {
   if (!m_buffer) return false;
+  if (!m_device) {  // getBuffer() alone allocates m_buffer: a modem never begun has no device (2026-09-28 21:27 crash)
+    m_buffer[0] = 0;  // callers parse m_buffer after a failed command too
+    return false;
+  }
   if (cmd) {
     m_device->xbWrite(cmd);
     delay(10);
@@ -1029,6 +1034,7 @@ bool CellUDP::close()
 
 bool CellUDP::send(const char* data, unsigned int len)
 {
+  if (!m_device) return false;  // modem never begun (begin()/attach() not called): nothing to talk to
   if (m_type == CELL_SIM7070) {
     sendCommand("AT+CASTATE?\r");
     sprintf(m_buffer, "AT+CASEND=0,%u\r", len);
@@ -1099,6 +1105,7 @@ char* CellUDP::receive(int* pbytes, unsigned int timeout)
 
 void CellHTTP::init()
 {
+  if (!m_device) return;  // modem never begun (begin()/attach() not called): nothing to talk to
   if (m_type == CELL_SIM7670) {
     // 2026-09-22: this device's real modem (SIM7670E-LNGV V1.9.05) confirmed
     // live that AT+HTTPINIT/the whole AT+HTTP* family (and even AT+CLAC)
@@ -1295,6 +1302,7 @@ void CellHTTP::init()
 
 bool CellHTTP::open(const char* host, uint16_t port)
 {
+  if (!m_device) return false;  // modem never begun (begin()/attach() not called): nothing to talk to
   if (m_type == CELL_SIM7070) {
     sendCommand("AT+CNACT=0,1\r");
     sendCommand("AT+CACID=0\r");
@@ -1594,6 +1602,7 @@ void CellHTTP::inbound()
 
 bool CellHTTP::send(HTTP_METHOD method, const char* host, uint16_t port, const char* path, const char* payload, int payloadSize, size_t rangeStart)
 {
+  if (!m_device) return false;  // modem never begun (begin()/attach() not called): nothing to talk to
   if (m_type == CELL_SIM7070) {
     if (method == METHOD_POST) {
       sprintf(m_buffer, "AT+SHBOD=%u,1000\r", payloadSize);
@@ -1954,6 +1963,7 @@ static const int AT_CCHRECV_OVERHEAD = 64;
 // subject to xbReceive()'s drop-oldest-line on a full buffer.
 int CellHTTP::cchRecvRaw(char* buf, int maxLen, unsigned int timeout)
 {
+  if (!m_device) return -1;  // modem never begun (begin()/attach() not called): nothing to talk to
   if (maxLen > 2048) maxLen = 2048;  // AT+CCHRECV max_recv_len range 0-2048
   if (maxLen <= 0) return -1;
   char cmd[32];

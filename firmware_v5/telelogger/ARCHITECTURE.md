@@ -590,6 +590,14 @@ Added 2026-09-29 (found by reading the code, fixes not written yet):
   `inbound`) while the WiFi event task was running `WiFi.begin`; the box was on
   the home WiFi at the time (cellular never started). `cell.send()` has the
   same exposure.
+  **FIXED 2026-10-11:** `CellSIMCOM::sendCommand()` (clears `m_buffer`) and
+  every function that calls `m_device->` directly (`setup`, `CellUDP::send`,
+  `CellHTTP::init/open/send/cchRecvRaw`) return failure when `m_device` is 0,
+  so a modem that was never begun is just "no link"; the unsent packet stays
+  in the delivery queue. Bench test: 5 remote WiFi drops (bench-only command
+  `WIFI_DROP`, build flag `-DTEST_WIFI_DROP`, 5 s outage) in one boot, no
+  restart, cellular took over and WiFi came back each time, `lost=0`. Only
+  the first drop had a never-begun modem (the exact crash state).
 - **Record lost across an OTA flash:** both flash paths (`standby()` start and
   the boot-time staged flash) restart without draining the queue or
   `txqSave(true)`. On 2026-09-28 the STOP 22:41:03 existed only on SD and never
