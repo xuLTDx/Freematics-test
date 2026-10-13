@@ -9,11 +9,6 @@ on
 #include <Arduino.h>
 #include "FreematicsBase.h"
 #include "FreematicsNetwork.h"
-// Pulls in ble_pause()/ble_resume()/ble_isPausedTooLong() (and ble_init()
-// etc.) from ble_spp_server_nimble.cpp. Needed here (not just in
-// telelogger.ino) so ClientWIFI::begin()/setup() below can pause/resume BT
-// around each WiFi
-// (re)connection attempt - see the 2026-09-21 comment there.
 #include "FreematicsPlus.h"
 
 // Runtime cellular debug flag – set to 1 via NVS key CELL_DEBUG (written by
@@ -100,25 +95,13 @@ bool ClientWIFI::setup(unsigned int timeout)
 {
   for (uint32_t t = millis(); millis() - t < timeout;) {
     if (WiFi.status() == WL_CONNECTED) {
-      // Connection attempt succeeded - safe to bring BT back now. Order
-      // matters: modem sleep must already be restored BEFORE the BT
-      // controller is re-enabled (see ble_pause() comment in
-      // ble_spp_server_nimble.cpp for why - the coexistence abort fires
-      // specifically when BOTH "BT enabled" and "WiFi modem sleep off" are
-      // true at once). ble_resume() is a no-op
-      // if BT was never paused (e.g. this setup() call is just polling an
-      // already-connected/never-reconnected link), so this is safe to call
-      // unconditionally on every successful poll, not just the first.
+      // connected: modem sleep back on (begin() turned it off for the handshake)
       WiFi.setSleep(true);
-      ble_resume();
       return true;
     }
     delay(50);
   }
-  // Definitively timed out without connecting - resume BT anyway so a WiFi
-  // outage doesn't strand it paused. Same ordering requirement as above.
   WiFi.setSleep(true);
-  ble_resume();
   return false;
 }
 
@@ -130,44 +113,16 @@ String ClientWIFI::getIP()
 bool ClientWIFI::begin(const char* ssid, const char* password)
 {
   //listAPs();
-  // 2026-09-20: tried WiFi.setSleep(false) here to fix WIFI_REASON_
-  // 4WAY_HANDSHAKE_TIMEOUT(15)/NO_AP_FOUND(201) disconnects - reverted the
-  // same day (boot loop under classic Bluedroid BT/WiFi coexistence).
-  // 2026-09-21: retried again with ENABLE_BLE_NIMBLE=1 (NimBLE instead of
-  // Bluedroid) on the theory that NimBLE's coexistence behavior would
-  // differ - it does NOT: still boot-loops, aborting right after HTTPD
-  // starts (same place, different PC than the Bluedroid crash). So this is
-  // not purely a Bluedroid-specific coexistence limitation - something
-  // about WiFi sleep=false + BT-of-any-kind enabled on this ESP-IDF/
-  // arduino-esp32 version is unsupported.
-  // 2026-09-21 (later the same day): root-caused via the actual crash
-  // backtrace - ESP-IDF's WiFi/BT coexistence layer aborts
-  // (coex_core_enable(): "Should enable WiFi modem sleep when both WiFi and
-  // Bluetooth are enabled!!!!!!" -> abort(), called from
-  // esp_bt_controller_enable()) whenever the BT controller is enabled AT
-  // THE SAME TIME WiFi has modem sleep disabled - true regardless of BLE
-  // host stack (Bluedroid and NimBLE both ultimately call the same
-  // esp_bt_controller_enable()). Fix: ble_pause() fully disables the BT
-  // controller before WiFi.setSleep(false) below, and ble_resume() (called
-  // from ClientWIFI::setup() and telelogger.ino's onWifiEvent()/
-  // ARDUINO_EVENT_WIFI_STA_GOT_IP once the connection attempt is over) only
-  // re-enables it AFTER WiFi.setSleep(true) has restored modem sleep - so
-  // "BT enabled" and "WiFi sleep off" are never simultaneously true. See
-  // ble_pause()'s own comment in ble_spp_server_nimble.cpp for the exact
-  // mechanism and how it was verified against the real NimBLE-Arduino
-  // source. Idempotent/safe to call even if BLE was never
-  // started (ENABLE_BLE=0 build, or disabled at runtime via NVS).
-  ble_pause();
+  // Modem sleep off for the connect attempt (handshake timeouts), back on in
+  // setup() / telelogger.ino onWifiEvent(GOT_IP). The 2026-09-21 WiFi/BT
+  // coexistence workaround (ble_pause/ble_resume) went with Bluetooth on
+  // 2026-10-12.
 #ifndef ARDUINO_ESP32C3_DEV
   // Set TX power before begin so the full connection handshake (auth + DHCP)
   // uses this power level. 17 dBm gives reliable range without maximum
   // interference to the co-located cellular radio.
   WiFi.setTxPower(WIFI_POWER_17dBm);
 #endif
-  // Now safe: the BT controller is confirmed off (ble_pause() above), so
-  // enabling this can't collide with a simultaneously-enabled BT controller.
-  // Restored to true (default modem sleep) once the attempt concludes - see
-  // ClientWIFI::setup() below and telelogger.ino's onWifiEvent().
   WiFi.setSleep(false);
   WiFi.begin(ssid, password);
   return true;

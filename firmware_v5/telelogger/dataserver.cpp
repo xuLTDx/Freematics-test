@@ -65,21 +65,18 @@ extern void loadConfig();
 extern bool enableLedRed;  // read here to apply LED state immediately in handlerControl
 extern bool enableObd;         // runtime OBD enable flag (NVS key OBD_EN)
 extern bool enableDeepStandby; // runtime deep-standby flag (NVS key DEEP_STANDBY)
-extern bool enableBleScan;     // BLE crew-detection scan (NVS key BLE_SCAN)
-extern uint8_t btMode;         // NVS BT_MODE: 0 NimBLE, 1 classic presence (after reboot)
-extern char btKnown[160];      // NVS BT_KNOWN: crew phones' classic BT addresses
-#if ENABLE_BLE
-int handlerBleScan(UrlHandlerParam* param);    // telelogger.ino
-int handlerBtPresence(UrlHandlerParam* param); // bt_presence.cpp
-#endif
 extern uint16_t nvsStandbyTimeS; // runtime standby-time override (NVS key STANDBY_TIME, 0=default)
 #include "sniff.h"           // sniff mode: SNIFF=..., /api/sniff
-void sdLock();               // telestore.cpp - SD shared with the logger and sniff.cpp
-void sdUnlock();
+#include "telestore.h"       // sdLock()/sdUnlock(): every SD access here takes it
+#include "sdwriter.h"        // SD? status
+#if STORAGE == STORAGE_SD
+extern SDLogger logger;      // PURGE_DRY=<pct>
+#endif
+void prepareRestart(const char* why);  // telelogger.ino: SD copy + sniff file complete
 #include "txqueue.h"         // delivery queue: TXQ? status, RESEND=<file>
 extern uint16_t getStateBits();  // live snapshot of telelogger.ino's State::m_state, for cmd=STATE?
 extern bool teleLoginState();    // teleClient.login flag, for cmd=STATE?
-// 2026-09-23: mirrors processBLE()'s NET_OP/NET_IP/NET_PACKET/NET_DATA/
+// 2026-09-23: mirrors the former BLE command handler's NET_OP/NET_IP/NET_PACKET/NET_DATA/
 // NET_RATE/RSSI/APN? commands for the web API (cmd=NET_OP etc below).
 extern const char* httpNetOp();
 extern const char* httpNetIp();
@@ -158,8 +155,11 @@ int handlerInfo(UrlHandlerParam* param)
     bytes += snprintf(buf + bytes, bufsize - bytes, "\"spiffs\":{\"total\":%u,\"used\":%u}",
         SPIFFS.totalBytes(), SPIFFS.usedBytes());
 #else
+    sdLock();
+    uint64_t sdTotal = SD.totalBytes(), sdUsed = SD.usedBytes();
+    sdUnlock();
     bytes += snprintf(buf + bytes, bufsize - bytes, "\"sd\":{\"total\":%llu,\"used\":%llu}",
-        SD.totalBytes(), SD.usedBytes());
+        sdTotal, sdUsed);
 #endif
 
     if (bytes < bufsize - 1) buf[bytes++] = '}';
@@ -184,7 +184,9 @@ int handlerLogFile(UrlHandlerParam* param)
     if (ctx) {
 		if (!param->pucBuffer) {
 			// connection to be closed, final calling, cleanup
+			sdLock();
 			ctx->file.close();
+			sdUnlock();
             delete ctx;
 			param->hs->ptr = 0;
 			return 0;
@@ -199,7 +201,9 @@ int handlerLogFile(UrlHandlerParam* param)
 #if STORAGE == STORAGE_SPIFFS
         ctx->file = SPIFFS.open(param->pucBuffer, FILE_READ);
 #else
+        sdLock();
         ctx->file = SD.open(param->pucBuffer, FILE_READ);
+        sdUnlock();
 #endif
         if (!ctx->file) {
             strcat(param->pucBuffer, " not found");
@@ -210,11 +214,14 @@ int handlerLogFile(UrlHandlerParam* param)
         param->hs->ptr = (void*)ctx;
     }
 
-    if (!ctx->file.available()) {
+    sdLock();
+    bool more = ctx->file.available();
+    if (more) param->contentLength = ctx->file.readBytes(param->pucBuffer, param->bufSize);
+    sdUnlock();
+    if (!more) {
         // EOF
         return 0;
     }
-    param->contentLength = ctx->file.readBytes(param->pucBuffer, param->bufSize);
     param->contentType = HTTPFILETYPE_TEXT;
     return FLAG_DATA_STREAM;
 }
@@ -227,7 +234,9 @@ int handlerLogData(UrlHandlerParam* param)
     if (ctx) {
 		if (!param->pucBuffer) {
 			// connection to be closed, final calling, cleanup
+			sdLock();
 			ctx->file.close();
+			sdUnlock();
             delete ctx;
 			param->hs->ptr = 0;
 			return 0;
@@ -242,7 +251,9 @@ int handlerLogData(UrlHandlerParam* param)
 #if STORAGE == STORAGE_SPIFFS
         ctx->file = SPIFFS.open(param->pucBuffer, FILE_READ);
 #else
+        sdLock();
         ctx->file = SD.open(param->pucBuffer, FILE_READ);
+        sdUnlock();
 #endif
         if (!ctx->file) {
             param->contentLength = sprintf(param->pucBuffer, "{\"error\":\"Data file not found\"}");
@@ -266,11 +277,13 @@ int handlerLogData(UrlHandlerParam* param)
     char buf[64];
     uint32_t ts = 0;
 
+    sdLock();  // released at both exits of the loop below
     for (;;) {
         int c = ctx->file.read();
         if (c == -1) {
             if (param->contentLength == 0) {
                 // EOF
+                sdUnlock();
                 return 0;
             }
             // JSON tail
@@ -303,6 +316,7 @@ int handlerLogData(UrlHandlerParam* param)
             buf[len++] = c;
         }
     }
+    sdUnlock();
     return FLAG_DATA_STREAM;
 }
 
@@ -314,6 +328,7 @@ int handlerLogList(UrlHandlerParam* param)
 #if STORAGE == STORAGE_SPIFFS
     File root = SPIFFS.open("/");
 #elif STORAGE == STORAGE_SD
+    sdLock();  // released after the listing
     File root = SD.open("/DATA");
 #endif
     int n = snprintf(buf, bufsize, "[");
@@ -353,6 +368,10 @@ int handlerLogList(UrlHandlerParam* param)
         }
         if (n > 0 && buf[n - 1] == ',') n--;
     }
+#if STORAGE == STORAGE_SD
+    if (root) root.close();
+    sdUnlock();
+#endif
     n += snprintf(buf + n, bufsize - n, "]");
     param->contentType=HTTPFILETYPE_JSON;
     param->contentLength = n;
@@ -387,9 +406,11 @@ int handlerLogEvents(UrlHandlerParam* param)
 #if STORAGE == STORAGE_SPIFFS
     File file = SPIFFS.open(path, FILE_READ);
 #else
+    sdLock();  // released after the file is read
     File file = SD.open(path, FILE_READ);
 #endif
     if (!file) {
+        sdUnlock();
         param->contentLength = snprintf(param->pucBuffer, param->bufSize, "%s not found", path);
         param->contentType = HTTPFILETYPE_TEXT;
         return FLAG_DATA_RAW;
@@ -442,6 +463,7 @@ int handlerLogEvents(UrlHandlerParam* param)
         }
     }
     file.close();
+    sdUnlock();
 
     param->contentLength = n;
     param->contentType = HTTPFILETYPE_TEXT;
@@ -455,13 +477,18 @@ int handlerLogDelete(UrlHandlerParam* param)
         id = atoi(param->pucRequest + 1);
     }
     sprintf(param->pucBuffer, "/DATA/%u.CSV", id);
+    uint32_t needed = txqOldestFileNeeded();
     if (id == fileid) {
         strcat(param->pucBuffer, " still active");
+    } else if (needed && (uint32_t)id >= needed) {
+        strcat(param->pucBuffer, " still to be sent (delivery queue)");
     } else {
 #if STORAGE == STORAGE_SPIFFS
         bool removal = SPIFFS.remove(param->pucBuffer);
 #else
+        sdLock();
         bool removal = SD.remove(param->pucBuffer);
+        sdUnlock();
 #endif
         if (removal) {
             strcat(param->pucBuffer, " deleted");
@@ -555,6 +582,7 @@ int handlerControl(UrlHandlerParam* param)
         n = snprintf(buf, bufsize, "OK");
         param->contentLength = n;
         param->contentType = HTTPFILETYPE_TEXT;
+        prepareRestart("HTTP_RESET");
         ESP.restart();
     } else if (!strcmp(cmd, "OFF")) {
         // Pause telemetry: signal the net task to enter standby so WiFi
@@ -642,32 +670,6 @@ int handlerControl(UrlHandlerParam* param)
             nvs_set_u16(nvs, "STANDBY_TIME", v) == ESP_OK
             && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
         loadConfig();
-    } else if (!strcmp(cmd, "BT_MODE?")) {
-        n = snprintf(buf, bufsize, "%u", (unsigned)btMode);
-    } else if (!strncmp(cmd, "BT_MODE=", 8)) {
-        // 0 = NimBLE, 1 = classic-BT phone presence. Applies after RESET.
-        uint8_t v = atoi(cmd + 8) == 1 ? 1 : 0;
-        n = snprintf(buf, bufsize, "%s",
-            nvs_set_u8(nvs, "BT_MODE", v) == ESP_OK
-            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-    } else if (!strcmp(cmd, "BT_KNOWN?")) {
-        n = snprintf(buf, bufsize, "%s", btKnown[0] ? btKnown : "-");
-    } else if (!strncmp(cmd, "BT_KNOWN=", 9)) {
-        // crew phones' classic Bluetooth addresses, "AA:BB:CC:DD:EE:FF,..."; "-" clears
-        const char* p = cmd + 9;
-        n = snprintf(buf, bufsize, "%s",
-            nvs_set_str(nvs, "BT_KNOWN", strcmp(p, "-") ? p : "") == ESP_OK
-            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-        loadConfig();
-    } else if (!strcmp(cmd, "BLE_SCAN?")) {
-        n = snprintf(buf, bufsize, "%u", (unsigned)enableBleScan);
-    } else if (!strncmp(cmd, "BLE_SCAN=", 9)) {
-        // BLE scan bursts for crew detection (NVS key BLE_SCAN, u8, 0/1).
-        uint8_t v = atoi(cmd + 9) ? 1 : 0;
-        n = snprintf(buf, bufsize, "%s",
-            nvs_set_u8(nvs, "BLE_SCAN", v) == ESP_OK
-            && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-        loadConfig();
     } else if (!strncmp(cmd, "DEEP_STANDBY=", 13)) {
         // Enable or disable deep-standby mode (NVS key DEEP_STANDBY, u8).
         // 1 = use ESP32 deep sleep during standby, 0 = normal standby.
@@ -736,6 +738,30 @@ int handlerControl(UrlHandlerParam* param)
     } else if (!strcmp(cmd, "TXQ?")) {
         txqStatus(buf, bufsize);
         n = strlen(buf);
+    } else if (!strcmp(cmd, "SD?")) {   // the SD writer: errors, lost bytes, pending, dead
+        n = sdwStatus(buf, bufsize);
+#if STORAGE == STORAGE_SD
+    } else if (!strncmp(cmd, "PURGE_DRY=", 10)) {  // which /DATA files a purge at <pct> % would delete (none deleted)
+        bool any = logger.purgeOldFiles(txqOldestFileNeeded(), atoi(cmd + 10), true, buf, bufsize);
+        n = strlen(buf);
+        if (!any && !n) n = snprintf(buf, bufsize, "below %d %% - nothing", atoi(cmd + 10));
+    } else if (!strcmp(cmd, "SNIFF_PURGE")) {  // sniff files older than SNIFF_KEEP_DAYS, now
+        n = snprintf(buf, bufsize, "removed %d", sniffPurgeOld(time(nullptr)));
+#endif
+#ifdef TEST_SD_FAULT
+    } else if (!strncmp(cmd, "SD_FAULT=", 9)) {  // bench: every n-th SD write fails half-way (0 = off)
+        sdwTestFault(strtoul(cmd + 9, nullptr, 10));
+        n = snprintf(buf, bufsize, "OK");
+#endif
+#ifdef TEST_SNIFF_LOAD
+    } else if (!strncmp(cmd, "SNIFF_CHECK", 11)) {  // SNIFF_CHECK=<n> start, SNIFF_CHECK? result
+        n = sniffCheck(cmd[11] == '=' ? strtoul(cmd + 12, nullptr, 10) : 0, buf, bufsize);
+    } else if (!strncmp(cmd, "SNIFF_FAKEOLD=", 14)) {  // a sniff file dated <days> back
+        n = sniffFakeOld(strtoul(cmd + 14, nullptr, 10), buf, bufsize);
+    } else if (!strncmp(cmd, "SNIFF_LIMIT=", 12)) {  // the start limit, % of the card
+        sniffSetSdLimit(atoi(cmd + 12));
+        n = snprintf(buf, bufsize, "OK");
+#endif
 #ifdef TEST_TXQ
     } else if (!strcmp(cmd, "TXQLOSE")) {   // bench: power-loss path, restarts
         txqTestLoseReserve();
@@ -777,6 +803,13 @@ int handlerControl(UrlHandlerParam* param)
         }
         if (!c || !len) n = snprintf(buf, bufsize, "ERR need <id>,<data>");
         else n = sniffSend(strtoul(cmd + 11, nullptr, 16), data, len, buf, bufsize);
+    } else if (!strcmp(cmd, "VW_ODO?")) {
+        uint8_t v = 0;
+        nvs_get_u8(nvs, "VW_ODO", &v);
+        n = snprintf(buf, bufsize, "%u", (unsigned)v);
+    } else if (!strncmp(cmd, "VW_ODO=", 7)) {  // 1 = odometer/fuel UDS reads (VW Passat only), applied within a cycle
+        n = snprintf(buf, bufsize, "%s",
+            nvs_set_u8(nvs, "VW_ODO", cmd[7] == '1' ? 1 : 0) == ESP_OK && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
     } else if (!strncmp(cmd, "SNIFF_VEH=", 10)) {
         n = snprintf(buf, bufsize, sniffSetVehicle(cmd + 10) ? "OK" : "ERR");
     } else {
@@ -983,6 +1016,7 @@ int handlerOTA(UrlHandlerParam* param) {
         // the first reboot fired) before re-arming.
         esp_timer_stop(s_ota_timer);
     }
+    prepareRestart("HTTP_OTA");
     esp_timer_start_once(s_ota_timer, 1500000); // 1.5 s in microseconds
 
     strcpy(buf, "OK");
@@ -1008,7 +1042,29 @@ int handlerWebUI(UrlHandlerParam* param)
 class SniffFileContext {
 public:
     File file;
+    uint32_t toMs = 0;        // ?to=<ms>: stop after the frames up to this time (0 = to the end)
+    uint32_t dataPos = 0;     // ?from=<ms>: where the frames start (after the header was sent)
+    bool headerSent = true;
+    bool done = false;
 };
+
+// ms of the first frame line at or after pos (header/stats lines skipped);
+// *at = where that line starts. 0xFFFFFFFF = none.
+static uint32_t sniffMsAt(File& f, uint32_t pos, uint32_t* at)
+{
+    char line[96];
+    f.seek(pos);
+    if (pos) f.readBytesUntil('\n', line, sizeof(line));  // to the start of the next line
+    for (;;) {
+        uint32_t p = f.position();
+        int n = f.available() ? f.readBytesUntil('\n', line, sizeof(line) - 1) : -1;
+        if (n < 0) return 0xFFFFFFFF;
+        if (n == 0 || line[0] == '#') continue;
+        line[n] = 0;
+        *at = p;
+        return strtoul(line, nullptr, 10);
+    }
+}
 
 int handlerSniff(UrlHandlerParam* param)
 {
@@ -1070,9 +1126,64 @@ int handlerSniff(UrlHandlerParam* param)
             return FLAG_DATA_RAW;
         }
         param->hs->ptr = (void*)ctx;
+        // ?from=&to= (ms since boot, the first column): only that part of the
+        // session, after the file's header lines - a whole session is tens of
+        // MB and the box serves ~4-14 kB/s (2026-10-12)
+        uint32_t fromMs = mwGetVarValueInt(param->pxVars, "from", 0);
+        ctx->toMs = mwGetVarValueInt(param->pxVars, "to", 0);
+        if (fromMs) {
+            sdLock();
+            uint32_t lo = 0, hi = ctx->file.size(), at = 0;
+            while (hi - lo > 2048) {  // the frames are in time order: binary search
+                uint32_t mid = lo + (hi - lo) / 2;
+                uint32_t ms = sniffMsAt(ctx->file, mid, &at);
+                if (ms < fromMs) lo = mid; else hi = mid;
+            }
+            // from lo forward to the first frame at or after fromMs
+            uint32_t ms = sniffMsAt(ctx->file, lo, &at);
+            while (ms != 0xFFFFFFFF && ms < fromMs) {
+                uint32_t next = 0;
+                ms = sniffMsAt(ctx->file, at + 1, &next);
+                at = next;
+            }
+            ctx->dataPos = ms == 0xFFFFFFFF ? ctx->file.size() : at;
+            ctx->file.seek(0);
+            sdUnlock();
+            ctx->headerSent = false;
+        }
     }
+    if (ctx->done) return 0;
     sdLock();
-    int n = ctx->file.available() ? ctx->file.readBytes(buf, bufsize) : 0;
+    int n = 0;
+    if (!ctx->headerSent) {
+        // the header lines at the top of the file (vehicle, clock mapping, format)
+        char line[200];
+        while (ctx->file.available() && n < bufsize - (int)sizeof(line)) {
+            int l = ctx->file.readBytesUntil('\n', line, sizeof(line) - 1);
+            if (l <= 0 || line[0] != '#') break;
+            memcpy(buf + n, line, l);
+            n += l;
+            buf[n++] = '\n';
+        }
+        ctx->headerSent = true;
+        ctx->file.seek(ctx->dataPos);
+    } else if (ctx->file.available()) {
+        n = ctx->file.readBytes(buf, bufsize);
+        if (ctx->toMs && n > 0) {
+            // whole lines only (the rest is read again next time), and stop at
+            // the first frame after toMs
+            int end = n;
+            while (end > 0 && buf[end - 1] != '\n') end--;
+            if (end > 0 && end < n) ctx->file.seek(ctx->file.position() - (n - end));
+            if (end > 0) n = end;
+            for (int i = 0; i < n;) {
+                if (buf[i] != '#' && strtoul(buf + i, nullptr, 10) > ctx->toMs) { n = i; ctx->done = true; break; }
+                char* nl = (char*)memchr(buf + i, '\n', n - i);
+                if (!nl) break;
+                i = nl - buf + 1;
+            }
+        }
+    }
     sdUnlock();
     if (!n) return 0;  // EOF
     param->contentLength = n;
@@ -1083,10 +1194,6 @@ int handlerSniff(UrlHandlerParam* param)
 UrlHandler urlHandlerList[]={
     {"", handlerWebUI},  // empty prefix matches only "/" (httpd.c _mwCheckUrlHandlers)
     {"api/live", handlerLiveData},
-#if ENABLE_BLE
-    {"api/ble", handlerBleScan},
-    {"api/bt", handlerBtPresence},
-#endif
     {"api/info", handlerInfo},
     {"api/control", handlerControl},
     {"api/ota", handlerOTA},

@@ -14,6 +14,10 @@
 // records are cut to time code, position, speed and heading; from 80 % they
 // are also thinned to one per 10 s (engine start/stop records never thinned).
 // Without PSRAM a small internal-RAM queue is used instead.
+// 2026-10-12: a record counts as having an SD copy only once the SD writer
+// confirmed it (sdwriter.cpp, txqSdConfirmed); a record dropped without one is
+// counted in lost=. Standby records (SD off) are also kept in the internal
+// flash (SPIFFS) until confirmed, so they survive a power loss.
 #pragma once
 #include <Arduino.h>
 
@@ -37,6 +41,14 @@ void txqBegin(uint32_t bootId);      // after NVS is open: check what survived
 void txqSetFile(uint32_t fileId);    // the SD file new records are written to (0 = none)
 // rec = "0:<ts>,<pid>:<value>,..." as it goes on the wire, without devid/checksum
 bool txqPush(uint32_t ts, const char* rec, int len);
+// standby = also kept in the internal flash until the server confirms it
+// (survives a power loss; the SD card is off in standby)
+bool txqPushEx(uint32_t ts, const char* rec, int len, bool standby);
+void txqSdConfirmed(const uint32_t* ts, int n);  // SD writer: these records are on the card
+uint32_t txqOldestFileNeeded();      // oldest /DATA file still needed for SD replay (0 = none)
+// bench diagnostics (TEST_TXQ builds): queue decisions as SD event lines
+void txqSetEventSink(void (*sink)(const char*));
+void txqBootReport();                // after the sink is set: what the boot found
 int txqNextPacket(char* out, int cap, const char* devid);  // 0 = nothing to send now
 void txqSendFailed();                // the last packet from txqNextPacket() did not go out
 void txqOnAck(uint32_t packetNo);

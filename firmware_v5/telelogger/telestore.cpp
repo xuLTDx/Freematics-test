@@ -1,5 +1,6 @@
 #include <FreematicsPlus.h>
 #include "telestore.h"
+#include "sdwriter.h"
 
 void CStorage::log(uint16_t pid, uint8_t values[], uint8_t count)
 {
@@ -179,9 +180,9 @@ void FileLogger::logEvent(const char* text)
     // Prefix with PID 0xFE so the line is properly formatted for CSV yet
     // never matched by normal data queries (handlerLogData skips unknown PIDs).
     // The raw /api/log file view shows the full human-readable text.
-    // 160 bytes = 4 ("FE,") + up to 155 chars of text + NUL; callers format
-    // their message into diag[128] so the combined length is always ≤ 132.
-    char buf[160];
+    // "FE," + up to 245 chars of text (the delivery queue's status line is
+    // ~200); longer text is not written at all.
+    char buf[250];  // byte length: dispatch() takes at most 255
     int n = snprintf(buf, sizeof(buf), "FE,%s", text);
     if (n > 0 && n < (int)sizeof(buf)) {
         dispatch(buf, (byte)n);
@@ -233,15 +234,18 @@ bool SDLogger::init()
     lock();
     unlock();
     SPI.begin();
-    bool ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ);
+    // 10 open files (default 5): the SD writer's telemetry + sniff file,
+    // downloads over HTTP, SD replay and OTA can be open at the same time
+    bool ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ, SDW_MOUNT, 10);
     uint32_t gap = 200;
     for (int attempt = 1; !ok && attempt <= 6; attempt++, gap *= 2) {
         Serial.printf("SD:init failed, recovery attempt %d\n", attempt);
         SD.end();
         sdUnstick();
         delay(gap > 3200 ? 3200 : gap);
-        ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ);
+        ok = SD.begin(PIN_SD_CS, SPI, SPI_FREQ, SDW_MOUNT, 10);
     }
+    if (ok) sdwStart();
     if (ok) {
         unsigned int total = SD.totalBytes() >> 20;
         unsigned int used = SD.usedBytes() >> 20;
@@ -261,6 +265,7 @@ uint32_t SDLogger::begin(uint32_t lastId)
 {
     lock();
     char path[24];
+    if (!SD.exists("/DATA")) SD.mkdir("/DATA");
     if (lastId) {
         // 2026-09-27: listing /DATA (900+ files) took 14.4 s of every boot,
         // all of it before the first record. The caller remembers the last
@@ -274,64 +279,66 @@ uint32_t SDLogger::begin(uint32_t lastId)
     } else {
         File root = SD.open("/DATA");
         m_id = getFileID(root);
-        if (m_id == 0) {
-            SD.mkdir("/DATA");
-            m_id = 1;
-        }
+        if (m_id == 0) m_id = 1;
     }
+    unlock();  // the SD writer takes the SD lock itself
     sprintf(path, "/DATA/%u.CSV", m_id);
     Serial.print("File: ");
     Serial.println(path);
-    m_file = SD.open(path, FILE_WRITE);
-    if (!m_file) {
+    if (!sdwDataOpen(path)) {
         Serial.println("File error");
         m_id = 0;
     }
+    m_size = 0;
     m_dataCount = 0;
-    unlock();
     return m_id;
 }
 
-// FAT only records the file size on close, hence close + reopen
-bool SDLogger::reopen()
+// a line into the SD writer's ring (it adds nothing on its own: the "\n"
+// is ours); the writer confirms it with write + fsync
+void SDLogger::dispatch(const char* buf, byte len)
 {
-    if (m_id == 0) return false;
-    char path[24];
-    sprintf(path, "/DATA/%u.CSV", m_id);
-    m_file.close();
-    m_file = SD.open(path, FILE_APPEND);
-    if (!m_file) {
-        Serial.println("File error");
-        return false;
-    }
-    return true;
+    if (m_id == 0) return;
+    char line[258];
+    memcpy(line, buf, len);
+    line[len] = '\n';
+    sdwDataWrite(line, len + 1);
+    m_size += len + 1;
 }
 
-void SDLogger::flush()
+bool SDLogger::reopen() { return m_id != 0; }  // the writer reopens on its own
+
+void SDLogger::flush() { sdwKick(); }
+
+bool SDLogger::sync(uint32_t timeoutMs) { return m_id == 0 || sdwDataSync(timeoutMs); }
+
+void SDLogger::end()
 {
-    lock();
-    reopen();
-    unlock();
+    if (m_id) sdwDataClose(5000);
+    m_id = 0;
+    m_size = 0;
 }
 
-bool SDLogger::purgeOldFiles()
+bool SDLogger::purgeOldFiles(uint32_t keepFrom, int pct, bool dryRun, char* report, int reportCap)
 {
-    // Check if cleanup is needed: only purge when SD is >= 80% full.
+    // Check if cleanup is needed: only purge when SD is >= pct % full.
+    sdLock();
     uint64_t total = SD.totalBytes();
-    if (total == 0) return false;
-    uint64_t used = SD.usedBytes();
-    // free < 20% of total → trigger purge
-    if (total - used >= total / 5) return false;  // still >= 20% free
+    uint64_t used = total ? SD.usedBytes() : 0;
+    if (total == 0 || used * 100 < total * (uint64_t)pct) { sdUnlock(); return false; }
+    uint64_t needFree = total / 5;  // until 20 % is free
+    uint64_t freeNow = total - used;
 
     // Build a sorted list of file IDs under /DATA (ascending = oldest first).
     // We collect up to 512 IDs to avoid dynamic allocation; in practice the
     // directory never has that many files before space is exhausted.
     static const int MAX_IDS = 512;
-    uint32_t ids[MAX_IDS];
+    static uint32_t ids[MAX_IDS];
+    static uint32_t sizes[MAX_IDS];
     int count = 0;
 
     File root = SD.open("/DATA");
-    if (!root) return false;
+    if (!root) { sdUnlock(); return false; }
     File file;
     while ((file = root.openNextFile()) && count < MAX_IDS) {
         const char* name = file.name();
@@ -339,53 +346,44 @@ bool SDLogger::purgeOldFiles()
         const char* slash = strrchr(name, '/');
         const char* base = slash ? slash + 1 : name;
         unsigned int n = (unsigned int)atoi(base);
-        if (n != 0) ids[count++] = n;
+        if (n != 0) { ids[count] = n; sizes[count] = file.size(); count++; }
         file.close();
     }
     root.close();
 
-    if (count == 0) return false;
+    if (count == 0) { sdUnlock(); return false; }
 
-    // Sort ascending (insertion sort — small count, runs on MCU).
+    // Sort ascending (insertion sort - small count, runs on MCU).
     for (int i = 1; i < count; i++) {
-        uint32_t key = ids[i];
+        uint32_t key = ids[i], sz = sizes[i];
         int j = i - 1;
-        while (j >= 0 && ids[j] > key) { ids[j + 1] = ids[j]; j--; }
+        while (j >= 0 && ids[j] > key) { ids[j + 1] = ids[j]; sizes[j + 1] = sizes[j]; j--; }
         ids[j + 1] = key;
+        sizes[j + 1] = sz;
     }
 
-    // Close the active log file once before the deletion loop so the SPI bus
-    // is not interleaved between remove() calls and file re-opens.  We reopen
-    // it once after all deletions are done.
-    bool wasOpen = (m_id != 0);
-    if (wasOpen) m_file.close();
-
-    // Delete the oldest 20% of files (at least 1), skipping the active file.
+    // Delete the oldest 20% of files (at least 1) that nothing needs any more.
     int toDelete = count / 5;
     if (toDelete < 1) toDelete = 1;
     bool any = false;
     char path[24];
+    int rn = 0;
+    if (report && reportCap) rn = snprintf(report, reportCap, "used=%u%% keepFrom=%u %s:",
+        (unsigned)(used * 100 / total), (unsigned)keepFrom, dryRun ? "would delete" : "deleted");
     for (int i = 0; i < count && toDelete > 0; i++) {
-        if (ids[i] == m_id) continue;  // never delete the currently open file
+        if (ids[i] == m_id) continue;                 // never the file being written
+        if (keepFrom && ids[i] >= keepFrom) break;     // still to be sent: never
         sprintf(path, "/DATA/%u.CSV", ids[i]);
-        if (SD.remove(path)) {
-            Serial.print("[SD] Purged ");
-            Serial.println(path);
+        if (dryRun || SD.remove(path)) {
+            Serial.printf("[SD] %s %s\n", dryRun ? "Would purge" : "Purged", path);
+            if (report && rn < reportCap - 12) rn += snprintf(report + rn, reportCap - rn, " %u", (unsigned)ids[i]);
             any = true;
             toDelete--;
+            freeNow += sizes[i];
         }
-        // Re-check free space — stop early if we freed enough.
-        uint64_t t2 = SD.totalBytes();
-        uint64_t u2 = SD.usedBytes();
-        if (t2 > 0 && t2 - u2 >= t2 / 5) break;
+        if (freeNow >= needFree) break;  // freed enough
     }
-
-    // Reopen the active log file now that all deletions are complete.
-    if (wasOpen) {
-        sprintf(path, "/DATA/%u.CSV", m_id);
-        m_file = SD.open(path, FILE_APPEND);
-        if (!m_file) m_id = 0;
-    }
+    sdUnlock();
     return any;
 }
 

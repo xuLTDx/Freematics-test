@@ -34,6 +34,7 @@ extern UpdateClass Update;
 #include "txqueue.h"
 #include "canodo.h"
 #include "sniff.h"
+#include "sdwriter.h"
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -267,32 +268,9 @@ static int32_t wifiDisconnectCount = 0;
 // Defined later (near wifiScanAndLog(), after `logger`/`state` exist).
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
-// Safety-net ceiling for ble_pause()/ble_resume() (see FreematicsNetwork.cpp's
-// ClientWIFI::begin()/setup() and ble_spp_server_nimble.cpp's ble_pause()
-// comment for the full WiFi/BT coexistence story). Normally
-// ble_resume() fires within WIFI_JOIN_TIMEOUT (15s) via either
-// ARDUINO_EVENT_WIFI_STA_GOT_IP below or ClientWIFI::setup()'s own
-// success/timeout paths - this is only a backstop for the one wifiConnect()
-// call site (the periodic RSSI-check block further down) that does not call
-// teleClient.wifi.setup() right after wifiConnect(), so BT can't be left
-// paused indefinitely if that path's connection attempt never resolves one
-// way or the other. Generous margin over WIFI_JOIN_TIMEOUT on purpose - this
-// is a last resort, not the normal resume path.
-#define BLE_PAUSE_MAX_MS 30000
-
 void wifiConnect()
 {
 #if ENABLE_WIFI
-  // Backstop: force BT back on if a previous pause somehow never got
-  // resumed. WiFi.setSleep(true) MUST happen before ble_resume() (same
-  // ordering requirement as every other resume call site - see
-  // ClientWIFI::begin()'s comment) so the WiFi/BT coexistence abort can't
-  // recur here either.
-  if (ble_isPausedTooLong(BLE_PAUSE_MAX_MS)) {
-    Serial.println("[WIFI] BLE pause exceeded safety timeout - forcing resume");
-    WiFi.setSleep(true);
-    ble_resume();
-  }
 #endif
   static bool scanned = false;
   if (!scanned) {
@@ -358,11 +336,6 @@ char cellWebhookPath[256] = "";
 // provisioning.  Can be overridden by NVS key ENABLE_HTTPD written by the HA
 // integration config_nvs.bin.  Only takes effect when compiled with ENABLE_HTTPD=1.
 uint8_t enableHttpd = ENABLE_HTTPD;
-// Runtime BLE enable Ã¢â‚¬â€œ set to 0 via NVS key ENABLE_BLE to disable the BLE
-// SPP server and free ~100 KB heap for the TLS webhook client.  Defaults to
-// 1 (on) so devices that were never provisioned keep the previous behaviour.
-// Only takes effect when the firmware is compiled with ENABLE_BLE=1.
-uint8_t enableBle = 1;
 nvs_handle_t nvs;
 // NVS settings version string (NVS_VER key): written by the HA integration
 // when generating the NVS partition so the firmware can report which settings
@@ -612,7 +585,7 @@ uint32_t s_lowVoltSinceMs = 0;
 // Diagnosis of every read attempt, sent with the next record (canodo.h):
 #define PID_CAN_RESULT    0x386   // CanOdoResult (0 = OK)
 #define PID_CAN_NRC       0x387   // gateway negative response code
-#define PID_CAN_STATE     0x388   // controller state (1 = running)
+#define PID_CANODO_STATE  0x388   // controller state (1 = running)
 #define PID_CAN_FRAMES    0x389   // frames received since boot, any ID
 #define PID_CAN_FRAMES77A 0x38A   // frames from the gateway (0x77A) since boot
 #define PID_CAN_TXERR     0x38B   // TX error counter
@@ -631,6 +604,26 @@ CanOdoDiag s_odoDiagSent;       // the last one reported (report again only on c
 uint8_t s_fuelRaw[56];
 size_t s_fuelLen = 0;
 bool s_fuelNew = false;
+// VW_ODO (NVS u8, default 0 = off, 2026-10-12): the odometer/fuel reads send
+// UDS to the VW gateway 0x710 / cluster 0x714 - verified only in the Passat B8.
+// Off = the CAN controller is not even started, so nothing goes on the bus of
+// another car (in the Peugeot on 2026-10-12 the box would have sent them after
+// SNIFF=0). Set with /api/control?cmd=VW_ODO=1|0, applied by vwOdoTick().
+static bool s_vwOdoOn = false;      // controller started for the reads
+static uint32_t s_sniffEndMs = 0;   // engine STOP grace after sniff mode (engineTick)
+static bool vwOdoWanted()
+{
+  uint8_t v = 0;
+  nvs_get_u8(nvs, "VW_ODO", &v);
+  return v == 1;
+}
+static void vwOdoTick()
+{
+  if (sniffActive()) return;  // sniff owns the controller
+  bool want = vwOdoWanted();
+  if (want && !s_vwOdoOn) s_vwOdoOn = canOdoBegin();
+  else if (!want && s_vwOdoOn) { canOdoEnd(); s_vwOdoOn = false; }
+}
 
 static bool odoRead()
 {
@@ -691,7 +684,7 @@ static void addOdo(CBuffer* b)
     CanOdoDiag& d = s_odoDiag;   // add() takes non-const pointers
     b->add(PID_CAN_RESULT, ELEMENT_UINT8, &d.result, sizeof(d.result));
     b->add(PID_CAN_NRC, ELEMENT_UINT8, &d.nrc, sizeof(d.nrc));
-    b->add(PID_CAN_STATE, ELEMENT_UINT8, &d.state, sizeof(d.state));
+    b->add(PID_CANODO_STATE, ELEMENT_UINT8, &d.state, sizeof(d.state));
     b->add(PID_CAN_FRAMES, ELEMENT_UINT32, &d.framesAll, sizeof(d.framesAll));
     b->add(PID_CAN_FRAMES77A, ELEMENT_UINT32, &d.frames77A, sizeof(d.frames77A));
     b->add(PID_CAN_TXERR, ELEMENT_UINT32, &d.txErr, sizeof(d.txErr));
@@ -740,18 +733,6 @@ bool enableObd = true;   // OBD-II PID polling (compile-time ENABLE_OBD must als
 // standby instead of the normal active-wait loop.  Loaded from NVS key
 // DEEP_STANDBY (u8, 0=off 1=on).  Defaults to false.
 bool enableDeepStandby = false;
-// BLE scan bursts for crew (phone) detection - NVS key BLE_SCAN, default off.
-bool enableBleScan = false;
-// Bluetooth mode (NVS key BT_MODE): 0 = NimBLE (GATT server for the phone
-// app + optional BLE scan), 1 = classic-BT phone presence (bt_presence.cpp,
-// no NimBLE). Takes effect after a reboot. BT_KNOWN: comma-separated classic
-// Bluetooth addresses of the crew's phones.
-uint8_t btMode = 0;
-char btKnown[160] = {0};
-#if ENABLE_BLE
-bool bt_presence_start(bool (*active)());
-void bt_presence_set_known(const char* list);
-#endif
 
 // Vehicle identification loaded from NVS (VEHICLE_MAKE, VEHICLE_MODEL, VEHICLE_YEAR).
 // Stored for informational purposes and future vehicle-specific PID selection.
@@ -923,7 +904,7 @@ static uint8_t s_otaChunkBuf[PULL_OTA_CHUNK_SIZE];
 // updating a running SHA256 context per chunk. Returns total bytes written -
 // equal to expectedSize only on full success; the caller compares the two
 // the same way the existing WiFi loops already do.
-static size_t cellDownloadBody(File& file, size_t expectedSize, mbedtls_sha256_context* sha256Ctx)
+static size_t cellDownloadBody(LockedFile& file, size_t expectedSize, mbedtls_sha256_context* sha256Ctx)
 {
   size_t written = 0;
   size_t sinceFlush = 0;
@@ -950,7 +931,6 @@ bool serverSetup(IPAddress& ip);
 void serverProcess(int timeout);
 void processMEMS(CBuffer* buffer);
 bool processGPS(CBuffer* buffer);
-void processBLE(int timeout);
 extern "C" uint8_t temprature_sens_read();  // ESP32 ROM die-temperature sensor
 // Forward declaration: defined in the Pull-OTA section below; called from
 // telemetry() before its point of definition.
@@ -1154,7 +1134,6 @@ protected:
 #if ENABLE_MEMS
     processMEMS(0);
 #endif
-    processBLE(0);
   }
 };
 
@@ -1194,6 +1173,32 @@ void logNetEvent(const char* msg)
 #endif
 }
 
+// Before every deliberate restart (2026-10-12): the SD copy made complete
+// (the writer syncs everything queued), the sniff file ended with its last
+// frames and "# restart" (its minutes stay in NVS - it resumes after the
+// boot, in a new file), the delivery queue's SD cursor saved. A panic or
+// watchdog reset cannot do this: the queue in PSRAM survives those, the SD
+// copy may then miss its last second. Any task, never an esp_timer callback.
+void prepareRestart(const char* why)
+{
+  Serial.printf("[RESTART] %s\n", why);
+  sniffCloseForRestart();
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) {
+    char ev[48];
+    snprintf(ev, sizeof(ev), "RESTART %s", why);
+    logger.logEvent(ev);
+    char st[220];
+    txqStatus(st, sizeof(st));  // what the delivery queue holds right before the restart
+    logger.logEvent(st);
+#if STORAGE == STORAGE_SD
+    if (!logger.sync(3000)) Serial.println("[RESTART] SD copy not complete within 3 s");
+#endif
+  }
+#endif
+  txqSave(true);
+}
+
 // One finished record (the CBuffer, already written to SD) into the delivery
 // queue, in the wire format "0:<ts>,<pid>:<value>,...".
 static void queueRecord(CBuffer* b)
@@ -1206,6 +1211,11 @@ static void queueRecord(CBuffer* b)
   int len = r.length();
   if (len && rec[len - 1] == ',') len--;
   if (!txqPush(b->timestamp, rec, len)) Serial.println("[TXQ] record not queued");
+#if STORAGE == STORAGE_SD
+  // the record's SD lines (written just before) end here: once the card has
+  // them, the SD writer confirms the record to the queue (txqSdConfirmed)
+  sdwDataMark(b->timestamp);
+#endif
 }
 
 // Live-diagnostic wrapper for dataserver.cpp's /api/control?cmd=STATE? -
@@ -1225,7 +1235,7 @@ bool teleLoginState()
   return teleClient.login;
 }
 
-// 2026-09-23: httpd-task-safe accessors mirroring processBLE()'s NET_OP/
+// 2026-09-23: httpd-task-safe accessors mirroring the former BLE command handler's NET_OP/
 // NET_IP/NET_PACKET/NET_DATA/NET_RATE/RSSI commands, so the same info is
 // available over the web API (handlerControl in dataserver.cpp), not just
 // BLE - same pattern as getStateBits()/teleLoginState() above.
@@ -1321,19 +1331,9 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
     }
 #endif
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-    // Connection attempt succeeded - resume BT now rather than waiting for
-    // whichever ClientWIFI::setup() call happens to poll next. Matters most
-    // for the periodic RSSI-check wifiConnect() call site further down,
-    // which does not call setup() right after - without this, BT would stay
-    // paused until some later, unrelated setup() call happened to run.
-    // WiFi.setSleep(true) MUST come before ble_resume() (see
-    // ClientWIFI::begin()'s comment for why) - duplicated here rather than
-    // shared with ClientWIFI::setup()'s copy since this fires from a
-    // different translation unit. ble_resume() is a no-op if BT was already
-    // resumed (e.g. setup() got there first) or was never paused, so this
-    // is safe to call on every GOT_IP, not just the first.
+    // the connect attempt is over: modem sleep back on (ClientWIFI::begin()
+    // turned it off for the handshake)
     WiFi.setSleep(true);
-    ble_resume();
     // Adaptive network preference (see the block above wifiCurrentIdx's
     // declaration): the network that just got an IP becomes the preferred
     // one for the next wifiConnect() call - wifiCurrentIdx was set
@@ -1576,7 +1576,7 @@ int handlerLiveData(UrlHandlerParam* param)
       n += snprintf(buf + n, bufsize - n, ",\"gps\":{\"utc\":\"%s\",\"lat\":%f,\"lng\":%f,\"alt\":%f,\"speed\":%f,\"sat\":%d,\"age\":%u}",
           isoTime, gd->lat, gd->lng, gd->alt, gd->speed, (int)gd->sat, (unsigned int)(millis() - gd->ts));
     }
-    // 2026-09-23: same info as processBLE()'s NET_OP/RSSI/APN?/NET_PACKET/
+    // 2026-09-23: same info as the former BLE command handler's NET_OP/RSSI/APN?/NET_PACKET/
     // NET_DATA/NET_RATE commands, folded into /api/live so one request
     // covers everything the app would otherwise show over BLE.
     n += snprintf(buf + n, bufsize - n, ",\"net\":{\"op\":\"%s\",\"ip\":\"%s\",\"apn\":\"%s\",\"rssi\":%d,\"packets\":%u,\"bytes\":%u,\"rateKBh\":%u}",
@@ -1598,110 +1598,6 @@ int handlerLiveData(UrlHandlerParam* param)
     param->contentType=HTTPFILETYPE_JSON;
     return FLAG_DATA_RAW;
 }
-#endif
-
-/*******************************************************************************
-  BLE scan (crew detection, step 1: see what phones actually advertise).
-  A 5 s active scan burst every 30 s while working (never in standby),
-  results kept in a small table for /api/ble and the web UI. Enabled by NVS
-  BLE_SCAN=1 (default off).
-*******************************************************************************/
-#if ENABLE_BLE
-#define BLE_SCAN_MAX 32
-#define BLE_SCAN_EVERY_MS 30000
-#define BLE_SCAN_SECONDS 5
-struct BleSeen {
-  uint8_t addr[6];      // most significant byte first
-  uint8_t type;         // 0 public, 1 random
-  int8_t rssi, rssiMax;
-  uint16_t mfg;         // company id from manufacturer data, 0xFFFF none
-  uint16_t scans;       // bursts it was seen in
-  uint16_t lastScan;
-  uint32_t lastMs;
-  char name[21];
-};
-static BleSeen s_ble[BLE_SCAN_MAX];
-static uint8_t s_bleCount = 0;
-static volatile uint16_t s_bleScanNo = 0;
-static portMUX_TYPE s_bleMux = portMUX_INITIALIZER_UNLOCKED;
-
-// NimBLE host task
-static void onBleResult(const uint8_t* addr, uint8_t type, int rssi, const char* name, uint16_t mfg)
-{
-  portENTER_CRITICAL(&s_bleMux);
-  int i = 0;
-  while (i < s_bleCount && memcmp(s_ble[i].addr, addr, 6)) i++;
-  if (i == s_bleCount) {
-    if (s_bleCount < BLE_SCAN_MAX) {
-      s_bleCount++;
-    } else {
-      i = 0;  // full: reuse the least recently seen entry
-      for (int j = 1; j < BLE_SCAN_MAX; j++) if (s_ble[j].lastMs < s_ble[i].lastMs) i = j;
-    }
-    memset(&s_ble[i], 0, sizeof(BleSeen));
-    memcpy(s_ble[i].addr, addr, 6);
-    s_ble[i].type = type;
-    s_ble[i].rssiMax = -128;
-    s_ble[i].mfg = 0xFFFF;
-  }
-  BleSeen& d = s_ble[i];
-  d.rssi = (int8_t)rssi;
-  if (rssi > d.rssiMax) d.rssiMax = (int8_t)rssi;
-  if (mfg != 0xFFFF) d.mfg = mfg;
-  if (name && name[0]) {
-    strncpy(d.name, name, sizeof(d.name) - 1);
-    d.name[sizeof(d.name) - 1] = 0;
-  }
-  if (d.lastScan != s_bleScanNo) {
-    d.lastScan = s_bleScanNo;
-    d.scans++;
-  }
-  d.lastMs = millis();
-  portEXIT_CRITICAL(&s_bleMux);
-}
-
-// called from process() - starts the next burst when due
-static void bleScanTick()
-{
-  static uint32_t lastStart = 0;
-  if (!enableBleScan || ble_scan_running()) return;
-  if (lastStart && millis() - lastStart < BLE_SCAN_EVERY_MS) return;
-  s_bleScanNo++;
-  if (ble_scan_start(BLE_SCAN_SECONDS, onBleResult)) lastStart = millis();
-}
-
-#if ENABLE_HTTPD
-int handlerBleScan(UrlHandlerParam* param)
-{
-  char *buf = param->pucBuffer;
-  int bufsize = param->bufSize;
-  static BleSeen copy[BLE_SCAN_MAX];  // static: keep it off the httpd stack
-  portENTER_CRITICAL(&s_bleMux);
-  uint8_t cnt = s_bleCount;
-  memcpy(copy, s_ble, sizeof(BleSeen) * cnt);
-  portEXIT_CRITICAL(&s_bleMux);
-  uint32_t now = millis();
-  int n = snprintf(buf, bufsize, "{\"on\":%u,\"scan\":%u,\"dev\":[", (unsigned)enableBleScan, (unsigned)s_bleScanNo);
-  for (int i = 0; i < cnt && n < bufsize - 160; i++) {
-    const BleSeen& d = copy[i];
-    char nm[sizeof(d.name)];
-    for (int k = 0; k < (int)sizeof(nm); k++) {  // JSON-safe
-      char c = d.name[k];
-      nm[k] = (c == '"' || c == '\\' || (c > 0 && c < 32)) ? '_' : c;
-      if (!c) break;
-    }
-    n += snprintf(buf + n, bufsize - n,
-        "%s{\"a\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"t\":%u,\"r\":%d,\"rm\":%d,\"m\":%d,\"s\":%u,\"ago\":%u,\"n\":\"%s\"}",
-        i ? "," : "", d.addr[0], d.addr[1], d.addr[2], d.addr[3], d.addr[4], d.addr[5],
-        (unsigned)d.type, d.rssi, d.rssiMax, d.mfg == 0xFFFF ? -1 : (int)d.mfg,
-        (unsigned)d.scans, (unsigned)((now - d.lastMs) / 1000), nm);
-  }
-  n += snprintf(buf + n, bufsize - n, "]}");
-  param->contentLength = n;
-  param->contentType = HTTPFILETYPE_JSON;
-  return FLAG_DATA_RAW;
-}
-#endif
 #endif
 
 /*******************************************************************************
@@ -2258,6 +2154,11 @@ void initialize()
   }
   // records of this session have an SD copy only if the file opened
   txqSetFile(state.check(STATE_STORAGE_READY) && fileid > 0 ? (uint32_t)fileid : 0);
+#ifdef TEST_TXQ
+  // bench: every delivery-queue decision into the SD log (txqueue.cpp ev())
+  txqSetEventSink([](const char* m) { if (state.check(STATE_STORAGE_READY)) logger.logEvent(m); });
+  txqBootReport();
+#endif
 #endif
 
 #if STORAGE == STORAGE_SD
@@ -2267,11 +2168,11 @@ void initialize()
   // next standby transition.  Any mismatch means a partial download Ã¢â‚¬â€
   // clean up both files to avoid a corrupt flash attempt.
   if (state.check(STATE_STORAGE_READY)) {
-    if (SD.exists(OTA_META_PATH)) {
+    if (sdExists(OTA_META_PATH)) {
       unsigned long expectedSize = 0;
       char stagedBy[32] = {0};
       {
-        File mf = SD.open(OTA_META_PATH, FILE_READ);
+        LockedFile mf = sdOpen(OTA_META_PATH, FILE_READ);
         if (mf) {
           char buf[16] = {0};
           mf.readBytesUntil('\n', buf, sizeof(buf) - 1);
@@ -2283,8 +2184,8 @@ void initialize()
         }
       }
       bool stagingValid = false;
-      if (expectedSize >= PULL_OTA_MIN_FW_SIZE && SD.exists(OTA_PENDING_PATH)) {
-        File ff = SD.open(OTA_PENDING_PATH, FILE_READ);
+      if (expectedSize >= PULL_OTA_MIN_FW_SIZE && sdExists(OTA_PENDING_PATH)) {
+        LockedFile ff = sdOpen(OTA_PENDING_PATH, FILE_READ);
         unsigned long actual = ff ? (unsigned long)ff.size() : 0UL;
         if (ff) ff.close();
         stagingValid = (actual == expectedSize);
@@ -2313,25 +2214,25 @@ void initialize()
         // Flash failed (corrupt image etc.): staging files already cleaned up
         // by performPullOtaFlash().  Continue normal boot.
       } else {
-        SD.remove(OTA_PENDING_PATH);
-        SD.remove(OTA_META_PATH);
-        SD.remove(OTA_NVS_PATH);
-        SD.remove(OTA_RESUME_PATH);
+        sdRemove(OTA_PENDING_PATH);
+        sdRemove(OTA_META_PATH);
+        sdRemove(OTA_NVS_PATH);
+        sdRemove(OTA_RESUME_PATH);
         Serial.println("[OTA-PULL] Stale/incomplete SD staging files removed");
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL STALE_REMOVED");
       }
-    } else if (SD.exists(OTA_PENDING_PATH) && SD.exists(OTA_RESUME_PATH)) {
+    } else if (sdExists(OTA_PENDING_PATH) && sdExists(OTA_RESUME_PATH)) {
       // Unfinished download from before this reboot (ignition off mid-
       // transfer, signal lost, etc.) - keep it; performPullOtaCheck() resumes
       // it if it still matches the offered target, or discards it if not.
-      File pf = SD.open(OTA_PENDING_PATH, FILE_READ);
+      LockedFile pf = sdOpen(OTA_PENDING_PATH, FILE_READ);
       Serial.printf("[OTA-PULL] Partial download on SD (%u bytes), kept for resume\n",
                     pf ? (unsigned)pf.size() : 0U);
       if (pf) pf.close();
-    } else if (SD.exists(OTA_PENDING_PATH)) {
+    } else if (sdExists(OTA_PENDING_PATH)) {
       // Firmware file without companion meta Ã¢â‚¬â€ can't verify, remove it.
-      SD.remove(OTA_PENDING_PATH);
-      SD.remove(OTA_NVS_PATH);
+      sdRemove(OTA_PENDING_PATH);
+      sdRemove(OTA_NVS_PATH);
     } else {
       // Normal case: no OTA firmware staged on SD.
       Serial.println("[OTA] SD:none");
@@ -2418,7 +2319,7 @@ bool waitMotion(long timeout)
 #if ENABLE_HTTPD
       serverProcess(100);
 #endif
-      processBLE(100);
+      delay(100);
       // check movement
       if (motion >= MOTION_THRESHOLD * MOTION_THRESHOLD) {
         //lastMotionTime = millis();
@@ -2537,6 +2438,10 @@ static void engineTick(CBuffer* buffer)
   } else if (obd) {
     if (s_obdCycle == 0) s_obdSilent++;
     else if (s_obdCycle == 1) s_obdSilent = 0;
+    // after sniff mode OBD starts again from scratch: its first silent cycles
+    // are not an engine stop (a false STOP at 15.3 V followed SNIFF=0 in the
+    // Peugeot on 2026-10-12 - why the ECU was silent is NOT verified)
+    if (s_sniffEndMs && millis() - s_sniffEndMs < 120000) s_obdSilent = 0;
     if (s_obdSilent >= ENGINE_STOP_SILENT_CYCLES) engineStop();
   } else {
     if (volts) s_lowVoltSinceMs = 0;
@@ -2573,9 +2478,6 @@ void process()
   static uint32_t lastGPStick = 0;
   uint32_t startTime = millis();
 
-#if ENABLE_BLE
-  bleScanTick();
-#endif
   CBuffer* buffer = bufman.getFree();  // only builds the record; it is queued and freed below
   buffer->state = BUFFER_STATE_FILLING;
 
@@ -2583,7 +2485,16 @@ void process()
   // odometer reads stop, standby is held off (see the stationary check)
   {
     int ev = sniffTick();
-    if (ev == SNIFF_EV_STARTED) state.clear(STATE_OBD_READY);
+    if (ev == SNIFF_EV_STARTED) { state.clear(STATE_OBD_READY); s_vwOdoOn = false; }  // sniff stopped canodo
+    if (ev == SNIFF_EV_STOPPED) s_sniffEndMs = millis();
+    if (ev == SNIFF_EV_REFUSED) {
+      Serial.println("[SNIFF] refused: SD card too full");
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) logger.logEvent("SNIFF REFUSED SD_FULL");
+#endif
+      ev = 0;
+    }
+    vwOdoTick();
 #if STORAGE != STORAGE_NONE
     if (ev && state.check(STATE_STORAGE_READY)) {
       char diag[48];
@@ -2680,9 +2591,9 @@ void process()
   engineTick(buffer);
 #ifdef TEST_CANODO_BENCH
   // bench only: attempts without a running engine, to see the diagnosis reach the server
-  if (!sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
 #else
-  if (s_engineOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (s_engineOn && s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
 #endif
   addOdo(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into
@@ -2846,12 +2757,31 @@ void process()
       uint32_t sdTotalMb = 0;
       uint32_t sdFreeMb  = 0;
       if (state.check(STATE_STORAGE_READY)) {
-        // Purge oldest 20% of log files when SD >= 80% full.
-        if (logger.purgeOldFiles()) {
+        // Purge oldest 20% of log files when SD >= 80% full - never a file
+        // the delivery queue may still replay (txqOldestFileNeeded()).
+        if (logger.purgeOldFiles(txqOldestFileNeeded())) {
           logger.logEvent("SD:PURGE");
         }
+        // sniff files older than SNIFF_KEEP_DAYS: checked once a day
+        static bool sniffPurged = false;
+        static uint32_t lastSniffPurgeMs = 0;
+        if (!sniffPurged || nowMs - lastSniffPurgeMs >= 86400000UL) {
+          time_t now = time(nullptr);
+          if (now > 1735689600) {  // valid clock only
+            sniffPurged = true;
+            lastSniffPurgeMs = nowMs;
+            int n = sniffPurgeOld(now);
+            if (n) {
+              char ev[40];
+              snprintf(ev, sizeof(ev), "SNIFF PURGE files=%d", n);
+              logger.logEvent(ev);
+            }
+          }
+        }
+        sdLock();
         uint64_t tot = SD.totalBytes();
         uint64_t used = SD.usedBytes();
+        sdUnlock();
         sdTotalMb = (uint32_t)(tot >> 20);
         sdFreeMb  = (uint32_t)((tot > used ? tot - used : 0) >> 20);
       }
@@ -3031,7 +2961,7 @@ void process()
   do {
     long t = dataInterval - (millis() - startTime);
     long slice = (t > 100) ? 100 : (t > 0 ? t : 0);
-    processBLE(slice);
+    delay(slice);
 #if ENABLE_HTTPD
     if (enableHttpd) serverProcess(0);
 #endif
@@ -3189,7 +3119,7 @@ static void buildStandbyReport(CStorageRAM& rb)
   rb.log(PID_RPM | 0x100, &rpm0, 1);
   int len = rb.length();
   if (len && rb.buffer()[len - 1] == ',') len--;
-  txqPush(recTs, rb.buffer(), len);
+  txqPushEx(recTs, rb.buffer(), len, true);  // + internal flash: survives a power loss
   Serial.print("[STANDBY] Report ");
   Serial.print(hasFix ? "with GPS fix: " : "WITHOUT GPS fix: ");
   Serial.write((const uint8_t*)rb.buffer(), len);  // not NUL-terminated
@@ -3455,23 +3385,6 @@ void telemetry(void* inst)
 
       if (millis() - lastRssiTime > SIGNAL_CHECK_INTERVAL * 1000) {
 #if ENABLE_WIFI
-        // BLE pause watchdog, independent check (2026-09-22): the existing
-        // ble_isPausedTooLong() backstop (see BLE_PAUSE_MAX_MS's comment) was
-        // ONLY ever checked at the top of wifiConnect() - if WiFi connects
-        // and then stays up indefinitely, wifiConnect() is never called
-        // again, so a BLE pause that somehow never got resumed (a missed
-        // GOT_IP event, a race) would stay stuck forever, making the phone
-        // app permanently unable to connect with no self-healing path.
-        // Checked here instead, every SIGNAL_CHECK_INTERVAL (10s) - this
-        // whole block only runs inside the telemetry() task's
-        // `while (state.check(STATE_WORKING))` loop, i.e. never during
-        // standby, matching the explicit requirement that this NOT try to
-        // resume BLE while the device is deliberately powered down.
-        if (ble_isPausedTooLong(BLE_PAUSE_MAX_MS)) {
-          Serial.println("[BLE] Pause exceeded safety timeout with no wifiConnect() to catch it - forcing resume");
-          WiFi.setSleep(true);
-          ble_resume();
-        }
         // Geofence-WiFi sync retry (2026-09-22): the optimistic immediate
         // attempt at the moment WiFi connects (search s_locSynced above)
         // reliably fails that early on this hardware - retry here every
@@ -3843,6 +3756,7 @@ void standby()
   wakeInfoMagic = WAKE_INFO_MAGIC;
   sys.resetLink();
 #if RESET_AFTER_WAKEUP
+  prepareRestart("WAKE");
   ESP.restart();
 #endif  
   state.clear(STATE_STANDBY);
@@ -3992,27 +3906,6 @@ void loadConfig()
     enableHttpd = nvsHttpd;
   }
 
-#if ENABLE_BLE
-  // Enable/disable BLE at runtime.  NVS key ENABLE_BLE is written by the HA
-  // integration (0 = off, 1 = on).  Disabling BLE frees ~100 KB of heap,
-  // which prevents MBEDTLS_ERR_SSL_ALLOC_FAILED during the TLS handshake for
-  // the HTTPS webhook.  The key is absent on un-provisioned devices so the
-  // default (enableBle = 1) preserves backwards-compatible behaviour.
-  uint8_t nvsBle = 1;
-  if (nvs_get_u8(nvs, "ENABLE_BLE", &nvsBle) == ESP_OK) {
-    enableBle = nvsBle;
-  } else if (webhookPath[0]) {
-    // ENABLE_BLE was not provisioned in NVS but webhook mode is active.
-    // Auto-disable BLE so the ~100 KB it occupies is available for the TLS
-    // handshake (prevents MBEDTLS_ERR_SSL_ALLOC_FAILED on hooks.nabu.casa).
-    // Users who want BLE alongside webhooks can set ENABLE_BLE=1 explicitly.
-    enableBle = 0;
-  }
-  // 2026-09-23 diagnostic-only: print the actual resolved state so we can
-  // see on this real device whether enableBle got silently forced to 0.
-  Serial.printf("[BLE-DIAG] enableBle=%u webhookPath=\"%s\"\n", enableBle, webhookPath);
-#endif
-
   // Enable verbose cellular debug logging at runtime.  NVS key CELL_DEBUG is
   // written by the HA config/options flow (0 = off, 1 = on).  When enabled the
   // firmware prints TX-Preview, hex-dump, AT+CCHSTATUS? and per-packet
@@ -4055,16 +3948,6 @@ void loadConfig()
   if (nvs_get_u8(nvs, "DEEP_STANDBY", &nvsDeepStandby) == ESP_OK) {
     enableDeepStandby = nvsDeepStandby != 0;
   }
-
-  // BLE scan for crew detection (NVS key BLE_SCAN, u8, default 0 = off).
-  uint8_t nvsBleScan = 0;
-  enableBleScan = nvs_get_u8(nvs, "BLE_SCAN", &nvsBleScan) == ESP_OK && nvsBleScan;
-  if (nvs_get_u8(nvs, "BT_MODE", &btMode) != ESP_OK) btMode = 0;
-  size_t btKnownLen = sizeof(btKnown);
-  if (nvs_get_str(nvs, "BT_KNOWN", btKnown, &btKnownLen) != ESP_OK) btKnown[0] = 0;
-#if ENABLE_BLE
-  bt_presence_set_known(btKnown);
-#endif
 
   // Standby-time override (NVS key STANDBY_TIME, u16, seconds, 5-900).
   // 0 means "use compile-time STATIONARY_TIME_TABLE default" (currently 180 s).
@@ -4222,14 +4105,14 @@ void loadConfig()
 // ---------------------------------------------------------------------------
 static bool _applyNvsFromSD()
 {
-  if (!SD.exists(OTA_NVS_PATH)) {
+  if (!sdExists(OTA_NVS_PATH)) {
     return true; // no NVS update staged; not an error
   }
 
-  File nvsFile = SD.open(OTA_NVS_PATH, FILE_READ);
+  LockedFile nvsFile = sdOpen(OTA_NVS_PATH, FILE_READ);
   if (!nvsFile) {
     Serial.println("[OTA-PULL] Cannot open NVS staging file");
-    SD.remove(OTA_NVS_PATH);
+    sdRemove(OTA_NVS_PATH);
     return false;
   }
   size_t nvsSize = nvsFile.size();
@@ -4240,7 +4123,7 @@ static bool _applyNvsFromSD()
     nvsFile.close();
     Serial.printf("[OTA-PULL] NVS staging file has invalid size: %u Ã¢â‚¬â€ skipping\n",
                   (unsigned)nvsSize);
-    SD.remove(OTA_NVS_PATH);
+    sdRemove(OTA_NVS_PATH);
     return false;
   }
 
@@ -4260,7 +4143,7 @@ static bool _applyNvsFromSD()
   if (!nvsBuf) {
     nvsFile.close();
     Serial.println("[OTA-PULL] NVS: not enough RAM to buffer image Ã¢â‚¬â€ skipping NVS update");
-    SD.remove(OTA_NVS_PATH);
+    sdRemove(OTA_NVS_PATH);
     return false;
   }
   // Pre-fill the alignment-padding tail with 0xFF so it is ready for the write.
@@ -4282,7 +4165,7 @@ static bool _applyNvsFromSD()
     readTotal += (size_t)n;
   }
   nvsFile.close();
-  SD.remove(OTA_NVS_PATH);
+  sdRemove(OTA_NVS_PATH);
 
   if (!readOk || readTotal != nvsSize) {
     free(nvsBuf);
@@ -4362,19 +4245,19 @@ static bool _applyNvsFromSD()
 static bool performPullOtaFlash()
 {
   // --- Verify staging files ------------------------------------------------
-  if (!SD.exists(OTA_PENDING_PATH)) {
+  if (!sdExists(OTA_PENDING_PATH)) {
     Serial.println("[OTA-PULL] Staged firmware not found on SD");
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SD_NOT_FOUND");
 #endif
-    SD.remove(OTA_META_PATH);
+    sdRemove(OTA_META_PATH);
     return false;
   }
 
   // Read expected size from companion meta file.
   unsigned long expectedSize = 0;
   {
-    File mf = SD.open(OTA_META_PATH, FILE_READ);
+    LockedFile mf = sdOpen(OTA_META_PATH, FILE_READ);
     if (mf) {
       char buf[16] = {0};
       mf.readBytesUntil('\n', buf, sizeof(buf) - 1);
@@ -4383,7 +4266,7 @@ static bool performPullOtaFlash()
     }
   }
   {
-    File ff = SD.open(OTA_PENDING_PATH, FILE_READ);
+    LockedFile ff = sdOpen(OTA_PENDING_PATH, FILE_READ);
     unsigned long actual = ff ? (unsigned long)ff.size() : 0UL;
     if (ff) ff.close();
     if (expectedSize < PULL_OTA_MIN_FW_SIZE || actual != expectedSize) {
@@ -4392,8 +4275,8 @@ static bool performPullOtaFlash()
 #if STORAGE != STORAGE_NONE
       if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SD_SIZE");
 #endif
-      SD.remove(OTA_PENDING_PATH);
-      SD.remove(OTA_META_PATH);
+      sdRemove(OTA_PENDING_PATH);
+      sdRemove(OTA_META_PATH);
       return false;
     }
   }
@@ -4416,7 +4299,7 @@ static bool performPullOtaFlash()
     return false;
   }
 
-  File fwFile = SD.open(OTA_PENDING_PATH, FILE_READ);
+  LockedFile fwFile = sdOpen(OTA_PENDING_PATH, FILE_READ);
   if (!fwFile) {
     Serial.println("[OTA-PULL] Cannot open staged firmware for reading");
     Update.abort();
@@ -4467,8 +4350,8 @@ static bool performPullOtaFlash()
 
   if (!Update.end()) {
     Serial.printf("[OTA-PULL] Update.end failed: %s\n", Update.errorString());
-    SD.remove(OTA_PENDING_PATH);
-    SD.remove(OTA_META_PATH);
+    sdRemove(OTA_PENDING_PATH);
+    sdRemove(OTA_META_PATH);
 #if STORAGE != STORAGE_NONE
     if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=UPD_END");
 #endif
@@ -4476,8 +4359,8 @@ static bool performPullOtaFlash()
   }
 
   // --- Flash successful: clean up SD, log, apply NVS settings if staged -----
-  SD.remove(OTA_PENDING_PATH);
-  SD.remove(OTA_META_PATH);
+  sdRemove(OTA_PENDING_PATH);
+  sdRemove(OTA_META_PATH);
 
   Serial.printf("[OTA-PULL] Flash from SD successful: %u bytes in %u ms\n",
                 (unsigned)written, (unsigned)(millis() - t0));
@@ -4489,7 +4372,7 @@ static bool performPullOtaFlash()
   // check interval (the HA side keeps nvs_version unsynchronised until the
   // device successfully downloads and applies nvs.bin).
   {
-    bool _nvsStaged = SD.exists(OTA_NVS_PATH);
+    bool _nvsStaged = sdExists(OTA_NVS_PATH);
     if (_applyNvsFromSD()) {
       if (_nvsStaged) {
         Serial.println("[OTA-PULL] Settings (NVS) updated successfully");
@@ -4507,9 +4390,9 @@ static bool performPullOtaFlash()
     snprintf(diag, sizeof(diag), "OTA-PULL FLASH OK FW=%s SIZE=%u",
              FIRMWARE_VERSION, (unsigned)written);
     logger.logEvent(diag);
-    logger.flush();  // ensure log entry survives the reboot
   }
 #endif
+  prepareRestart("OTA_FLASHED");
 
   // s_ota_active remains true; device reboots shortly.
   static esp_timer_handle_t s_ota_flash_timer = NULL;
@@ -4606,6 +4489,7 @@ bool performPullOtaCheck()
   // yet.  Trigger it now so the boot-time flash runs cleanly.
   if (s_ota_pending) {
     Serial.println("[OTA-PULL] Firmware already staged on SD, restarting to flash");
+    prepareRestart("OTA_STAGED");
     esp_restart();
     return false;  // unreachable
   }
@@ -4813,7 +4697,7 @@ bool performPullOtaCheck()
       return false;
     }
     Serial.println("[OTA-PULL] NVS-only update: downloading settings binary");
-    if (SD.exists(OTA_NVS_PATH)) SD.remove(OTA_NVS_PATH);
+    if (sdExists(OTA_NVS_PATH)) sdRemove(OTA_NVS_PATH);
     if (nvsPath[0] && useCell) {
       // 2026-09-23: cellular NVS-only download, same shape as the WiFi path
       // below but via cellDownloadBody() (see its own comment).
@@ -4822,13 +4706,13 @@ bool performPullOtaCheck()
         int _nvsCL = 0;
         int _nvsHC = otaCellClient.receiveHeaders(&_nvsCL);
         if (_nvsHC == 200 && _nvsCL > 0) {
-          File _nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
+          LockedFile _nvsFile = sdOpen(OTA_NVS_PATH, FILE_WRITE);
           if (_nvsFile) {
             size_t _nvsWr = cellDownloadBody(_nvsFile, (size_t)_nvsCL, nullptr);
             _nvsFile.close();
             if (_nvsWr != (size_t)_nvsCL) {
               Serial.println("[OTA-PULL] Cell NVS download incomplete - settings unchanged");
-              SD.remove(OTA_NVS_PATH);
+              sdRemove(OTA_NVS_PATH);
             } else {
               Serial.printf("[OTA-PULL] NVS staged (cell): %u bytes\n", (unsigned)_nvsWr);
             }
@@ -4848,7 +4732,7 @@ bool performPullOtaCheck()
         int _nvsCL = 0;
         int _nvsHC = otaWifiClient.receiveHeaders(&_nvsCL);
         if (_nvsHC == 200 && _nvsCL > 0) {
-          File _nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
+          LockedFile _nvsFile = sdOpen(OTA_NVS_PATH, FILE_WRITE);
           if (_nvsFile) {
             WiFiClientSecure& _nvsRaw = otaWifiClient.rawClient();
             size_t _nvsWr = 0, _nvsExp = (size_t)_nvsCL;
@@ -4867,7 +4751,7 @@ bool performPullOtaCheck()
             _nvsFile.close();
             if (!_nvsOk || _nvsWr != _nvsExp) {
               Serial.println("[OTA-PULL] NVS download incomplete Ã¢â‚¬â€ settings unchanged");
-              SD.remove(OTA_NVS_PATH);
+              sdRemove(OTA_NVS_PATH);
             } else {
               Serial.printf("[OTA-PULL] NVS staged: %u bytes\n", (unsigned)_nvsWr);
             }
@@ -4884,12 +4768,13 @@ bool performPullOtaCheck()
     }
     // Only restart if NVS was successfully staged on SD.  If the download
     // failed leave the device running and let it retry on the next interval.
-    if (!SD.exists(OTA_NVS_PATH)) {
+    if (!sdExists(OTA_NVS_PATH)) {
       Serial.println("[OTA-PULL] NVS-only: download failed, will retry on next check");
       return false;
     }
     if (_applyNvsFromSD()) {
       Serial.println("[OTA-PULL] Settings (NVS) applied Ã¢â‚¬â€ restarting");
+      prepareRestart("NVS_APPLIED");
       esp_restart();
       return false;  // unreachable
     } else {
@@ -4989,8 +4874,8 @@ bool performPullOtaCheck()
     // build was published in between, the stale partial is discarded and a
     // fresh download starts, exactly like before.
     size_t resumeFrom = 0;
-    if (SD.exists(OTA_RESUME_PATH) && SD.exists(OTA_PENDING_PATH)) {
-      File mf = SD.open(OTA_RESUME_PATH, FILE_READ);
+    if (sdExists(OTA_RESUME_PATH) && sdExists(OTA_PENDING_PATH)) {
+      LockedFile mf = sdOpen(OTA_RESUME_PATH, FILE_READ);
       if (mf) {
         char sizeLine[24] = {0}, shaLine[80] = {0};
         mf.readBytesUntil('\n', sizeLine, sizeof(sizeLine) - 1);
@@ -4999,7 +4884,7 @@ bool performPullOtaCheck()
         char* cr = strchr(shaLine, '\r');
         if (cr) *cr = '\0';
         if (strtoul(sizeLine, nullptr, 10) == fwSize && fwSha256Hex[0] && !strcmp(shaLine, fwSha256Hex)) {
-          File pf = SD.open(OTA_PENDING_PATH, FILE_READ);
+          LockedFile pf = sdOpen(OTA_PENDING_PATH, FILE_READ);
           if (pf) {
             size_t existing = pf.size();
             pf.close();
@@ -5009,14 +4894,14 @@ bool performPullOtaCheck()
       }
     }
 
-    if (SD.exists(OTA_META_PATH)) SD.remove(OTA_META_PATH);
+    if (sdExists(OTA_META_PATH)) sdRemove(OTA_META_PATH);
     if (!resumeFrom) {
-      if (SD.exists(OTA_PENDING_PATH)) SD.remove(OTA_PENDING_PATH);
-      if (SD.exists(OTA_RESUME_PATH)) SD.remove(OTA_RESUME_PATH);
+      if (sdExists(OTA_PENDING_PATH)) sdRemove(OTA_PENDING_PATH);
+      if (sdExists(OTA_RESUME_PATH)) sdRemove(OTA_RESUME_PATH);
       // Without a sha256 there's nothing to prove a later partial belongs
       // to this same target, so such a download is simply never resumed.
       if (fwSha256Hex[0]) {
-        File rf = SD.open(OTA_RESUME_PATH, FILE_WRITE);
+        LockedFile rf = sdOpen(OTA_RESUME_PATH, FILE_WRITE);
         if (rf) {
           rf.printf("%u\n%s\n", (unsigned)fwSize, fwSha256Hex);
           rf.close();
@@ -5026,7 +4911,7 @@ bool performPullOtaCheck()
       Serial.printf("[OTA-PULL] Resuming download from byte %u / %u\n", (unsigned)resumeFrom, (unsigned)fwSize);
     }
 
-    File fwFile = SD.open(OTA_PENDING_PATH, resumeFrom ? FILE_APPEND : FILE_WRITE);
+    LockedFile fwFile = sdOpen(OTA_PENDING_PATH, resumeFrom ? FILE_APPEND : FILE_WRITE);
     if (!fwFile) {
       Serial.println("[OTA-PULL] Cannot create SD staging file");
 #if STORAGE != STORAGE_NONE
@@ -5052,7 +4937,7 @@ bool performPullOtaCheck()
         // Re-hash the bytes already on SD from a previous attempt so the
         // running context reflects the whole file, not just what's newly
         // downloaded this round.
-        File rf = SD.open(OTA_PENDING_PATH, FILE_READ);
+        LockedFile rf = sdOpen(OTA_PENDING_PATH, FILE_READ);
         if (rf) {
           int n;
           while ((n = rf.read(s_otaChunkBuf, PULL_OTA_CHUNK_SIZE)) > 0) {
@@ -5270,8 +5155,8 @@ bool performPullOtaCheck()
         // Genuine corruption (possibly from an earlier resumed segment) -
         // unlike a transient network failure, this is not safely resumable.
         // Wipe both staging files so the next attempt starts clean.
-        SD.remove(OTA_PENDING_PATH);
-        SD.remove(OTA_RESUME_PATH);
+        sdRemove(OTA_PENDING_PATH);
+        sdRemove(OTA_RESUME_PATH);
         return false;
       }
       Serial.println("[OTA-PULL] SHA256 OK");
@@ -5327,7 +5212,7 @@ bool performPullOtaCheck()
 
     // Write companion meta file: expected byte count for integrity check.
     {
-      File metaFile = SD.open(OTA_META_PATH, FILE_WRITE);
+      LockedFile metaFile = sdOpen(OTA_META_PATH, FILE_WRITE);
       if (metaFile) {
         // Line 2 = which build downloaded this - checked at boot, see the
         // staging check in setup(). performPullOtaFlash() reads line 1 only.
@@ -5338,10 +5223,10 @@ bool performPullOtaCheck()
       }
     }
     // Download is complete and verified - no longer a resumable partial.
-    SD.remove(OTA_RESUME_PATH);
+    sdRemove(OTA_RESUME_PATH);
 
     // ---- Step 3 (optional): Download NVS settings binary -------------------
-    if (SD.exists(OTA_NVS_PATH)) SD.remove(OTA_NVS_PATH);
+    if (sdExists(OTA_NVS_PATH)) sdRemove(OTA_NVS_PATH);
     if (nvsPath[0]) {
       Serial.printf("[OTA-PULL] Downloading NVS settings from %s\n", nvsPath);
 #if ENABLE_WIFI
@@ -5350,7 +5235,7 @@ bool performPullOtaCheck()
         int nvsContentLen = 0;
         int nvsHttpCode = otaWifiClient.receiveHeaders(&nvsContentLen);
         if (nvsHttpCode == 200 && nvsContentLen > 0) {
-          File nvsFile = SD.open(OTA_NVS_PATH, FILE_WRITE);
+          LockedFile nvsFile = sdOpen(OTA_NVS_PATH, FILE_WRITE);
           if (nvsFile) {
             WiFiClientSecure& rawSock2 = otaWifiClient.rawClient();
             size_t nvsWritten = 0;
@@ -5375,7 +5260,7 @@ bool performPullOtaCheck()
 #endif
             } else {
               Serial.println("[OTA-PULL] NVS download incomplete Ã¢â‚¬â€ skipping settings update");
-              SD.remove(OTA_NVS_PATH);
+              sdRemove(OTA_NVS_PATH);
             }
           }
         } else {
@@ -5406,6 +5291,7 @@ bool performPullOtaCheck()
     // opened, ensuring the flash and optional NVS update succeed reliably.
     // This also resolves the "Low heap" WiFi/LTE failure loop that would
     // otherwise block all network connections until the next natural standby.
+    prepareRestart("OTA_DOWNLOADED");
     esp_restart();
     return false;  // unreachable: esp_restart() does not return
   }
@@ -5562,6 +5448,7 @@ bool performPullOtaCheck()
     }
     otaWifiClient.close();
   }
+  prepareRestart("OTA_FLASHED_DIRECT");
   // s_ota_active remains true; device reboots shortly.
   static esp_timer_handle_t s_pull_ota_timer = NULL;
   if (!s_pull_ota_timer) {
@@ -5584,247 +5471,6 @@ bool performPullOtaCheck()
   return false;  // Pull-OTA requires WiFi (ENABLE_WIFI) - no longer tied to SERVER_PROTOCOL.
 }
 #endif  // ENABLE_WIFI (outer)
-
-void processBLE(int timeout)
-{
-#if ENABLE_BLE
-  if (!enableBle) {
-    if (timeout) delay(timeout);
-    return;
-  }
-  static byte echo = 0;
-  char* cmd;
-  if (!(cmd = ble_recv_command(timeout))) {
-    return;
-  }
-
-  char *p = strchr(cmd, '\r');
-  if (p) *p = 0;
-  char buf[48];
-  int bufsize = sizeof(buf);
-  int n = 0;
-  if (echo) n += snprintf(buf + n, bufsize - n, "%s\r", cmd);
-  Serial.print("[BLE] ");
-  Serial.print(cmd);
-  if (!strcmp(cmd, "UPTIME") || !strcmp(cmd, "TICK")) {
-    n += snprintf(buf + n, bufsize - n, "%lu", millis());
-  } else if (!strcmp(cmd, "BATT")) {
-    n += snprintf(buf + n, bufsize - n, "%.2f", (float)(analogRead(A0) * 42) / 4095);
-  } else if (!strcmp(cmd, "RESET")) {
-#if STORAGE
-    logger.end();
-#endif
-    txqSave(true);
-    ESP.restart();
-    // never reach here
-  } else if (!strcmp(cmd, "OFF")) {
-    state.set(STATE_STANDBY);
-    state.clear(STATE_WORKING);
-    n += snprintf(buf + n, bufsize - n, "OK");
-  } else if (!strcmp(cmd, "ON")) {
-    state.clear(STATE_STANDBY);
-    n += snprintf(buf + n, bufsize - n, "OK");
-  } else if (!strcmp(cmd, "ON?")) {
-    n += snprintf(buf + n, bufsize - n, "%u", state.check(STATE_STANDBY) ? 0 : 1);
-  } else if (!strcmp(cmd, "APN?")) {
-    n += snprintf(buf + n, bufsize - n, "%s", *apn ? apn : "DEFAULT");
-  } else if (!strncmp(cmd, "APN=", 4)) {
-    n += snprintf(buf + n, bufsize - n, nvs_set_str(nvs, "CELL_APN", strcmp(cmd + 4, "DEFAULT") ? cmd + 4 : "") == ESP_OK
-        && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-    loadConfig();
-  } else if (!strcmp(cmd, "PIN?")) {
-    n += snprintf(buf + n, bufsize - n, "%s", *simPin ? "SET" : "NONE");
-  } else if (!strncmp(cmd, "PIN=", 4)) {
-    n += snprintf(buf + n, bufsize - n, nvs_set_str(nvs, "SIM_PIN", strcmp(cmd + 4, "CLEAR") ? cmd + 4 : "") == ESP_OK
-        && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-    loadConfig();
-  } else if (!strcmp(cmd, "NET_OP")) {
-    if (state.check(STATE_WIFI_CONNECTED)) {
-#if ENABLE_WIFI
-      n += snprintf(buf + n, bufsize - n, "%s", wifiSSID[0] ? wifiSSID : "-");
-#endif
-    } else {
-      snprintf(buf + n, bufsize - n, "%s", netop.length() ? netop.c_str() : "-");
-      char *p = strchr(buf + n, ' ');
-      if (p) *p = 0;
-      n += strlen(buf + n);
-    }
-  } else if (!strcmp(cmd, "NET_IP")) {
-    n += snprintf(buf + n, bufsize - n, "%s", ip.length() ? ip.c_str() : "-");
-  } else if (!strcmp(cmd, "NET_PACKET")) {
-      n += snprintf(buf + n, bufsize - n, "%u", teleClient.txCount);
-  } else if (!strcmp(cmd, "NET_DATA")) {
-      n += snprintf(buf + n, bufsize - n, "%u", teleClient.txBytes);
-  } else if (!strcmp(cmd, "NET_RATE")) {
-      n += snprintf(buf + n, bufsize - n, "%u", teleClient.startTime ? (unsigned int)((uint64_t)(teleClient.txBytes + teleClient.rxBytes) * 3600 / (millis() - teleClient.startTime)) : 0);
-  } else if (!strcmp(cmd, "RSSI")) {
-    n += snprintf(buf + n, bufsize - n, "%d", rssi);
-#if ENABLE_WIFI
-  } else if (!strcmp(cmd, "SSID?")) {
-    n += snprintf(buf + n, bufsize - n, "%s", wifiSSID[0] ? wifiSSID : "-");
-  } else if (!strncmp(cmd, "SSID=", 5)) {
-    const char* p = cmd + 5;
-    n += snprintf(buf + n, bufsize - n, nvs_set_str(nvs, "WIFI_SSID", strcmp(p, "-") ? p : "") == ESP_OK
-        && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-    loadConfig();
-  } else if (!strcmp(cmd, "WPWD?")) {
-    n += snprintf(buf + n, bufsize - n, "%s", wifiPassword[0] ? wifiPassword : "-");
-  } else if (!strncmp(cmd, "WPWD=", 5)) {
-    const char* p = cmd + 5;
-    n += snprintf(buf + n, bufsize - n, nvs_set_str(nvs, "WIFI_PWD", strcmp(p, "-") ? p : "") == ESP_OK
-        && nvs_commit(nvs) == ESP_OK ? "OK" : "ERR");
-    loadConfig();
-  } else if (!strncmp(cmd, "OTA_TOKEN=", 10)) {
-    // Provision (or clear) the pull-OTA authentication token in NVS.
-    // Use "-" or empty string to clear the token (disables OTA checks).
-    // Also updates the runtime variable so the next OTA check fires without
-    // a reboot (assuming OTA_INTERVAL is also set and otaHost is reachable).
-    const char* p = cmd + 10;
-    const bool clr = (p[0] == '\0' || (p[0] == '-' && p[1] == '\0'));
-    esp_err_t e = nvs_set_str(nvs, "OTA_TOKEN", clr ? "" : p);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    if (e == ESP_OK) {
-      size_t tlen = sizeof(otaToken);
-      otaToken[0] = 0;
-      nvs_get_str(nvs, "OTA_TOKEN", otaToken, &tlen);
-      // Ensure otaHost is set so performPullOtaCheck() can open a connection.
-      // If no dedicated OTA_HOST key is stored, fall back to serverHost.
-      if (!otaHost[0] && otaToken[0]) {
-        strncpy(otaHost, serverHost, sizeof(otaHost) - 1);
-        otaHost[sizeof(otaHost) - 1] = 0;
-      }
-    }
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-  } else if (!strncmp(cmd, "OTA_HOST=", 9)) {
-    // Set the hostname (or IP) of the HA server that serves the pull-OTA
-    // endpoint.  Stored in NVS as OTA_HOST and applied at runtime.
-    // Use "-" to clear (firmware then falls back to serverHost).
-    const char* p = cmd + 9;
-    const bool clr = (p[0] == '-' && p[1] == '\0');
-    esp_err_t e = nvs_set_str(nvs, "OTA_HOST", clr ? "" : p);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    if (e == ESP_OK) {
-      size_t hlen = sizeof(otaHost);
-      otaHost[0] = 0;
-      nvs_get_str(nvs, "OTA_HOST", otaHost, &hlen);
-      // Same fallback as OTA_TOKEN handler: use serverHost when OTA_HOST is cleared.
-      if (!otaHost[0] && otaToken[0]) {
-        strncpy(otaHost, serverHost, sizeof(otaHost) - 1);
-        otaHost[sizeof(otaHost) - 1] = 0;
-      }
-    }
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-  } else if (!strncmp(cmd, "OTA_INTERVAL=", 13)) {
-    // Set the pull-OTA check interval in seconds (0 = disable).
-    // Applied at runtime so the next check fires after this interval,
-    // without requiring a reboot.
-    uint16_t interval = (uint16_t)atoi(cmd + 13);
-    esp_err_t e = nvs_set_u16(nvs, "OTA_INTERVAL", interval);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    if (e == ESP_OK) otaCheckIntervalS = interval;
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-#else
-  } else if (!strcmp(cmd, "SSID?") || !strcmp(cmd, "WPWD?")) {
-    n += snprintf(buf + n, bufsize - n, "-");
-#endif
-  } else if (!strcmp(cmd, "TEMP")) {
-#if ENABLE_MEMS
-    n += snprintf(buf + n, bufsize - n, "%d", (int)deviceTemp);
-#else
-    // No MEMS chip in this build - ESP32's own die sensor, same formula as
-    // the web API's /api/info (dataserver.cpp). Coarse, but a real reading.
-    n += snprintf(buf + n, bufsize - n, "%d", (int)temprature_sens_read() * 165 / 255 - 40);
-#endif
-#if ENABLE_MEMS
-  } else if (!strcmp(cmd, "ACC")) {
-    n += snprintf(buf + n, bufsize - n, "%.1f/%.1f/%.1f", acc[0], acc[1], acc[2]);
-  } else if (!strcmp(cmd, "GYRO")) {
-    n += snprintf(buf + n, bufsize - n, "%.1f/%.1f/%.1f", gyr[0], gyr[1], gyr[2]);
-  } else if (!strcmp(cmd, "GF")) {
-    n += snprintf(buf + n, bufsize - n, "%f", (float)sqrt(acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2]));
-#endif
-  } else if (!strcmp(cmd, "ATE0")) {
-    echo = 0;
-    n += snprintf(buf + n, bufsize - n, "OK");
-  } else if (!strcmp(cmd, "ATE1")) {
-    echo = 1;
-    n += snprintf(buf + n, bufsize - n, "OK");
-  } else if (!strcmp(cmd, "FS")) {
-    n += snprintf(buf + n, bufsize - n, "%u",
-#if STORAGE == STORAGE_NONE
-    0
-#else
-    logger.size()
-#endif
-      );
-  } else if (!memcmp(cmd, "01", 2)) {
-    byte pid = hex2uint8(cmd + 2);
-    for (byte i = 0; i < sizeof(obdData) / sizeof(obdData[0]); i++) {
-      if (obdData[i].pid == pid) {
-        n += snprintf(buf + n, bufsize - n, "%d", obdData[i].value);
-        pid = 0;
-        break;
-      }
-    }
-    if (pid) {
-      int value;
-      if (obd.readPID(pid, value)) {
-        n += snprintf(buf + n, bufsize - n, "%d", value);
-      } else {
-        n += snprintf(buf + n, bufsize - n, "N/A");
-      }
-    }
-  } else if (!strcmp(cmd, "VIN")) {
-    n += snprintf(buf + n, bufsize - n, "%s", vin[0] ? vin : "N/A");
-  } else if (!strcmp(cmd, "LAT") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%f", gd->lat);
-  } else if (!strcmp(cmd, "LNG") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%f", gd->lng);
-  } else if (!strcmp(cmd, "ALT") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%d", (int)gd->alt);
-  } else if (!strcmp(cmd, "SAT") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%u", (unsigned int)gd->sat);
-  } else if (!strcmp(cmd, "SPD") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%d", (int)(gd->speed * 1852 / 1000));
-  } else if (!strcmp(cmd, "CRS") && gd) {
-    n += snprintf(buf + n, bufsize - n, "%u", (unsigned int)gd->heading);
-  } else if (!strncmp(cmd, "LED_WHITE=", 10)) {
-    // Enable (1) or disable (0) the white/network LED at runtime and in NVS.
-    uint8_t v = (uint8_t)atoi(cmd + 10);
-    enableLedWhite = (v != 0);
-    esp_err_t e = nvs_set_u8(nvs, "LED_WHITE_EN", v);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-  } else if (!strncmp(cmd, "LED_RED=", 8)) {
-    // Enable (1) or disable (0) the red/power LED at runtime and in NVS.
-    uint8_t v = (uint8_t)atoi(cmd + 8);
-    enableLedRed = (v != 0);
-    esp_err_t e = nvs_set_u8(nvs, "LED_RED_EN", v);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-  } else if (!strncmp(cmd, "BEEP=", 5)) {
-    // Enable (1) or disable (0) the connection beep at runtime and in NVS.
-    uint8_t v = (uint8_t)atoi(cmd + 5);
-    enableBeep = (v != 0);
-    esp_err_t e = nvs_set_u8(nvs, "BEEP_EN", v);
-    if (e == ESP_OK) e = nvs_commit(nvs);
-    n += snprintf(buf + n, bufsize - n, e == ESP_OK ? "OK" : "ERR");
-  } else {
-    n += snprintf(buf + n, bufsize - n, "ERROR");
-  }
-  Serial.print(" -> ");
-  Serial.println((p = strchr(buf, '\r')) ? p + 1 : buf);
-  if (n < bufsize - 1) {
-    buf[n++] = '\r';
-  } else {
-    n = bufsize - 1;
-  }
-  buf[n] = 0;
-  ble_send_response(buf, n, cmd);
-#else
-  if (timeout) delay(timeout);
-#endif
-}
 
 // ---------------------------------------------------------------------------
 // printOtaStatus()
@@ -6021,7 +5667,7 @@ void setup()
     nvs_commit(nvs);
   }
   txqBegin(s_bootNo);
-  if (!sniffInit()) canOdoBegin();  // sniff mode on before the restart: it takes the controller
+  sniffInit();  // the CAN controller: sniff mode (if it was on) or vwOdoTick() (VW_ODO=1)
 
   // Redirect mbedTLS's internal TLS-session buffer allocations to PSRAM
   // before anything below can possibly touch WiFi/TLS (fixes the
@@ -6079,10 +5725,6 @@ void setup()
   // connected but nothing is ever sent". Moving creation here gives it first
   // claim on a much less fragmented heap. Retries + logs the outcome either
   // way so a future regression here can never be silently invisible again.
-#if ENABLE_BLE
-  // before any task can start a WiFi connect (it calls ble_pause())
-  ble_coex_init();
-#endif
   {
     Serial.printf("HEAP:free=%u maxblock=%u (internal, before telemetry task stack)\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
@@ -6162,19 +5804,6 @@ if (!state.check(STATE_MEMS_READY)) do {
       Serial.println(ip);
     } else {
       Serial.println("HTTPD:NO");
-    }
-  }
-#endif
-
-#if ENABLE_BLE
-  if (enableBle) {
-    if (btMode == 1) {
-      // classic-BT phone presence instead of NimBLE; bursts only while driving
-      bool ok = bt_presence_start([]() { return state.check(STATE_WORKING) && !state.check(STATE_STANDBY); });
-      Serial.printf("[BT] classic presence mode, %s\n", ok ? "started" : "FAILED");
-    } else {
-      // init BLE
-      ble_init("FreematicsPlus");
     }
   }
 #endif

@@ -19,13 +19,6 @@
 #include "FreematicsMEMS.h"
 #include "FreematicsOBD.h"
 
-// BLE SPP server: NimBLE-Arduino based (libraries/FreematicsPlus/utility/
-// ble_spp_server_nimble.cpp) - the old classic ESP-IDF Bluedroid
-// implementation (ble_spp_server.c/.h) was removed 2026-09-21.
-extern "C" {
-#include "utility/ble_spp_server_nimble.h"
-}
-
 #define PIN_SD_CS 5
 
 #define PIN_LINK_SPI_CS 2

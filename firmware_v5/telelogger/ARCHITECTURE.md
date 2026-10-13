@@ -34,7 +34,6 @@ telemetry(void*)       FreeRTOS task — owns WiFi/cellular, drains CBuffers,
 processOBD(buffer)      tiered Mode-1 PID polling (A2)
 processGPS(buffer)      GPS fix → buffer (Part B §2)
 processMEMS(buffer)     accelerometer/gyro → buffer (calibrateMEMS() once)
-processBLE(timeout)     NimBLE SPP-like service (A3)
 processExtInputs(buffer) digital/analog aux inputs on spare GPIOs
 
 wifiConnect() / wifiReconnectCurrent()   Part B §6
@@ -73,16 +72,22 @@ absent doesn't stall GPS/MEMS/network — each subsystem's readiness is its
 own flag, checked independently in process()).
 ```
 
-### A3. BLE (`processBLE()`, NimBLE backend)
+### A3. Bluetooth - REMOVED 2026-10-12, MEMS back
 
-A SPP-like GATT service (`ble_spp_server_nimble.cpp`) for local
-configuration/diagnostics over Bluetooth, independent of WiFi/cellular.
-**WiFi/BT coexistence**: `ble_pause()`/`ble_resume()` wrap every WiFi
-(re)connect attempt — `WiFi.setSleep(false)` is rejected by the ESP32's
-radio-coexistence layer while BLE is active, so BLE is paused for the
-duration of a WiFi join handshake and resumed after (`WiFi.setSleep(true)`
-called first, matching the same ordering used everywhere this pattern
-appears — see `ClientWIFI::begin()`'s own comment in `FreematicsNetwork.cpp`).
+No Bluetooth any more: the NimBLE GATT service for the Freematics Controller
+App (`ble_spp_server_nimble.cpp`), the BLE scan and the classic-BT phone
+presence (`bt_presence.cpp`) are deleted (last code with them: `02c2c28`).
+Why: crew detection reads the car instead (infotainment module 5F, DIDs
+0x1848-0x185A, verified 2026-10-11), the app never showed data reliably (see
+B10), and the BT controller (`libbtdm_app.a`) took **30.5 KB of IRAM** - it
+stayed linked even with `ENABLE_BLE=0` because `FreematicsNetwork.cpp`
+called `ble_pause()`/`ble_resume()` around every WiFi connect. MEMS needs
+~1.6 KB of IRAM for the ESP-IDF I2C driver ISR and did not fit (IRAM 838 B
+free, overflow 736 B); now `ENABLE_MEMS=1` with ~33.8 KB IRAM free
+(`.iram0.text` 129207 -> 96215 B). `WiFi.setSleep(false)` during a connect
+and `true` after it stay as before (handshake timeouts).
+MEMS motion (> `MOTION_THRESHOLD` 0.4 G) refreshes `lastMotionTime`
+(`/api/live` `ml` drops to 0) - verified 2026-10-12 08:30 by shaking the box.
 
 ### A4. Local HTTPD (`dataserver.cpp`, port 80)
 
@@ -388,6 +393,73 @@ never reached Traccar, 43 arrived twice, and the link was re-opened every
   power loss (`-DTEST_TXQ -DTXQ_RESERVE_BYTES=4096`, `cmd=TXQLOSE/TXQNOSD/
   TXQPAUSE/TXQRESUME`), OTA_READY over cellular, forced standby + report.
 
+### B4c. SD writer and the queue's SD copy (2026-10-12/13, `sdwriter.cpp/.h`)
+
+Bench load test S20 (sniff 1500 frames/s) found a hole of 84 frames in the
+file with `sd_lost=0`: the Arduino `File` class has a 4096 B stdio buffer
+(`vfs_api.cpp`, `DEFAULT_FILE_BUFFER_SIZE`), so `write()` "succeeded" for
+bytes that never reached the card, and `flush()` returns nothing. The same
+held for the telemetry SD copy (`FileLogger::dispatch`). Now:
+
+- **One writer task** (`sdwriter.cpp`) is the only one writing to the card:
+  telemetry/event lines (priority, a PSRAM ring of 64 KB, `SDLogger::dispatch`
+  never waits for the card) and sniff blocks (32 KB, pulled from
+  `sniffFill()`). POSIX `write()` + `fsync()` on the FatFs VFS; a write counts
+  only when both succeed. The writer keeps each file's confirmed length; after
+  a failure it reopens, `ftruncate()`s back to that length and writes the same
+  bytes again - no hole, no duplicate. Errors go into the file with their time
+  (`FE,SD_ERR t=..` / `# sderr t=..`). Telemetry is synced at most once a
+  second (a power loss costs at most ~1 s of the SD copy). No successful write
+  for 30 s = card gone: telemetry continues without an SD copy
+  (`txqSetFile(0)`, the queue's no-SD rules), sniff stops, every byte counted.
+  ESP-IDF FAT: `O_CREAT` alone means "open existing" - `O_APPEND`/`O_EXCL`
+  create. `cmd=SD?` = writer status.
+- **A record has an SD copy only when the card confirmed it**
+  (`txqSdConfirmed()`, flag `F_SD` in `QEnt.flags`, the former always-0 pad
+  byte). The queue drops an unconfirmed record as `lost=`, never relying on
+  an SD copy that may not exist.
+- **All other SD access holds `sdLock()`**: downloads and listings in
+  `dataserver.cpp`, the OTA files (`LockedFile`, `sdOpen/sdExists/sdRemove`
+  in `telestore.h`), purge, `SD.usedBytes()`. `SD.begin(..., "/sd", 10)`: 10
+  open files (default 5).
+- **Purge** (SD >= 80 %) never deletes the file being written or any file
+  >= `txqOldestFileNeeded()` (still to be replayed); `/api/log/delete` refuses
+  them too. `cmd=PURGE_DRY=<pct>` lists what a purge at <pct> would delete.
+- **SD replay fixes (2026-10-13):**
+  - it waits for `txqSetFile()` after a boot: after a power-on the network was
+    up ~5 s after boot, the card ~18 s; the replay found no file, ended and 38
+    records were never sent (lost=0). Nothing is sent before the card is set up
+    (keeps the order). No card at all: the cursor stays in NVS for a boot with
+    the card (`replay_deferred=1`); a replay ended at a missing file is counted
+    (`replay_abandoned=`).
+  - it ends only when a build finds nothing more to send: the full queue drops
+    records relying on the running replay; one dropped while the "last" replay
+    packet was out was never sent (2 records, bench).
+  - a growing last record of the current file is not sent half-written.
+- **PSRAM write-back:** "disabling cache on the ESP32 discards the data in the
+  SPI RAM cache" (ESP-IDF `spiram.h`) - the newest queue entries were lost
+  across a RESET (3 records, bench). `esp_spiram_writeback_cache()` after every
+  change of the reserve and in a shutdown handler (any `esp_restart()`). NOT
+  verified: whether it also writes back the other CPU's cache.
+- **Standby records** (SD is off in standby) are also kept in the internal
+  flash (`/spiffs/txq_sb.bin`, CRC per record, max 96 KB), deleted when all
+  are confirmed, restored with their own identity after a lost reserve.
+  `/live.html` removed from SPIFFS (unused).
+- **`prepareRestart(why)`** before every deliberate restart (OTA flashed /
+  staged / downloaded, NVS applied, wake, `RESET`, `/api/ota`): event
+  `RESTART <why>` + queue status, SD copy synced, sniff file closed with
+  `# restart` (its minutes saved - it resumes), `txqSave(true)`.
+- **Bench-verified 2026-10-12/13** (builds with `TEST_SNIFF_LOAD=1500`,
+  `TEST_SD_FAULT` (`SD_FAULT=<n>`: every n-th write fails half-way), `TEST_TXQ`
+  (+ SD event lines for every queue decision), `TEST_WIFI_DROP`,
+  `TXQ_RESERVE_BYTES=4096`): 60 min sniff with 217 injected write failures,
+  5 WiFi drops and a 19 min server outage - 5,401,959 frames, 0 gaps
+  (on-box `SNIFF_CHECK`), telemetry SD = Traccar 762/762; RESET in the middle
+  of a sniff (S24 `# restart`, S25 resumed, both 0 gaps); 5 rounds of
+  overflow + SD replay + RESET, SD = Traccar every round, 0 missing, 0 dup;
+  a real USB power loss during an SD replay: 1414/1414; standby record
+  restored from SPIFFS after a power loss and delivered.
+
 ## B5. SD store-and-forward / catch-up (HISTORY - replaced by B4b)
 
 ```
@@ -587,7 +659,13 @@ so the box never has to change firmware to record a scan-tool session.
   writer task (under `sdLock()`) to `/SNIFF/S<n>.LOG` in the HexSniff line
   format, with a header (vehicle, build, boot, `# clock unix=... at_ms=...`)
   and `# stats` every minute. `n` = above every file already on the card
-  (HexSniff's own S1..S16 are there); **nothing is ever deleted**.
+  (HexSniff's own S1..S16 are there). Written by the SD writer (B4c): every
+  block confirmed, `written` counts only confirmed frames; PSRAM queue 65536
+  frames (~40 s at 1580 frames/s; smaller if PSRAM is short, `queue=` in
+  `SNIFF?`). **Deleted after 60 days** (user 2026-10-12, `sniffPurgeOld()`,
+  age from `# clock unix=`, valid clock only, unix=0 never; daily and
+  `cmd=SNIFF_PURGE`). No start when the card is >= 70 % full
+  (`refused=1`, event `SNIFF REFUSED SD_FULL`; no card counts as full).
 - **While on, `telelogger.ino`:** no OBD requests (no `processOBD()`, no OBD
   re-init, `initialize()` skips OBD when `sniffWanted()`), no odometer/fuel
   reads, **no standby** (stationary forced false), so a VCDS session with the
@@ -603,6 +681,17 @@ so the box never has to change firmware to record a scan-tool session.
   `SNIFF ON file=S<n> min=<m>` / `SNIFF OFF`.
 - **Files:** `/api/sniff` (status JSON), `/api/sniff/live?id=&mask=`,
   `/api/sniff/list`, `/api/sniff/<n>`; web UI section "Sniff".
+- **After the Peugeot test 2026-10-12** (false ENGINE_STOP and VW 0x710 reads
+  in a foreign car after `SNIFF=0`): the odometer/fuel UDS reads run only with
+  NVS `VW_ODO=1` (`cmd=VW_ODO=0|1`, `VW_ODO?`; default 0 - set to 1 on the
+  Passat box 2026-10-13); sniff off no longer starts canodo itself
+  (`vwOdoTick()` does, by the switch); engine STOP is held off for 120 s after
+  sniff off (`s_sniffEndMs`). Part of a session: `/api/sniff/<n>?from=<ms>&to=<ms>`
+  (header lines first, binary search on the `<ms>` column).
+- **Bench tools (`TEST_SNIFF_LOAD` builds):** `SNIFF_CHECK=<n>` (the box
+  reads the file itself: lines, frames vs last `written`, malformed lines,
+  gaps/repeats in the 0x7AA counter, `# end`), `SNIFF_FAKEOLD=<days>`,
+  `SNIFF_LIMIT=<pct>`; `sniff_check.py` does the same for a downloaded file.
 - **Verified 2026-10-11 on the bench (no bus):** on/off over LAN and over
   Traccar, auto-off after 2 min, S17 created after the existing S16, old files
   untouched, file closed with `# end`. **Not yet verified:** a real capture
@@ -631,7 +720,9 @@ Added 2026-09-29 (found by reading the code, fixes not written yet):
   `WIFI_DROP`, build flag `-DTEST_WIFI_DROP`, 5 s outage) in one boot, no
   restart, cellular took over and WiFi came back each time, `lost=0`. Only
   the first drop had a never-begun modem (the exact crash state).
-- **Record lost across an OTA flash:** both flash paths (`standby()` start and
+- **Record lost across an OTA flash** (2026-10-13: likely the PSRAM cache
+  write-back, see B4c - verified on the bench for RESET, not for this exact
+  2026-09-28 case): both flash paths (`standby()` start and
   the boot-time staged flash) restart without draining the queue or
   `txqSave(true)`. On 2026-09-28 the STOP 22:41:03 existed only on SD and never
   reached the server; the exact sequence (OTA restart, then unplugged) is not
@@ -667,7 +758,7 @@ Added 2026-09-29 (found by reading the code, fixes not written yet):
   deployment - worth fixing server-side even though it's non-fatal to the
   actual update (loses the "device confirmed receipt" bookkeeping signal).
 - **Freematics Controller App does not reliably show live data (2026-09-23,
-  UNRESOLVED).** BLE link stays connected and the firmware keeps responding
+  CLOSED 2026-10-12: Bluetooth removed, see A3).** BLE link stays connected and the firmware keeps responding
   to commands (`[BLE] BATT/TEMP/FS/UPTIME` lines never stop in serial logs),
   but the app UI often shows nothing. Confirmed NOT caused by: WiFi/BT radio
   coexistence (reproduced with WiFi fully off), cellular RF interference

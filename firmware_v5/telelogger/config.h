@@ -21,9 +21,6 @@
 #define WIFI_SSID CONFIG_WIFI_SSID
 #define WIFI_PASSWORD CONFIG_WIFI_PASSWORD
 #endif
-#ifdef CONFIG_ENABLE_BLE
-#define ENABLE_BLE CONFIG_ENABLE_BLE
-#endif
 #ifdef CONFIG_ENABLE_HTTPD
 #define ENABLE_HTTPD CONFIG_ENABLE_HTTPD
 #endif
@@ -277,15 +274,6 @@
 #define FIRMWARE_VERSION "5.4"
 #endif
 
-// enable(1)/disable(0) BLE SPP server (for Freematics Controller App).
-#ifndef ENABLE_BLE
-#define ENABLE_BLE 1
-#endif
-
-// BLE SPP server implementation: NimBLE-Arduino (libraries/FreematicsPlus/
-// utility/ble_spp_server_nimble.cpp) - the only implementation as of
-// 2026-09-21, the old Bluedroid-based ble_spp_server.c/.h was removed
-// (dead weight once NimBLE became the sole backend).
 
 
 #endif // CONFIG_H_INCLUDED
