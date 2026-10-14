@@ -61,3 +61,21 @@ bool canOdoRead(uint32_t* km, CanOdoDiag* diag);
 // Fuel block 22 22B0 from the instrument cluster: the data bytes after
 // 62 22 B0 into `data` (up to `cap`), their count in `len`.
 bool canFuelRead(uint8_t* data, size_t cap, size_t* len, CanOdoDiag* diag);
+
+// Phones connected to the car's Bluetooth (VW Passat B8, infotainment module
+// 5F, 0x773 -> 0x7DD; DIDs from VCDS logs 2026-10-06/11, HexSniff):
+//   22 1848 = <found> <paired> <connected>
+//   22 1856 / 1857 = connected device 1 / 2: <signal> <name, 0-terminated>
+//     ("ff 00" = none)
+// Read first without a session change; only if the module refuses, after
+// 10 03 (VCDS sent it). Verified in the Passat 2026-10-13 15:50 (boot 132):
+// connected 0 -> 1, name "POCO F7 Ultra DereC".
+struct CanPhones {
+  uint8_t paired, connected;
+  bool session;               // the extended session was needed
+  uint8_t signal[2];
+  uint8_t nameLen[2];
+  uint8_t nameResult[2];      // CanOdoResult of a failed name read, 0 = ok
+  char name[2][40];
+};
+bool canPhonesRead(CanPhones* p, CanOdoDiag* diag);

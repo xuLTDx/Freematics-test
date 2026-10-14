@@ -7,6 +7,9 @@
 #define CANODO_GW_RESP    0x77A   // Gateway -> tester
 #define CANODO_IC_REQ     0x714   // tester -> Instruments (module 17)
 #define CANODO_IC_RESP    0x77E   // Instruments -> tester
+#define CANODO_MM_REQ     0x773   // tester -> infotainment (module 5F)
+#define CANODO_MM_RESP    0x7DD   // infotainment -> tester
+#define CANODO_PENDING_MS 3000    // after "response pending" (7F xx 78): the ECU's longer deadline
 #define CANODO_PAD        0x55
 #define CANODO_TIMEOUT_MS 300     // per wait for the next frame
 #define CANODO_MAX_REPLY  64      // fuel reply: 3 + 53 bytes
@@ -101,10 +104,10 @@ static void countPending()
   while (twai_receive(&m, 0) == ESP_OK) countFrame(m);
 }
 
-static bool waitFrame(uint32_t respId, twai_message_t* m)
+static bool waitFrame(uint32_t respId, twai_message_t* m, uint32_t timeoutMs = CANODO_TIMEOUT_MS)
 {
   uint32_t start = millis();
-  while (millis() - start < CANODO_TIMEOUT_MS) {
+  while (millis() - start < timeoutMs) {
     if (twai_receive(m, pdMS_TO_TICKS(20)) != ESP_OK) continue;
     countFrame(*m);
     if (m->identifier == respId && !m->extd && m->data_length_code >= 2) return true;
@@ -141,12 +144,13 @@ static bool udsRead(uint32_t reqId, uint32_t respId, uint16_t did,
 
   size_t want = 0, got = 0;
   twai_message_t m;
+  uint32_t wait = CANODO_TIMEOUT_MS;
   for (;;) {
-    if (!waitFrame(respId, &m)) return fail(d, CANODO_NO_REPLY);
+    if (!waitFrame(respId, &m, wait)) return fail(d, CANODO_NO_REPLY);
     uint8_t pci = m.data[0] >> 4;
     if (pci == 0) {                        // single frame (negative response or short reply)
       size_t n = m.data[0] & 0x0F;
-      if (n >= 3 && m.data[1] == 0x7F && m.data[3] == 0x78) continue;  // response pending
+      if (n >= 3 && m.data[1] == 0x7F && m.data[3] == 0x78) { wait = CANODO_PENDING_MS; continue; }  // response pending
       if (n >= 3 && m.data[1] == 0x7F) {
         setRaw(d, m.data + 1, n > 7 ? 7 : n);
         d->nrc = m.data[3];
@@ -208,5 +212,60 @@ bool canFuelRead(uint8_t* data, size_t cap, size_t* len, CanOdoDiag* d)
   n -= 3;                                  // drop 62 22 B0
   *len = n < cap ? n : cap;
   memcpy(data, payload + 3, *len);
+  return true;
+}
+
+// 10 03 (extended diagnostic session) - VCDS sent it before reading module 5F
+// (2026-10-06); used only when a read without it is refused
+static bool udsExtendedSession(uint32_t reqId, uint32_t respId, CanOdoDiag* d)
+{
+  const uint8_t req[8] = {0x02, 0x10, 0x03, CANODO_PAD, CANODO_PAD, CANODO_PAD, CANODO_PAD, CANODO_PAD};
+  if (!sendFrame(reqId, req)) return fail(d, CANODO_TX_FAILED);
+  twai_message_t m;
+  uint32_t wait = CANODO_TIMEOUT_MS;
+  for (;;) {
+    if (!waitFrame(respId, &m, wait)) return fail(d, CANODO_NO_REPLY);
+    size_t n = m.data[0] & 0x0F;
+    if ((m.data[0] >> 4) != 0 || n < 2) continue;
+    if (n >= 3 && m.data[1] == 0x7F && m.data[3] == 0x78) { wait = CANODO_PENDING_MS; continue; }
+    if (m.data[1] == 0x50 && m.data[2] == 0x03) return true;
+    if (m.data[1] == 0x7F) { d->nrc = m.data[3]; return fail(d, CANODO_NRC); }
+    return fail(d, CANODO_BAD_REPLY);
+  }
+}
+
+bool canPhonesRead(CanPhones* p, CanOdoDiag* d)
+{
+  memset(p, 0, sizeof(*p));
+  uint8_t pl[CANODO_MAX_REPLY];
+  size_t n = 0;
+  bool ok = udsRead(CANODO_MM_REQ, CANODO_MM_RESP, 0x1848, pl, sizeof(pl), &n, d);
+  if (!ok && d->result == CANODO_NRC) {
+    // refused in the default session: once more in the extended one
+    CanOdoDiag s;
+    memset(&s, 0, sizeof(s));
+    if (udsExtendedSession(CANODO_MM_REQ, CANODO_MM_RESP, &s)) {
+      p->session = true;
+      ok = udsRead(CANODO_MM_REQ, CANODO_MM_RESP, 0x1848, pl, sizeof(pl), &n, d);
+    }
+  }
+  if (!ok) return false;
+  // 62 18 48 <found> <paired> <connected>
+  if (n < 6) return fail(d, CANODO_BAD_REPLY);
+  p->paired = pl[4];
+  p->connected = pl[5];
+  for (int i = 0; i < 2 && i < p->connected; i++) {
+    CanOdoDiag d2;
+    if (!udsRead(CANODO_MM_REQ, CANODO_MM_RESP, 0x1856 + i, pl, sizeof(pl), &n, &d2) || n < 4) {
+      p->nameResult[i] = d2.result ? d2.result : CANODO_BAD_REPLY;
+      continue;
+    }
+    // 62 18 56 <signal> <name ... 00>
+    p->signal[i] = pl[3];
+    size_t k = 0;
+    for (size_t j = 4; j < n && pl[j] && k < sizeof(p->name[i]) - 1; j++) p->name[i][k++] = (char)pl[j];
+    p->name[i][k] = 0;
+    p->nameLen[i] = k;
+  }
   return true;
 }

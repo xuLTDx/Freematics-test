@@ -595,6 +595,12 @@ uint32_t s_lowVoltSinceMs = 0;
 #define PID_CAN_RAW       0x38F   // gateway reply bytes (decimal, ';'-separated)
 #define PID_CAN_LASTID    0x390   // ID of the last frame received
 #define PID_SNIFF_MIN     0x393   // sniff mode: minutes left, 0 = off (sniff.h)
+// phones connected to the car's Bluetooth, read from the VW infotainment over
+// CAN (canPhonesRead, 2026-10-13, verified in the Passat 2026-10-13)
+#define PID_PHONES        0x394   // connected count; 0xFF = read failed (result in PID_PHONES_RES)
+#define PID_PHONE1        0x395   // name of connected phone 1 (bytes, decimal ';'-separated)
+#define PID_PHONE2        0x396   // name of connected phone 2
+#define PID_PHONES_RES    0x397   // CanOdoResult*256 + NRC of a failed read
 uint32_t s_odoKm = 0;           // last good reading
 uint32_t s_odoMs = 0;           // millis() of that reading
 uint32_t s_odoTryMs = 0;        // millis() of the last attempt
@@ -666,8 +672,55 @@ static void fuelRead()
   }
 }
 
+// Phones connected to the car (module 5F): read with the odometer (every
+// minute while the engine runs, and at START/STOP - the crew of the trip).
+// An SD event line when the result changes, readable names.
+void logNetEvent(const char* msg);
+static CanPhones s_phones;
+static bool s_phonesOk = false, s_phonesNew = false;
+static CanOdoDiag s_phonesDiag;
+static void phonesRead(bool always)
+{
+  CanPhones p;
+  bool ok = canPhonesRead(&p, &s_phonesDiag);
+  bool changed = ok != s_phonesOk || p.connected != s_phones.connected ||
+                 strcmp(p.name[0], s_phones.name[0]) || strcmp(p.name[1], s_phones.name[1]);
+  s_phones = p;
+  s_phonesOk = ok;
+  s_phonesNew = true;
+  char ev[140];
+  if (ok) {
+    char n0[40], n1[40];
+    for (int i = 0; i < 2; i++) {
+      char* o = i ? n1 : n0;
+      const char* src = p.name[i];
+      int k = 0;
+      for (; src[k] && k < 39; k++) o[k] = (src[k] < 0x20 || src[k] > 0x7E || src[k] == ',') ? '_' : src[k];
+      o[k] = 0;
+    }
+    snprintf(ev, sizeof(ev), "PHONES connected=%u paired=%u session=%d 1=%s 2=%s", p.connected, p.paired,
+             p.session ? 1 : 0, n0, n1);
+  } else {
+    snprintf(ev, sizeof(ev), "PHONES FAIL res=%u nrc=0x%02X", s_phonesDiag.result, s_phonesDiag.nrc);
+  }
+  Serial.printf("[CAN] %s\n", ev);
+  if (changed || always) logNetEvent(ev);
+}
+
 static void addOdo(CBuffer* b)
 {
+  if (s_phonesNew) {
+    s_phonesNew = false;
+    uint8_t c = s_phonesOk ? s_phones.connected : 0xFF;
+    b->add(PID_PHONES, ELEMENT_UINT8, &c, sizeof(c));
+    if (s_phonesOk) {
+      if (s_phones.nameLen[0]) b->add(PID_PHONE1, ELEMENT_UINT8, s_phones.name[0], s_phones.nameLen[0], s_phones.nameLen[0]);
+      if (s_phones.nameLen[1]) b->add(PID_PHONE2, ELEMENT_UINT8, s_phones.name[1], s_phones.nameLen[1], s_phones.nameLen[1]);
+    } else {
+      uint16_t r = (uint16_t)s_phonesDiag.result * 256 + s_phonesDiag.nrc;
+      b->add(PID_PHONES_RES, ELEMENT_UINT16, &r, sizeof(r));
+    }
+  }
   if (s_fuelNew) {
     s_fuelNew = false;
     if (s_fuelLen >= 36) {
@@ -2380,6 +2433,7 @@ static void emitEngineEvent(bool start, time_t when)
   // the trip's km come from the odometer in its START and STOP records: read
   // it now (the gateway still answers right after the engine stops)
   odoRead();
+  if (s_vwOdoOn) phonesRead(true);  // the crew at the trip's start / end
   addOdo(b);
   uint8_t ev = start ? 1 : 2;
   b->add(PID_ENGINE_EVENT, ELEMENT_UINT8, &ev, sizeof(ev));
@@ -2591,9 +2645,9 @@ void process()
   engineTick(buffer);
 #ifdef TEST_CANODO_BENCH
   // bench only: attempts without a running engine, to see the diagnosis reach the server
-  if (s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); phonesRead(false); }
 #else
-  if (s_engineOn && s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); }
+  if (s_engineOn && s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); phonesRead(false); }
 #endif
   addOdo(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into

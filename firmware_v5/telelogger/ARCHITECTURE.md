@@ -638,6 +638,13 @@ bytes 1..3. Verified in the car: 157638 km = dashboard.
   0x714 → 0x77E): candidate [34:36] in 0.1 l and the raw data bytes -
   **position of the litres NOT confirmed** (the candidate rose while driving
   on 2026-09-28).
+- `0x394`-`0x397` = phones connected to the infotainment (crew detection,
+  `canPhonesRead`): UDS 0x773 → 0x7DD, `22 1848` byte 3 = connected count
+  (`0x394`; 0xFF = read failed, result in `0x397`), `22 1856`/`1857` = name
+  of connected device 1/2 (`0x395`/`0x396`, bytes decimal `;`-separated);
+  `10 03` only if the module refuses. Read at every engine START/STOP and once a
+  minute while the engine runs. **Verified in the car 2026-10-13** (boot 132:
+  0 at the start, then 1 = "POCO F7 Ultra DereC").
 - Bench build flag `-DTEST_CANODO_BENCH`: tries without a running engine.
 
 Traccar side (`ReportUtils.applyCarOdometer`, device attribute
