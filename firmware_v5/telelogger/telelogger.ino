@@ -1527,8 +1527,16 @@ bool httpIsStandby() {
 
 // Called from handlerControl (httpd task, cmd=OTA_CHECK_NOW) to request an
 // immediate pull-OTA check on the telemetry task's next pass.
+static void otaLog(const char* text);
 void httpTriggerOtaCheckNow() {
     s_ota_check_now = true;
+    // 2026-10-14: on a powerbank (cellular) four OTA_READY gave no meta.json and no OTA line -
+    // say what the request found, so the server sees why nothing follows
+    char m[64];
+    snprintf(m, sizeof(m), "OTA-PULL REQ token=%d interval=%u wifi=%d cell=%d", otaToken[0] ? 1 : 0,
+             (unsigned)otaCheckIntervalS, state.check(STATE_WIFI_CONNECTED) ? 1 : 0,
+             state.check(STATE_CELL_CONNECTED) ? 1 : 0);
+    otaLog(m);
 }
 
 void printTimeoutStats()
@@ -3568,11 +3576,29 @@ void telemetry(void* inst)
       // OTA_READY) is now the ONLY trigger. otaCheckIntervalS > 0 is kept
       // purely as the existing OTA-provisioned/enabled gate (0 = OTA
       // disabled entirely), no longer as a timer period.
+      if (s_ota_check_now && !(otaToken[0] && otaCheckIntervalS > 0 &&
+          (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED)))) {
+        static uint32_t lastSkipMs = 0;   // requested, but the check cannot run now - say why (once a minute)
+        if (!lastSkipMs || millis() - lastSkipMs >= 60000) {
+          lastSkipMs = millis();
+          char m[64];
+          snprintf(m, sizeof(m), "OTA-PULL WAIT token=%d interval=%u wifi=%d cell=%d", otaToken[0] ? 1 : 0,
+                   (unsigned)otaCheckIntervalS, state.check(STATE_WIFI_CONNECTED) ? 1 : 0,
+                   state.check(STATE_CELL_CONNECTED) ? 1 : 0);
+          otaLog(m);
+        }
+      }
       if (otaToken[0] && otaCheckIntervalS > 0 &&
           (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED))) {
         bool checkNow = s_ota_check_now;
         if (checkNow) {
           s_ota_check_now = false;
+          {
+            char m[48];
+            snprintf(m, sizeof(m), "OTA-PULL CHECK wifi=%d cell=%d", WiFi.isConnected() ? 1 : 0,
+                     state.check(STATE_CELL_CONNECTED) ? 1 : 0);
+            otaLog(m);
+          }
           Serial.println("[OTA-PULL] Checking for firmware update (triggered)...");
           // Do NOT close the telemetry TLS session here.  In virtually all
           // deployments (Nabu Casa / hooks.nabu.casa) the OTA host and the
@@ -4586,7 +4612,7 @@ static int takeOtaStatus(uint8_t* out, int cap)
 #if ENABLE_WIFI
 bool performPullOtaCheck()
 {
-  if (!otaToken[0] || !otaHost[0]) return false;
+  if (!otaToken[0] || !otaHost[0]) { otaLog("OTA-PULL STOP no token/host"); return false; }
 
   // 2026-09-23: OTA now works over either transport - see the useCell
   // branches below (meta.json fetch, firmware download) for the real
@@ -4595,8 +4621,8 @@ bool performPullOtaCheck()
   // This whole function only compiles under the outer #if ENABLE_WIFI
   // (see above), so WiFi.isConnected() is always safe to call here.
   bool useCell = !WiFi.isConnected() && state.check(STATE_CELL_CONNECTED);
-  if (!WiFi.isConnected() && !useCell) return false;
-  if (useCell && !ensureOtaCellAttached()) return false;
+  if (!WiFi.isConnected() && !useCell) { otaLog("OTA-PULL STOP no wifi, no cell"); return false; }
+  if (useCell && !ensureOtaCellAttached()) { otaLog("OTA-PULL STOP cell attach failed"); return false; }
 #if 0
   return false;  // No WiFi compiled in Ã¢â‚¬â€ OTA unavailable
 #endif
