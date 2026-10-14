@@ -7,6 +7,15 @@ session's actual debugging focus) and the WiFi/geofence design. Written
 2026-09-22, verified against the actual code — see file:line references
 throughout. Companion doc: `traccar` repo's `ARCHITECTURE_FREEMATICS.md`.
 
+**Server since 2026-10-14 00:40: FleetNest** (`xuLTDx/FleetNest`, on uLTD), not Traccar. The box
+is unchanged: it still sends the same UDP protocol to `ultd.mooo.com:6000`; FleetNest took the
+port over (Traccar stopped and disabled, its database kept) and answers byte-identically (ACK
+after storage, event replies, `EV=5` commands) - FleetNest `apps/telemetry/protocol.py`. OTA:
+`freematics-ota` asks FleetNest for the build and queues `OTA_READY` there
+(`fleetnest_credentials.json` `active=true`); `locations.csv` comes from FleetNest places. Where
+this document says "Traccar" for the server side, read FleetNest from that date; the Traccar-side
+details (decoder, calibration, `ReportUtils`) are history.
+
 ## Part A — the whole firmware
 
 ### A1. Every top-level function (`telelogger.ino`, declaration order)
