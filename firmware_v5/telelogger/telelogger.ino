@@ -601,6 +601,11 @@ uint32_t s_lowVoltSinceMs = 0;
 #define PID_PHONE1        0x395   // name of connected phone 1 (bytes, decimal ';'-separated)
 #define PID_PHONE2        0x396   // name of connected phone 2
 #define PID_PHONES_RES    0x397   // CanOdoResult*256 + NRC of a failed read
+// SD file fingerprint for FleetNest's "SD = database" check (sddigest.h, txqSdDigest):
+// file;boot;count;first ts;last ts;CRC-32 of the ts the card confirmed - in START/STOP
+// records, every SD_DIGEST_MS while driving and once after the file is closed
+#define PID_SD_DIGEST     0x398
+#define SD_DIGEST_MS      600000UL
 uint32_t s_odoKm = 0;           // last good reading
 uint32_t s_odoMs = 0;           // millis() of that reading
 uint32_t s_odoTryMs = 0;        // millis() of the last attempt
@@ -2410,6 +2415,20 @@ static void addTimeOf(CBuffer* b, time_t when)
   b->add(PID_GPS_DATE, ELEMENT_UINT32, &d, sizeof(d));
 }
 
+// The SD fingerprint into a record: a closed file's final one first (once), otherwise the open
+// file's when `now` or SD_DIGEST_MS passed. A few bytes in a record that goes anyway.
+static void addSdDigest(CBuffer* b, bool now)
+{
+  static uint32_t lastMs = 0;
+  uint32_t v[6];
+  if (txqSdDigestClosed(v)) {
+    b->add(PID_SD_DIGEST, ELEMENT_UINT32, v, sizeof(v), 6);
+  } else if ((now || millis() - lastMs >= SD_DIGEST_MS) && txqSdDigest(v)) {
+    b->add(PID_SD_DIGEST, ELEMENT_UINT32, v, sizeof(v), 6);
+    lastMs = millis();
+  }
+}
+
 // One record for an engine event, timed at the event itself (a STOP's time is
 // the last RPM > 0, i.e. earlier than now). Written to SD here; the telemetry
 // task sends it like any record (and the standby drain before sleeping).
@@ -2443,6 +2462,7 @@ static void emitEngineEvent(bool start, time_t when)
     int32_t zero = 0;
     b->add(PID_RPM | 0x100, ELEMENT_INT32, &zero, sizeof(zero));
   }
+  addSdDigest(b, true);  // what the card holds of this file so far
   b->timestamp = nextRecordTs();
   b->state = BUFFER_STATE_FILLED;
 #if STORAGE != STORAGE_NONE
@@ -2850,6 +2870,7 @@ void process()
   }
 #endif
 
+  addSdDigest(buffer, false);
   buffer->timestamp = nextRecordTs();  // PID 0 = the record's identity within this boot
   buffer->state = BUFFER_STATE_FILLED;
 
@@ -3171,6 +3192,8 @@ static void buildStandbyReport(CStorageRAM& rb)
   }
   int32_t rpm0 = 0;  // parked: ignition off for Traccar's trip detection
   rb.log(PID_RPM | 0x100, &rpm0, 1);
+  uint32_t dg[6];  // the file closed when standby began: its final SD fingerprint, once
+  if (txqSdDigestClosed(dg)) rb.log(PID_SD_DIGEST, dg, 6);
   int len = rb.length();
   if (len && rb.buffer()[len - 1] == ',') len--;
   txqPushEx(recTs, rb.buffer(), len, true);  // + internal flash: survives a power loss

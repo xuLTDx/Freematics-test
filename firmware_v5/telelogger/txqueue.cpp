@@ -9,6 +9,7 @@
 #include <SPIFFS.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include "sddigest.h"
 #include "txqueue.h"
 #include "esp32/spiram.h"   // esp_spiram_writeback_cache()
 #include "esp_system.h"     // esp_register_shutdown_handler()
@@ -68,6 +69,11 @@ static QHdr* H;
 #define DSTART ((uint32_t)sizeof(QHdr))
 
 static uint32_t s_boot, s_file, s_lastTs;
+// fingerprint of the open /DATA file (records the card confirmed) and of the last closed one,
+// reported once (FleetNest SD = database check; not kept over a reboot - the next boot opens
+// a new file and the STOP record already carried the trip's fingerprint)
+static SdDigest s_dg, s_dgClosed;
+static bool s_dgClosedNew;
 // SD replay vs. the card's state (2026-10-13 bench: after a power-on the
 // network was up ~5 s after boot, the card ~18 s; the replay found no file,
 // took that for "nothing left" and stopped - 38 records never sent, lost=0)
@@ -258,6 +264,10 @@ void txqBegin(uint32_t bootId)
 void txqSetFile(uint32_t fileId)
 {
   lock();
+  if (fileId != s_dg.file) {
+    if (s_dg.file && s_dg.count) { s_dgClosed = s_dg; s_dgClosedNew = true; }
+    sdDigestStart(&s_dg, fileId, s_boot);
+  }
   s_file = fileId;
   s_fileKnown = true;
   if (fileId > s_maxFile) s_maxFile = fileId;
@@ -508,6 +518,8 @@ void txqSdConfirmed(const uint32_t* ts, int n)
 {
   if (n <= 0) return;
   lock();
+  if (s_dg.file && s_dg.file == s_file)
+    for (int k = 0; k < n; k++) sdDigestAdd(&s_dg, ts[k]);
   uint32_t pos = H->tail;
   int j = 0;
   for (uint32_t i = 0; i < H->count && j < n; i++) {
@@ -986,4 +998,37 @@ void txqStatus(char* buf, int size)
       (unsigned)s_lost, (unsigned)sdWait, (unsigned)s_sbSaved, (unsigned)s_sbNotSaved, (unsigned)s_sbRestored,
       s_sbFile ? 1 : 0, s_replayDeferred ? 1 : 0, (unsigned)s_replayAbandoned, (unsigned)newestBoot, (unsigned)newestTs);
   unlock();
+}
+
+// SD file fingerprints (sddigest.h) - FleetNest compares them with its database
+bool txqSdDigest(uint32_t out[6])
+{
+  lock();
+  bool ok = s_dg.file && s_dg.count;
+  if (ok) sdDigestValues(&s_dg, out);
+  unlock();
+  return ok;
+}
+
+bool txqSdDigestClosed(uint32_t out[6])
+{
+  lock();
+  bool ok = s_dgClosedNew;
+  if (ok) { sdDigestValues(&s_dgClosed, out); s_dgClosedNew = false; }
+  unlock();
+  return ok;
+}
+
+// RESEND=<file> from the server: it repeats a command until it sees the result, so a replay
+// that already runs at or before this file (and goes on to the newest) is left alone -
+// restarting it every minute would never finish. Returns true when a replay was started.
+bool txqResendRequest(uint32_t fileId)
+{
+  if (!fileId) return false;
+  lock();
+  bool covered = s_sdActive && s_sdFile && s_sdFile <= fileId;
+  unlock();
+  if (covered) return false;
+  txqResendFrom(fileId);
+  return true;
 }

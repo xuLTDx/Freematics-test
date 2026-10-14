@@ -658,6 +658,16 @@ void TeleClientUDP::inbound()
           Serial.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
           logNetEvent(on ? "NET CMD_SNIFF_ON" : "NET CMD_SNIFF_OFF");
         }
+        // SD file sent again (FleetNest found its fingerprint differs from the database):
+        // CMD=RESEND=<file> - that file and the later ones, the server drops duplicates
+        if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
+          uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);
+          bool started = txqResendRequest(f);
+          Serial.printf("[UDP] CMD:RESEND=%u %s\n", (unsigned)f, started ? "started" : "already running");
+          char m[48];
+          snprintf(m, sizeof(m), "NET CMD_RESEND file=%u %s", (unsigned)f, started ? "start" : "running");
+          logNetEvent(m);
+        }
         break;
     }
     }

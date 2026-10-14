@@ -58,7 +58,11 @@ uint32_t txqBootId();
 bool txqUsingPsram();
 uint32_t txqUsedPercent();
 void txqStatus(char* buf, int size); // one line for logs / web UI
-void txqResendFrom(uint32_t fileId); // manual: replay /DATA/<fileId>.CSV and later from SD
+void txqResendFrom(uint32_t fileId); // replay /DATA/<fileId>.CSV and later from SD (web UI, server RESEND=)
+// SD file fingerprint for the server's "SD = database" check (sddigest.h, PID 0x398):
+bool txqSdDigest(uint32_t out[6]);       // the open file so far (false = no file / nothing confirmed)
+bool txqResendRequest(uint32_t fileId);  // server RESEND=: replay unless one already covers the file
+bool txqSdDigestClosed(uint32_t out[6]); // the last closed file, once (false = nothing new to report)
 #ifdef TEST_TXQ
 void txqTestLoseReserve();           // bench: as if power was lost (reserve not valid at next boot)
 #endif
