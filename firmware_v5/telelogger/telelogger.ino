@@ -4580,30 +4580,36 @@ static String _maskOtaHost(const char* host) {
 // OTA steps: an SD event line and the same text for the server (PID_OTA_STATUS, next record).
 // 2026-10-14: an OTA over the cellular link stopped after meta.json with nothing on SD -
 // every step is now visible on the server.
+// a short queue: several steps can come within one record interval (2026-10-14: with one slot
+// only the last step of an OTA reached the server); one line per record, oldest first
+#define OTA_STATUS_Q 8
 static portMUX_TYPE s_otaMux = portMUX_INITIALIZER_UNLOCKED;
-static char s_otaStatus[64];
-static volatile bool s_otaStatusNew = false;
+static char s_otaStatus[OTA_STATUS_Q][64];
+static uint8_t s_otaHead = 0, s_otaCount = 0;
 static void otaLog(const char* text)
 {
 #if STORAGE != STORAGE_NONE
   if (state.check(STATE_STORAGE_READY)) logger.logEvent(text);
 #endif
   portENTER_CRITICAL(&s_otaMux);
-  strncpy(s_otaStatus, text, sizeof(s_otaStatus) - 1);
-  s_otaStatus[sizeof(s_otaStatus) - 1] = '\0';
-  s_otaStatusNew = true;
+  uint8_t slot = (s_otaHead + s_otaCount) % OTA_STATUS_Q;
+  if (s_otaCount == OTA_STATUS_Q) s_otaHead = (s_otaHead + 1) % OTA_STATUS_Q;  // full: drop the oldest
+  else s_otaCount++;
+  strncpy(s_otaStatus[slot], text, sizeof(s_otaStatus[0]) - 1);
+  s_otaStatus[slot][sizeof(s_otaStatus[0]) - 1] = '\0';
   portEXIT_CRITICAL(&s_otaMux);
 }
 
-// the pending OTA text into a record (once); n = bytes copied, 0 = nothing new
+// the oldest pending OTA line into a record; n = bytes copied, 0 = nothing pending
 static int takeOtaStatus(uint8_t* out, int cap)
 {
   int n = 0;
   portENTER_CRITICAL(&s_otaMux);
-  if (s_otaStatusNew) {
-    n = strnlen(s_otaStatus, cap);
-    memcpy(out, s_otaStatus, n);
-    s_otaStatusNew = false;
+  if (s_otaCount) {
+    n = strnlen(s_otaStatus[s_otaHead], cap);
+    memcpy(out, s_otaStatus[s_otaHead], n);
+    s_otaHead = (s_otaHead + 1) % OTA_STATUS_Q;
+    s_otaCount--;
   }
   portEXIT_CRITICAL(&s_otaMux);
   return n;
