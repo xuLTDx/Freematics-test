@@ -654,6 +654,12 @@ bytes 1..3. Verified in the car: 157638 km = dashboard.
   `10 03` only if the module refuses. Read at every engine START/STOP and once a
   minute while the engine runs. **Verified in the car 2026-10-13** (boot 132:
   0 at the start, then 1 = "POCO F7 Ultra DereC").
+- `0x398` = SD file fingerprint for FleetNest's "SD = database" check (2026-10-14,
+  `sddigest.h`, `txqSdDigest`): `file;boot;count;first ts;last ts;CRC-32` of the ts the card
+  confirmed (`txqSdConfirmed`, no card read). In START/STOP records, every 10 min while driving
+  and once after the file closes (next record / standby report). The server compares it with
+  its records and sends `CMD=RESEND=<file>` when some are missing (`txqResendRequest`: ignored
+  while a replay already covers that file). Design: FleetNest `docs/navrh-sd-kontrola.md`.
 - Bench build flag `-DTEST_CANODO_BENCH`: tries without a running engine.
 
 Traccar side (`ReportUtils.applyCarOdometer`, device attribute
