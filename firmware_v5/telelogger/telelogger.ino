@@ -5000,7 +5000,12 @@ bool performPullOtaCheck()
       if (written != fwSize) {
         Serial.printf("[OTA-PULL] Cell recv incomplete at %u / %u bytes\n", (unsigned)written, (unsigned)fwSize);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_RECV");
+        if (state.check(STATE_STORAGE_READY)) {
+          char m[64];  // how far it got (the rest resumes with Range at the next check)
+          snprintf(m, sizeof(m), "OTA-PULL ERR=CELL_RECV %u/%u from %u in %ums", (unsigned)written,
+                   (unsigned)fwSize, (unsigned)resumeFrom, (unsigned)(millis() - dlStart));
+          otaLog(m);
+        }
 #endif
         dlOk = false;
       } else {
