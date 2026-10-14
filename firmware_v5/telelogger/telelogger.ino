@@ -605,6 +605,9 @@ uint32_t s_lowVoltSinceMs = 0;
 // file;boot;count;first ts;last ts;CRC-32 of the ts the card confirmed - in START/STOP
 // records, every SD_DIGEST_MS while driving and once after the file is closed
 #define PID_SD_DIGEST     0x398
+// OTA progress / result as text (bytes, decimal ';'-separated, like the phone names): the last
+// "OTA-PULL ..." line, once, in the next record - FleetNest shows why an OTA did or did not happen
+#define PID_OTA_STATUS    0x399
 #define SD_DIGEST_MS      600000UL
 uint32_t s_odoKm = 0;           // last good reading
 uint32_t s_odoMs = 0;           // millis() of that reading
@@ -2421,6 +2424,9 @@ static void addSdDigest(CBuffer* b, bool now)
 {
   static uint32_t lastMs = 0;
   uint32_t v[6];
+  uint8_t ota[64];
+  int on = takeOtaStatus(ota, sizeof(ota));
+  if (on) b->add(PID_OTA_STATUS, ELEMENT_UINT8, ota, on, on);
   if (txqSdDigestClosed(v)) {
     b->add(PID_SD_DIGEST, ELEMENT_UINT32, v, sizeof(v), 6);
   } else if ((now || millis() - lastMs >= SD_DIGEST_MS) && txqSdDigest(v)) {
@@ -3194,6 +3200,9 @@ static void buildStandbyReport(CStorageRAM& rb)
   rb.log(PID_RPM | 0x100, &rpm0, 1);
   uint32_t dg[6];  // the file closed when standby began: its final SD fingerprint, once
   if (txqSdDigestClosed(dg)) rb.log(PID_SD_DIGEST, dg, 6);
+  uint8_t ota[64];
+  int on = takeOtaStatus(ota, sizeof(ota));
+  if (on) rb.log(PID_OTA_STATUS, ota, (uint8_t)on);
   int len = rb.length();
   if (len && rb.buffer()[len - 1] == ',') len--;
   txqPushEx(recTs, rb.buffer(), len, true);  // + internal flash: survives a power loss
@@ -4542,6 +4551,38 @@ static String _maskOtaHost(const char* host) {
 // used ONLY by pull-OTA, completely independent of SERVER_PROTOCOL/
 // teleClient.wifi's type - so this now compiles and runs on every
 // ENABLE_WIFI build regardless of the main telemetry transport.
+// OTA steps: an SD event line and the same text for the server (PID_OTA_STATUS, next record).
+// 2026-10-14: an OTA over the cellular link stopped after meta.json with nothing on SD -
+// every step is now visible on the server.
+static portMUX_TYPE s_otaMux = portMUX_INITIALIZER_UNLOCKED;
+static char s_otaStatus[64];
+static volatile bool s_otaStatusNew = false;
+static void otaLog(const char* text)
+{
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) logger.logEvent(text);
+#endif
+  portENTER_CRITICAL(&s_otaMux);
+  strncpy(s_otaStatus, text, sizeof(s_otaStatus) - 1);
+  s_otaStatus[sizeof(s_otaStatus) - 1] = '\0';
+  s_otaStatusNew = true;
+  portEXIT_CRITICAL(&s_otaMux);
+}
+
+// the pending OTA text into a record (once); n = bytes copied, 0 = nothing new
+static int takeOtaStatus(uint8_t* out, int cap)
+{
+  int n = 0;
+  portENTER_CRITICAL(&s_otaMux);
+  if (s_otaStatusNew) {
+    n = strnlen(s_otaStatus, cap);
+    memcpy(out, s_otaStatus, n);
+    s_otaStatusNew = false;
+  }
+  portEXIT_CRITICAL(&s_otaMux);
+  return n;
+}
+
 #if ENABLE_WIFI
 bool performPullOtaCheck()
 {
@@ -4621,7 +4662,7 @@ bool performPullOtaCheck()
     if (!otaCellClient.open(otaHost, otaPort)) {
       Serial.printf("[OTA-PULL] Cell connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_CONNECT");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_CONNECT");
 #endif
       return false;
     }
@@ -4629,7 +4670,7 @@ bool performPullOtaCheck()
       Serial.println("[OTA-PULL] Cell META send failed");
       otaCellClient.close();
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_META_SEND");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_META_SEND");
 #endif
       return false;
     }
@@ -4652,7 +4693,7 @@ bool performPullOtaCheck()
       if (state.check(STATE_STORAGE_READY)) {
         char _ota_diag[48];
         snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=CELL_META_HTTP%d", metaHttpCode);
-        logger.logEvent(_ota_diag);
+        otaLog(_ota_diag);
       }
 #endif
       return false;
@@ -4667,6 +4708,12 @@ bool performPullOtaCheck()
     }
     metaBuf[metaBytes] = '\0';
     metaBody = metaBuf;
+    {
+      char _m[64];
+      snprintf(_m, sizeof(_m), "OTA-PULL META cell http=%d bytes=%d/%d", metaHttpCode, metaBytes,
+               metaContentLength);
+      otaLog(_m);
+    }
     // 2026-09-23: unlike the WiFi path below (which deliberately keeps its
     // TLS session alive for reuse - a real perf win there), close this one
     // immediately rather than leaving it dangling until some later return
@@ -4688,7 +4735,7 @@ bool performPullOtaCheck()
   if (!otaWifiClient.open(otaHost, otaPort)) {
     Serial.printf("[OTA-PULL] Cannot connect to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CONNECT");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CONNECT");
 #endif
     return false;
   }
@@ -4697,7 +4744,7 @@ bool performPullOtaCheck()
     Serial.println("[OTA-PULL] META send failed");
     otaWifiClient.close();
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=META_SEND");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=META_SEND");
 #endif
     return false;
   }
@@ -4710,7 +4757,7 @@ bool performPullOtaCheck()
     if (state.check(STATE_STORAGE_READY)) {
       char _ota_diag[48];
       snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=META_HTTP%d", (int)otaWifiClient.code());
-      logger.logEvent(_ota_diag);
+      otaLog(_ota_diag);
     }
 #endif
     return false;
@@ -4732,6 +4779,11 @@ bool performPullOtaCheck()
   // Parse "available": true / false
   if (!strstr(metaBody, "\"available\":true") && !strstr(metaBody, "\"available\": true")) {
     Serial.println("[OTA-PULL] No update available");
+    {
+      char _m[64];
+      snprintf(_m, sizeof(_m), "OTA-PULL NO_UPDATE %s bytes=%d", useCell ? "cell" : "wifi", (int)metaBytes);
+      otaLog(_m);
+    }
     return false;
   }
 
@@ -4875,7 +4927,7 @@ bool performPullOtaCheck()
   if (!sizeField) {
     Serial.println("[OTA-PULL] META: missing size field");
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=META_NOSIZE");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=META_NOSIZE");
 #endif
     return false;
   }
@@ -4883,7 +4935,7 @@ bool performPullOtaCheck()
   if (fwSize < PULL_OTA_MIN_FW_SIZE) { // sanity check: firmware must be at least 64 KB
     Serial.printf("[OTA-PULL] META: implausible size %u\n", (unsigned)fwSize);
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=META_SIZE");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=META_SIZE");
 #endif
     return false;
   }
@@ -4893,7 +4945,7 @@ bool performPullOtaCheck()
   if (state.check(STATE_STORAGE_READY)) {
     char _ota_diag[48];
     snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL START SIZE=%u", (unsigned)fwSize);
-    logger.logEvent(_ota_diag);
+    otaLog(_ota_diag);
   }
 #endif
 
@@ -4992,7 +5044,7 @@ bool performPullOtaCheck()
     if (!fwFile) {
       Serial.println("[OTA-PULL] Cannot create SD staging file");
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SD_OPEN");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=SD_OPEN");
 #endif
       return false;
     }
@@ -5041,7 +5093,7 @@ bool performPullOtaCheck()
         // at the top of this block.
         if (doSha256) mbedtls_sha256_free(&sha256Ctx);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_CONNECT");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_FW_CONNECT");
 #endif
         return false;
       }
@@ -5051,7 +5103,7 @@ bool performPullOtaCheck()
         fwFile.close();
         if (doSha256) mbedtls_sha256_free(&sha256Ctx);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_FW_SEND");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_FW_SEND");
 #endif
         return false;
       }
@@ -5066,7 +5118,7 @@ bool performPullOtaCheck()
         if (state.check(STATE_STORAGE_READY)) {
           char _ota_diag[48];
           snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=CELL_FW_HTTP%d", httpCode);
-          logger.logEvent(_ota_diag);
+          otaLog(_ota_diag);
         }
 #endif
         return false;
@@ -5082,7 +5134,7 @@ bool performPullOtaCheck()
       if (written != fwSize) {
         Serial.printf("[OTA-PULL] Cell recv incomplete at %u / %u bytes\n", (unsigned)written, (unsigned)fwSize);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=CELL_RECV");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=CELL_RECV");
 #endif
         dlOk = false;
       } else {
@@ -5097,7 +5149,7 @@ bool performPullOtaCheck()
       fwFile.close();
       // Leave the staging file in place (2026-09-23) - resumable next time.
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_CONNECT");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=FW_CONNECT");
 #endif
       return false;
     }
@@ -5107,7 +5159,7 @@ bool performPullOtaCheck()
       otaWifiClient.close();
       fwFile.close();
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_SEND");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=FW_SEND");
 #endif
       return false;
     }
@@ -5122,7 +5174,7 @@ bool performPullOtaCheck()
       if (state.check(STATE_STORAGE_READY)) {
         char _ota_diag[48];
         snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=FW_HTTP%d", httpCode);
-        logger.logEvent(_ota_diag);
+        otaLog(_ota_diag);
       }
 #endif
       return false;
@@ -5144,7 +5196,7 @@ bool performPullOtaCheck()
       if (!rawSock.available()) {
         Serial.printf("[OTA-PULL] Recv timeout at offset %u\n", (unsigned)written);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_TIMEOUT");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=RECV_TIMEOUT");
 #endif
         dlOk = false;
         break;
@@ -5155,7 +5207,7 @@ bool performPullOtaCheck()
       if (n <= 0) {
         Serial.printf("[OTA-PULL] Read error at offset %u\n", (unsigned)written);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_READ");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=RECV_READ");
 #endif
         dlOk = false;
         break;
@@ -5173,7 +5225,7 @@ bool performPullOtaCheck()
         if (nw != (size_t)n) {
           Serial.printf("[OTA-PULL] SD write error at offset %u\n", (unsigned)written);
 #if STORAGE != STORAGE_NONE
-          if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SD_WRITE");
+          if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=SD_WRITE");
 #endif
           dlOk = false;
           break;
@@ -5227,7 +5279,7 @@ bool performPullOtaCheck()
                       "[OTA-PULL]   actual:   %s\n",
                       fwSha256Hex, actualHex);
 #if STORAGE != STORAGE_NONE
-        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=SHA256");
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=SHA256");
 #endif
         // Genuine corruption (possibly from an earlier resumed segment) -
         // unlike a transient network failure, this is not safely resumable.
@@ -5333,7 +5385,7 @@ bool performPullOtaCheck()
             if (nvsOk && nvsWritten == nvsExpected) {
               Serial.printf("[OTA-PULL] NVS staged: %u bytes\n", (unsigned)nvsWritten);
 #if STORAGE != STORAGE_NONE
-              if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL NVS DL OK");
+              if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL NVS DL OK");
 #endif
             } else {
               Serial.println("[OTA-PULL] NVS download incomplete Ã¢â‚¬â€ skipping settings update");
@@ -5359,7 +5411,7 @@ bool performPullOtaCheck()
     if (state.check(STATE_STORAGE_READY)) {
       char _ota_diag[64];
       snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL DL OK SIZE=%u", (unsigned)fwSize);
-      logger.logEvent(_ota_diag);
+      otaLog(_ota_diag);
     }
 #endif
     // Restart immediately so the device boots with a clean heap.  The boot-time
@@ -5384,7 +5436,7 @@ bool performPullOtaCheck()
     Serial.printf("[OTA-PULL] FW connect failed to %s:%u\n", _maskOtaHost(otaHost).c_str(), (unsigned)otaPort);
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_CONNECT");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=FW_CONNECT");
 #endif
     return false;
   }
@@ -5394,7 +5446,7 @@ bool performPullOtaCheck()
     otaWifiClient.close();
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FW_SEND");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=FW_SEND");
 #endif
     return false;
   }
@@ -5409,7 +5461,7 @@ bool performPullOtaCheck()
     if (state.check(STATE_STORAGE_READY)) {
       char _ota_diag[48];
       snprintf(_ota_diag, sizeof(_ota_diag), "OTA-PULL ERR=FW_HTTP%d", httpCode);
-      logger.logEvent(_ota_diag);
+      otaLog(_ota_diag);
     }
 #endif
     return false;
@@ -5425,7 +5477,7 @@ bool performPullOtaCheck()
     otaWifiClient.close();
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=UPD_BEGIN");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=UPD_BEGIN");
 #endif
     return false;
   }
@@ -5444,7 +5496,7 @@ bool performPullOtaCheck()
       otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_TIMEOUT");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=RECV_TIMEOUT");
 #endif
       return false;
     }
@@ -5458,7 +5510,7 @@ bool performPullOtaCheck()
       otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=RECV_READ");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=RECV_READ");
 #endif
       return false;
     }
@@ -5470,7 +5522,7 @@ bool performPullOtaCheck()
       otaWifiClient.close();
       s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=FLASH_WRITE");
+      if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=FLASH_WRITE");
 #endif
       return false;
     }
@@ -5492,7 +5544,7 @@ bool performPullOtaCheck()
     Serial.printf("[OTA-PULL] Update.end failed: %s\n", Update.errorString());
     s_ota_active = false;
 #if STORAGE != STORAGE_NONE
-    if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL ERR=UPD_END");
+    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL ERR=UPD_END");
 #endif
     return false;
   }
@@ -5503,7 +5555,7 @@ bool performPullOtaCheck()
     char _ota_diag[64];
     snprintf(_ota_diag, sizeof(_ota_diag),
              "OTA-PULL OK FW=%s SIZE=%u", FIRMWARE_VERSION, (unsigned)written);
-    logger.logEvent(_ota_diag);
+    otaLog(_ota_diag);
   }
 #endif
   // Notify HA that firmware was written to flash (best-effort, WiFi-only).
