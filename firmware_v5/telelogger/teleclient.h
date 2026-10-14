@@ -89,15 +89,26 @@ public:
     bool login = false;
 };
 
-class TeleClientUDP : public TeleClient
-{
-public:
+class TeleClientUDP;
+// what one received buffer held (udpmsg.h / TeleClientUDP::onMessage)
+struct UdpRx {
+    TeleClientUDP* self = nullptr;
+    uint8_t want = 0;          // notify(): the event whose reply we wait for (0 = none)
+    bool found = false;
+    char reply[160] = "";
+};
+void udpOnMessage(char* msg, void* ctx);
+
+class TeleClientUDP : public TeleClient
+{
+public:
     bool notify(byte event, const char* payload = 0);
     bool connect(bool quick = false);
     bool transmit(const char* packetBuffer, unsigned int packetSize);
     bool ping();
     void inbound();
     bool verifyChecksum(char* data);
+    void onMessage(char* msg, UdpRx* rx);
     void shutdown();
 #if ENABLE_WIFI
     WifiUDP wifi;

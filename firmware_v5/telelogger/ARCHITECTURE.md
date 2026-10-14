@@ -16,6 +16,14 @@ after storage, event replies, `EV=5` commands) - FleetNest `apps/telemetry/proto
 this document says "Traccar" for the server side, read FleetNest from that date; the Traccar-side
 details (decoder, calibration, `ReportUtils`) are history.
 
+**Server messages (2026-10-14, `udpmsg.h`, `TeleClientUDP::onMessage`):** every read is split into
+messages `<body>*<CS>` and each is handled (ACK, command, the reply `notify()` waits for, sync) -
+the same for WiFi and cellular. Before, a read was handled as ONE message: over the cellular modem
+an ACK and a command arrive in one read, the command behind the ACK was dropped (OTA_READY, SNIFF,
+RESEND never worked over cellular) and a reply with a command behind it failed the checksum (login
+/ ping sent three times). The leftover bench `testCellularOtaMeta()` (a meta.json fetch at every
+cellular connect) is removed.
+
 ## Part A — the whole firmware
 
 ### A1. Every top-level function (`telelogger.ino`, declaration order)

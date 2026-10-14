@@ -21,6 +21,7 @@
 #include "sniff.h"
 #include "config.h"
 #include "txqueue.h"
+#include "udpmsg.h"          // server messages in one received buffer (WiFi = cellular)
 
 extern int16_t rssi;
 extern char devid[];
@@ -348,21 +349,20 @@ bool TeleClientUDP::notify(byte event, const char* payload)
       continue;
     }
     rxBytes += bytesRecv;
-    // verify checksum
-    if (!verifyChecksum(data)) {
-      Serial.print("[UDP] Checksum mismatch:");
+    // every message in the read (udpmsg.h): ACKs and commands are handled, the reply to this
+    // event is kept - over the cellular modem they come back to back in one read (2026-10-14)
+    UdpRx rx;
+    rx.self = this;
+    rx.want = event;
+    int bad = 0;
+    udpSplit(data, bytesRecv, udpOnMessage, &rx, &bad);
+    if (!rx.found) {
+      Serial.print(bad ? "[UDP] Checksum mismatch:" : "[UDP] Invalid reply: ");
       Serial.println(data);
-      logNetEvent("NET UDP_CHECKSUM_MISMATCH");
+      logNetEvent(bad ? "NET UDP_CHECKSUM_MISMATCH" : "NET UDP_INVALID_REPLY");
       continue;
     }
-    char pattern[16];
-    sprintf(pattern, "EV=%u", event);
-    if (!strstr(data, pattern)) {
-      Serial.print("[UDP] Invalid reply: ");
-      Serial.println(data);
-      logNetEvent("NET UDP_INVALID_REPLY");
-      continue;
-    }
+    data = rx.reply;  // the reply to this event (login: TM=, SN= below)
     if (event == EVENT_LOGIN) {
       // extract info from server response
       char *p = strstr(data, "TM=");
@@ -584,66 +584,20 @@ bool TeleClientUDP::transmit(const char* packetBuffer, unsigned int packetSize)
   return false;
 }
 
-void TeleClientUDP::inbound()
+// One server message (udpmsg.h, checksum already checked): a delivery ACK, a command, the
+// reply to the event notify() waits for, or a legacy sync. Same for WiFi and cellular.
+void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
 {
-  // check incoming datagram
-  do {
-    int len = 0;
-    char *data = 0;
-#if ENABLE_WIFI
-    if (wifi.connected())
-    {
-      data = cell.getBuffer();
-      len = wifi.receive(data, RECV_BUF_SIZE - 1, 10);
-    }
-    else
-#endif
-    {
-      data = cell.receive(&len, 50);
-    }
-    if (!data || len == 0) break;
-    data[len] = 0;
-    Serial.print("[UDP] ");
-    Serial.println(data);
-    rxBytes += len;
-    // delivery ACK(s) from the server, "1#ACK=<packet>*CS" (2026-09-26) - a
-    // read may hold several, each with its own checksum
-    bool acked = false;
-    for (char* a = strstr(data, "1#ACK="); a; a = strstr(a + 6, "1#ACK=")) {
-      char* star = strchr(a, '*');
-      if (!star) break;
-      uint8_t sum = 0;
-      for (char* q = a; q < star; q++) sum += *q;
-      if (hex2uint8(star + 1) == sum) {
-        txqOnAck(strtoul(a + 6, 0, 10));
-        acked = true;
-      }
-    }
-    if (acked) {
-      lastSyncTime = millis();  // the link is alive: no "poor connection" reconnect
-      break;
-    }
-    if (!verifyChecksum(data)) {
-      Serial.print("[UDP] Checksum mismatch:");
-      Serial.println(data);
-      logNetEvent("NET INBOUND_CHECKSUM_MISMATCH");
-      break;
-    }
-    char *p = strstr(data, "EV=");
-    if (!p) break;
-    int eventID = atoi(p + 3);
-    switch (eventID) {
-    case EVENT_SYNC:
-        feedid = hex2uint16(data);
-        Serial.print("[UDP] FEED ID:");
-        Serial.println(feedid);
-        break;
-    case EVENT_COMMAND: {
-        // Server-initiated push signal, e.g. "EV=5,TS=...,ID=...,CMD=OTA_READY*XX"
-        // sent via Traccar's Command.TYPE_CUSTOM. Only OTA_READY is recognised
-        // for now; anything else is ignored (forward-compatible with future
-        // command types without needing a firmware update to tolerate them).
-        char *cmdp = strstr(data, "CMD=");
+  if (!strncmp(msg, "1#ACK=", 6)) {      // "1#ACK=<packet>" after the records are stored
+    txqOnAck(strtoul(msg + 6, 0, 10));
+    lastSyncTime = millis();             // the link is alive: no "poor connection" reconnect
+    return;
+  }
+  char* p = strstr(msg, "EV=");
+  if (!p) return;
+  int eventID = atoi(p + 3);
+  if (eventID == EVENT_COMMAND) {
+        char *cmdp = strstr(msg, "CMD=");
         if (cmdp && !strncmp(cmdp + 4, "OTA_READY", 9)) {
           Serial.println("[UDP] CMD:OTA_READY");
           logNetEvent("NET CMD_OTA_READY");
@@ -668,9 +622,62 @@ void TeleClientUDP::inbound()
           snprintf(m, sizeof(m), "NET CMD_RESEND file=%u %s", (unsigned)f, started ? "start" : "running");
           logNetEvent(m);
         }
-        break;
+    return;
+  }
+  if (rx->want && eventID == rx->want) {
+    strncpy(rx->reply, msg, sizeof(rx->reply) - 1);
+    rx->reply[sizeof(rx->reply) - 1] = 0;
+    rx->found = true;
+    return;
+  }
+  if (eventID == EVENT_SYNC) {
+    feedid = hex2uint16(msg);
+    Serial.print("[UDP] FEED ID:");
+    Serial.println(feedid);
+  }
+}
+
+void udpOnMessage(char* msg, void* ctx)
+{
+  UdpRx* rx = (UdpRx*)ctx;
+  rx->self->onMessage(msg, rx);
+}
+
+void TeleClientUDP::inbound()
+{
+  // check incoming datagram
+  do {
+    int len = 0;
+    char *data = 0;
+#if ENABLE_WIFI
+    if (wifi.connected())
+    {
+      data = cell.getBuffer();
+      len = wifi.receive(data, RECV_BUF_SIZE - 1, 10);
     }
+    else
+#endif
+    {
+      data = cell.receive(&len, 50);
     }
+    if (!data || len == 0) break;
+    data[len] = 0;
+    Serial.print("[UDP] ");
+    Serial.println(data);
+    rxBytes += len;
+    // every message in the read (udpmsg.h) - the cellular modem returns an ACK and a command
+    // back to back in one read; the old code stopped at the ACK and dropped the command
+    UdpRx rx;
+    rx.self = this;
+    rx.want = 0;
+    int bad = 0;
+    int n = udpSplit(data, len, udpOnMessage, &rx, &bad);
+    if (bad) {
+      Serial.print("[UDP] Checksum mismatch:");
+      Serial.println(data);
+      logNetEvent("NET INBOUND_CHECKSUM_MISMATCH");
+    }
+    if (!n) break;
     lastSyncTime = millis();
   } while(0);
 }
